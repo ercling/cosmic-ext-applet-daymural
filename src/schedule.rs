@@ -7,7 +7,7 @@
 // afterwards in case of an inaccurate local clock.
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 
@@ -63,6 +63,27 @@ pub fn fetch_count(retention_days: u16) -> u8 {
     match retention_days {
         1..=8 => retention_days as u8,
         _ => 8,
+    }
+}
+
+/// How long until the next shuffle tick.
+///
+/// The countdown runs from the last user action that resets it — enabling
+/// shuffle, changing the interval, or manual prev/next/newest navigation —
+/// so the first fire comes one full interval after enabling, and browsing
+/// by hand postpones the next automatic rotation. `None` (no reset this
+/// session, e.g. shuffle restored as enabled at startup, or the cycle
+/// after a tick) also waits one full interval. An action more than one
+/// interval ago yields [`Duration::ZERO`] (fire now).
+pub fn next_shuffle_delay(
+    interval_secs: u32,
+    last_user_action: Option<Instant>,
+    now: Instant,
+) -> Duration {
+    let interval = Duration::from_secs(u64::from(interval_secs));
+    match last_user_action {
+        None => interval,
+        Some(at) => interval.saturating_sub(now.saturating_duration_since(at)),
     }
 }
 
@@ -161,6 +182,53 @@ mod tests {
         assert_eq!(fetch_count(8), 8);
         assert_eq!(fetch_count(30), 8); // capped at the API max
         assert_eq!(fetch_count(0), 8); // forever → full window
+    }
+
+    /// A "now" far enough from the process start that subtracting test
+    /// offsets can never underflow the monotonic clock.
+    fn shuffle_now() -> Instant {
+        Instant::now() + Duration::from_secs(100_000)
+    }
+
+    #[test]
+    fn shuffle_fresh_enable_waits_one_full_interval() {
+        let now = shuffle_now();
+        // No reset recorded this session → full interval…
+        assert_eq!(
+            next_shuffle_delay(1_800, None, now),
+            Duration::from_secs(1_800)
+        );
+        // …and an action at this very instant (the enable itself) too.
+        assert_eq!(
+            next_shuffle_delay(86_400, Some(now), now),
+            Duration::from_secs(86_400)
+        );
+    }
+
+    #[test]
+    fn shuffle_reset_counts_down_from_the_action() {
+        let now = shuffle_now();
+        // Manual navigation 10 minutes ago, 30-minute interval → 20 minutes.
+        let action = now - Duration::from_secs(600);
+        assert_eq!(
+            next_shuffle_delay(1_800, Some(action), now),
+            Duration::from_secs(1_200)
+        );
+    }
+
+    #[test]
+    fn shuffle_elapsed_interval_fires_immediately() {
+        let now = shuffle_now();
+        // Exactly one interval since the action → due now.
+        assert_eq!(
+            next_shuffle_delay(1_800, Some(now - Duration::from_secs(1_800)), now),
+            Duration::ZERO
+        );
+        // Long past it → still zero, never negative (saturating).
+        assert_eq!(
+            next_shuffle_delay(1_800, Some(now - Duration::from_secs(7_200)), now),
+            Duration::ZERO
+        );
     }
 
     #[test]

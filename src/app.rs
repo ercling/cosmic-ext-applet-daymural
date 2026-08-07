@@ -10,7 +10,7 @@
 // back via `RefreshFinished`.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use cosmic::{
@@ -54,10 +54,12 @@ fn catalogue_path() -> PathBuf {
 #[derive(Default)]
 pub struct Window {
     pub(crate) core: cosmic::app::Core,
-    popup: Option<window::Id>,
+    /// The open popup's window id (the interval dropdown needs it as the
+    /// parent surface of its menu popup).
+    pub(crate) popup: Option<window::Id>,
     /// Applet settings (shuffle, retention). Defaults when the config context
     /// is unavailable.
-    config: AppletConfig,
+    pub(crate) config: AppletConfig,
     /// cosmic-config context used to persist setting changes. `None` only if
     /// the config directory could not be created — the applet still runs with
     /// defaults, changes just don't persist.
@@ -77,6 +79,15 @@ pub struct Window {
     /// Generation counter for the one-shot refresh timer; `RefreshDue`
     /// messages carrying a stale generation are ignored.
     timer_generation: u64,
+    /// Generation counter for the one-shot shuffle timer (same stale-tick
+    /// scheme as the refresh timer).
+    shuffle_generation: u64,
+    /// A shuffle tick is currently scheduled.
+    shuffle_armed: bool,
+    /// The last user action that resets the shuffle countdown (enabling
+    /// shuffle, changing the interval, manual navigation). Cleared after
+    /// each tick so the following cycle waits one full interval again.
+    last_user_action: Option<Instant>,
     /// When the last successful fetch completed (status footer).
     last_updated: Option<DateTime<Utc>>,
     /// The last fetch error, cleared on success (status footer).
@@ -101,12 +112,20 @@ pub enum Message {
     /// Open a file or URL with the default handler (`xdg-open`): thumbnail
     /// click → full image, "About this image" → copyright link.
     Open(String),
+    /// The shuffle timer fired (payload: the generation it was armed with).
+    ShuffleDue(u64),
+    /// The popup's shuffle toggler.
+    SetShuffleEnabled(bool),
+    /// The popup's shuffle-interval dropdown (payload: dropdown index).
+    SetShuffleInterval(usize),
+    /// Forwarded surface actions (the dropdown's menu opens as its own
+    /// wayland popup and drives it through these).
+    Surface(cosmic::surface::Action),
 }
 
 impl Window {
     /// Write-on-change: adopt `config` and persist it if it differs from the
-    /// current settings. Used by the shuffle/retention controls (Tasks 9-10).
-    #[allow(dead_code)]
+    /// current settings. Used by the shuffle/retention controls.
     fn set_config(&mut self, config: AppletConfig) {
         use cosmic_config::CosmicConfigEntry as _;
 
@@ -131,6 +150,46 @@ impl Window {
             tokio::time::sleep(delay).await;
             Message::RefreshDue(generation)
         })
+    }
+
+    /// Arm (or re-arm) the one-shot shuffle timer, invalidating any pending
+    /// tick. The delay counts down from the last user action.
+    fn arm_shuffle(&mut self) -> app::Task<Message> {
+        self.shuffle_generation += 1;
+        self.shuffle_armed = true;
+        let generation = self.shuffle_generation;
+        let delay = schedule::next_shuffle_delay(
+            self.config.shuffle_interval_secs,
+            self.last_user_action,
+            Instant::now(),
+        );
+        tracing::info!("next shuffle in {}s", delay.as_secs());
+        cosmic::task::future(async move {
+            tokio::time::sleep(delay).await;
+            Message::ShuffleDue(generation)
+        })
+    }
+
+    /// Invalidate any pending shuffle tick.
+    fn disarm_shuffle(&mut self) {
+        self.shuffle_generation += 1;
+        self.shuffle_armed = false;
+    }
+
+    /// Bring the shuffle timer in line with the current state: it runs only
+    /// while shuffle is enabled and at least two images exist. Pass
+    /// `reset_countdown` to force a re-arm even when a tick is already
+    /// pending (manual navigation, settings changes).
+    fn sync_shuffle(&mut self, reset_countdown: bool) -> app::Task<Message> {
+        let should_run = self.config.shuffle_enabled && self.catalogue.images.len() >= 2;
+        if !should_run {
+            self.disarm_shuffle();
+            Task::none()
+        } else if !self.shuffle_armed || reset_countdown {
+            self.arm_shuffle()
+        } else {
+            Task::none()
+        }
     }
 
     /// Kick off the fetch pipeline unless one is already running.
@@ -269,11 +328,16 @@ impl cosmic::Application for Window {
             refresh_pending: false,
             first_fetch_pending,
             timer_generation: 0,
+            shuffle_generation: 0,
+            shuffle_armed: false,
+            last_user_action: None,
             last_updated: None,
             last_error: None,
         };
         let timer = window.schedule_refresh(delay);
-        (window, timer)
+        // Shuffle restored as enabled starts a fresh full-interval cycle.
+        let shuffle = window.sync_shuffle(false);
+        (window, Task::batch([timer, shuffle]))
     }
 
     fn on_close_requested(&self, id: window::Id) -> Option<Message> {
@@ -311,7 +375,20 @@ impl cosmic::Application for Window {
                 }
             }
             Message::ConfigUpdated(config) => {
+                // Our own setter writes echo back here unchanged (no-op);
+                // an *external* edit of the shuffle settings restarts the
+                // countdown against the new values.
+                let shuffle_changed = config.shuffle_enabled != self.config.shuffle_enabled
+                    || config.shuffle_interval_secs != self.config.shuffle_interval_secs;
+                let newly_enabled = config.shuffle_enabled && !self.config.shuffle_enabled;
                 self.config = config;
+                if newly_enabled {
+                    // First fire one full interval after enabling.
+                    self.last_user_action = Some(Instant::now());
+                }
+                if shuffle_changed {
+                    return self.sync_shuffle(true);
+                }
             }
             Message::RefreshDue(generation) => {
                 // Stale timers (replaced by a newer reschedule) are ignored.
@@ -322,10 +399,13 @@ impl cosmic::Application for Window {
             Message::RefreshNow => return self.start_refresh(),
             Message::ApplyImage(path) => {
                 // Browsing is setting: prev/next/newest apply immediately.
-                // (Manual navigation also resets the shuffle timer — wired
-                // in Task 9 when the timer exists.)
+                // Manual navigation also resets the shuffle countdown.
                 match wallpaper::apply(&path) {
-                    Ok(()) => self.current = Some(path),
+                    Ok(()) => {
+                        self.current = Some(path);
+                        self.last_user_action = Some(Instant::now());
+                        return self.sync_shuffle(true);
+                    }
                     Err(error) => {
                         tracing::warn!("failed to apply {}: {error}", path.display());
                     }
@@ -342,6 +422,50 @@ impl cosmic::Application for Window {
                     }
                     Err(error) => tracing::warn!("xdg-open {target} failed: {error}"),
                 }
+            }
+            Message::ShuffleDue(generation) => {
+                // Stale ticks (replaced by a newer re-arm) are ignored.
+                if generation != self.shuffle_generation {
+                    return Task::none();
+                }
+                self.shuffle_armed = false;
+                if !self.config.shuffle_enabled {
+                    return Task::none();
+                }
+                if let Some(pick) = self.catalogue.random_other(self.current.as_deref()) {
+                    let path = pick.filename.clone();
+                    match wallpaper::apply(&path) {
+                        Ok(()) => self.current = Some(path),
+                        Err(error) => {
+                            tracing::warn!("shuffle failed to apply {}: {error}", path.display());
+                        }
+                    }
+                }
+                // A tick starts a fresh cycle: the next one comes a full
+                // interval from now, not from the last user action.
+                self.last_user_action = None;
+                return self.sync_shuffle(false);
+            }
+            Message::SetShuffleEnabled(enabled) => {
+                let mut config = self.config.clone();
+                config.shuffle_enabled = enabled;
+                self.set_config(config);
+                if enabled {
+                    // First fire one full interval after enabling.
+                    self.last_user_action = Some(Instant::now());
+                }
+                return self.sync_shuffle(true);
+            }
+            Message::SetShuffleInterval(index) => {
+                let mut config = self.config.clone();
+                config.shuffle_interval_secs = crate::view::shuffle_interval_secs(index);
+                self.set_config(config);
+                // Picking an interval restarts the countdown at that length.
+                self.last_user_action = Some(Instant::now());
+                return self.sync_shuffle(true);
+            }
+            Message::Surface(action) => {
+                return cosmic::surface::surface_task(action);
             }
             Message::RefreshFinished(result) => {
                 self.refresh_pending = false;
@@ -376,7 +500,11 @@ impl cosmic::Application for Window {
                             self.catalogue.newest().map(|e| e.fullstartdate.as_str()),
                             Utc::now(),
                         );
-                        return self.schedule_refresh(delay);
+                        let refresh_timer = self.schedule_refresh(delay);
+                        // A grown catalogue may unlock a waiting shuffle
+                        // (≥2 images); a pending tick keeps its countdown.
+                        let shuffle = self.sync_shuffle(false);
+                        return Task::batch([refresh_timer, shuffle]);
                     }
                     Err(error) => {
                         tracing::warn!("refresh failed: {error}");

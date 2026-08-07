@@ -254,8 +254,6 @@ impl Catalogue {
     /// `None` when fewer than two images exist. `current` is excluded
     /// structurally (candidates are filtered first), so it can never be
     /// returned regardless of the entropy source.
-    // dead_code: wired to the shuffle timer in Task 9.
-    #[allow(dead_code)]
     pub fn random_other(&self, current: Option<&Path>) -> Option<&ImageEntry> {
         if self.images.len() < 2 {
             return None;

@@ -334,11 +334,11 @@ struct AppletConfig {
 **Files:**
 - Modify: `src/app.rs`, `src/schedule.rs`
 
-- [ ] shuffle toggler row + interval dropdown (30 min / 1 h / 6 h / daily) shown when enabled; persists via `AppletConfig`
-- [ ] pure `next_shuffle_delay(interval_secs, last_user_action: Option<Instant>, now) -> Duration` in `schedule.rs` — first fire one full interval after enabling; manual prev/next/newest resets the countdown
-- [ ] shuffle timer subscription: on tick pick `catalogue.random_other(current)` and apply; timer active only while enabled and catalogue has ≥2 images
-- [ ] write tests: `random_other` never returns current (n≥2) and returns None (n<2); interval-secs ↔ dropdown-index mapping roundtrip; `next_shuffle_delay` (fresh enable, after reset, elapsed)
-- [ ] run tests - must pass before task 10
+- [x] shuffle toggler row + interval dropdown (30 min / 1 h / 6 h / daily) shown when enabled; persists via `AppletConfig` (toggler row per cosmic-applet-tiling's idiom; dropdown via `popup_dropdown` + a `Message::Surface` forwarder — libcosmic's own applet example idiom, so the menu opens as its own wayland popup instead of clipping to the applet popup; rows shown only while the catalogue is non-empty, matching Task 8's empty-state rule; persisted through the existing write-on-change `set_config`)
+- [x] pure `next_shuffle_delay(interval_secs, last_user_action: Option<Instant>, now) -> Duration` in `schedule.rs` — first fire one full interval after enabling; manual prev/next/newest resets the countdown (interval − elapsed-since-action, saturating at zero; `None` = full interval — used for startup-restored shuffle and post-tick cycles; interval change also counts as a reset)
+- [x] shuffle timer subscription: on tick pick `catalogue.random_other(current)` and apply; timer active only while enabled and catalogue has ≥2 images (one-shot generation-counter timer, same scheme as the refresh timer; `sync_shuffle` re-evaluates on enable/disable, interval change, external config edits, manual nav, catalogue growth after a fetch, and startup)
+- [x] write tests: `random_other` never returns current (n≥2) and returns None (n<2) (already covered by Task 4's `random_other_never_returns_current` / `navigation_single_image` / `navigation_on_empty_catalogue`); interval-secs ↔ dropdown-index mapping roundtrip (+ garbage-value fallbacks to daily); `next_shuffle_delay` (fresh enable, after reset, elapsed incl. exact-boundary and saturation)
+- [x] run tests - must pass before task 10 (`cargo test`: 81 passed; clippy clean; fmt clean; binary not smoke-run — cold-start would trigger a real fetch + apply)
 
 ### Task 10: Retention setting UI + pruning wiring
 

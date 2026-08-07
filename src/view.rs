@@ -23,6 +23,13 @@ use crate::thumbs;
 /// fetch). The UI must never decode the full UHD file to fill this.
 const PLACEHOLDER_HEIGHT: f32 = 160.0;
 
+/// Shuffle interval choices, index-aligned with
+/// [`SHUFFLE_INTERVAL_LABELS`].
+const SHUFFLE_INTERVAL_SECS: [u32; 4] = [1_800, 3_600, 21_600, 86_400];
+
+/// Dropdown labels for the shuffle intervals.
+const SHUFFLE_INTERVAL_LABELS: &[&str] = &["30 minutes", "1 hour", "6 hours", "Daily"];
+
 // ---------------------------------------------------------------------------
 // Pure decisions (tested)
 // ---------------------------------------------------------------------------
@@ -104,6 +111,22 @@ pub(crate) fn format_updated(updated: NaiveDateTime, now: NaiveDateTime) -> Stri
     }
 }
 
+/// Dropdown index for a stored interval. Unknown values (hand-edited
+/// config) display as the daily default rather than crashing or showing
+/// an empty selection.
+pub(crate) fn shuffle_interval_index(secs: u32) -> usize {
+    SHUFFLE_INTERVAL_SECS
+        .iter()
+        .position(|&s| s == secs)
+        .unwrap_or(SHUFFLE_INTERVAL_SECS.len() - 1)
+}
+
+/// Interval seconds for a dropdown index. Out-of-range indices (cannot
+/// happen through the UI) fall back to daily.
+pub(crate) fn shuffle_interval_secs(index: usize) -> u32 {
+    SHUFFLE_INTERVAL_SECS.get(index).copied().unwrap_or(86_400)
+}
+
 // ---------------------------------------------------------------------------
 // View (exempt from unit tests per plan)
 // ---------------------------------------------------------------------------
@@ -126,7 +149,12 @@ pub(crate) fn popup_view(window: &Window) -> Element<'_, Message> {
         }
         content = content
             .push(padded_control(controls(window)).align_x(Alignment::Center))
-            .push(padded_control(widget::divider::horizontal::default()));
+            .push(padded_control(widget::divider::horizontal::default()))
+            .push(padded_control(shuffle_toggler(window)));
+        if window.config.shuffle_enabled {
+            content = content.push(padded_control(interval_row(window)));
+        }
+        content = content.push(padded_control(widget::divider::horizontal::default()));
     } else {
         // Empty catalogue: everything except the status footer is gone;
         // refresh stays reachable so an offline start can be retried by
@@ -197,6 +225,35 @@ fn controls(window: &Window) -> Element<'_, Message> {
         ))
         .push(refresh_button(window))
         .spacing(space.space_s)
+        .into()
+}
+
+/// Shuffle toggler row (idiom per cosmic-applet-tiling's toggler rows).
+fn shuffle_toggler(window: &Window) -> Element<'_, Message> {
+    widget::toggler(window.config.shuffle_enabled)
+        .on_toggle(Message::SetShuffleEnabled)
+        .text_size(14)
+        .width(Length::Fill)
+        .label("Shuffle".to_owned())
+        .into()
+}
+
+/// "Every <interval>" dropdown row, shown while shuffle is on. Uses
+/// `popup_dropdown` (as in libcosmic's own applet example) so the menu
+/// opens as its own wayland popup instead of an overlay clipped to the
+/// applet popup's bounds.
+fn interval_row(window: &Window) -> Element<'_, Message> {
+    widget::Row::new()
+        .push(widget::text::body("Every").width(Length::Fill))
+        .push(widget::dropdown::popup_dropdown(
+            SHUFFLE_INTERVAL_LABELS,
+            Some(shuffle_interval_index(window.config.shuffle_interval_secs)),
+            Message::SetShuffleInterval,
+            window.popup.unwrap_or(cosmic::iced::window::Id::NONE),
+            Message::Surface,
+            |message| message,
+        ))
+        .align_y(Alignment::Center)
         .into()
 }
 
@@ -322,6 +379,28 @@ mod tests {
             format_updated(at(2026, 8, 5, 7, 5), now),
             "Updated Aug 5 at 07:05"
         );
+    }
+
+    #[test]
+    fn shuffle_interval_mapping_roundtrips() {
+        // The plan's exact choices, in dropdown order.
+        assert_eq!(SHUFFLE_INTERVAL_SECS, [1_800, 3_600, 21_600, 86_400]);
+        assert_eq!(SHUFFLE_INTERVAL_LABELS.len(), SHUFFLE_INTERVAL_SECS.len());
+        for (index, &secs) in SHUFFLE_INTERVAL_SECS.iter().enumerate() {
+            assert_eq!(shuffle_interval_index(secs), index);
+            assert_eq!(shuffle_interval_secs(index), secs);
+            // Full roundtrip both ways.
+            assert_eq!(shuffle_interval_secs(shuffle_interval_index(secs)), secs);
+        }
+    }
+
+    #[test]
+    fn shuffle_interval_mapping_tolerates_garbage() {
+        // Hand-edited config value → displays as the daily default.
+        assert_eq!(shuffle_interval_index(1_234), 3);
+        assert_eq!(shuffle_interval_index(0), 3);
+        // Impossible dropdown index → daily seconds.
+        assert_eq!(shuffle_interval_secs(99), 86_400);
     }
 
     #[test]
