@@ -275,13 +275,13 @@ struct AppletConfig {
 **Files:**
 - Create: `src/catalogue.rs`
 
-- [ ] `ImageEntry` + `Catalogue` with JSON load/save at `~/.local/state/io.github.ercling.CosmicBingWallpaper/catalogue.json` (path injectable for tests); atomic write (`.tmp` + rename)
-- [ ] `merge(new_entries)`: dedupe by `urlbase`; when a fetched entry matches a rebuilt one, fill in the missing title/copyright metadata; sort ascending by `fullstartdate`
-- [ ] `prune(retention_days, currently_applied)`: delete files + entries whose `fullstartdate` is older than `now - N days` (reference semantics, `utils.js:546-550`); `0` = keep forever; never delete `currently_applied`; drop entries whose file vanished externally
-- [ ] `rebuild_from_folder(dir)`: scan `^\d{8}-.+\.jpg$` (any resolution suffix, matching the reference's own migration regex `utils.js:477`) using Task 2's `parse_filename` to reconstruct `urlbase`; entries get empty titles, refilled on next fetch merge; `fullstartdate` synthesized as `startdate + "0000"`
-- [ ] navigation helpers: `newest()`, `prev(current)`, `next(current)`, `random_other(current)`
-- [ ] write tests (tempfile): load/save roundtrip, corrupt JSON → rebuild path, merge dedupe + ordering, **rebuilt entry + freshly fetched same image → one entry and no re-download**, prune (fullstartdate boundary, forever, protects current, missing files), non-UHD files rebuilt, navigation incl. edge cases (empty, single image, at ends)
-- [ ] run tests - must pass before task 5
+- [x] `ImageEntry` + `Catalogue` with JSON load/save at `~/.local/state/io.github.ercling.CosmicBingWallpaper/catalogue.json` (path injectable for tests); atomic write (`.tmp` + rename) (`load`/`save`/`load_or_rebuild`; path always caller-supplied; also `ImageEntry::from_bing` helper for the Task 7 pipeline)
+- [x] `merge(new_entries)`: dedupe by `urlbase`; when a fetched entry matches a rebuilt one, fill in the missing title/copyright metadata; sort ascending by `fullstartdate` (rebuilt match also adopts the real `fullstartdate` and keeps the existing filename — no re-download; entries with real metadata are never overwritten)
+- [x] `prune(retention_days, currently_applied)`: delete files + entries whose `fullstartdate` is older than `now - N days` (reference semantics, `utils.js:546-550`); `0` = keep forever; never delete `currently_applied`; drop entries whose file vanished externally (`now` injected for tests; malformed dates are kept — never delete on a guess; returns deleted paths)
+- [x] `rebuild_from_folder(dir)`: scan `^\d{8}-.+\.jpg$` (any resolution suffix, matching the reference's own migration regex `utils.js:477`) using Task 2's `parse_filename` to reconstruct `urlbase`; entries get empty titles, refilled on next fetch merge; `fullstartdate` synthesized as `startdate + "0000"`
+- [x] navigation helpers: `newest()`, `prev(current)`, `next(current)`, `random_other(current)` (`random_other` filters candidates first — structurally cannot return current — and picks via clock nanos, avoiding a rand dep)
+- [x] write tests (tempfile): load/save roundtrip, corrupt JSON → rebuild path, merge dedupe + ordering, **rebuilt entry + freshly fetched same image → one entry and no re-download**, prune (fullstartdate boundary, forever, protects current, missing files), non-UHD files rebuilt, navigation incl. edge cases (empty, single image, at ends)
+- [x] run tests - must pass before task 5 (`cargo test`: 42 passed; clippy clean; fmt clean)
 
 ### Task 5: Applet settings via cosmic-config
 

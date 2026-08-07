@@ -3,6 +3,8 @@ mod app;
 #[allow(dead_code)]
 mod bing;
 #[allow(dead_code)]
+mod catalogue;
+#[allow(dead_code)]
 mod thumbs;
 
 fn main() -> cosmic::iced::Result {
