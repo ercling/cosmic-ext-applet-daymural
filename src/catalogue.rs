@@ -233,6 +233,8 @@ impl Catalogue {
 
     /// The image just older than `current` (the file currently applied);
     /// `None` at the oldest end or when `current` is not in the catalogue.
+    // dead_code: wired to the popup's navigation buttons in Task 8.
+    #[allow(dead_code)]
     pub fn prev(&self, current: &Path) -> Option<&ImageEntry> {
         let i = self.position(current)?;
         self.images.get(i.checked_sub(1)?)
@@ -240,6 +242,8 @@ impl Catalogue {
 
     /// The image just newer than `current`; `None` at the newest end or
     /// when `current` is not in the catalogue.
+    // dead_code: wired to the popup's navigation buttons in Task 8.
+    #[allow(dead_code)]
     pub fn next(&self, current: &Path) -> Option<&ImageEntry> {
         let i = self.position(current)?;
         self.images.get(i + 1)
@@ -249,6 +253,8 @@ impl Catalogue {
     /// `None` when fewer than two images exist. `current` is excluded
     /// structurally (candidates are filtered first), so it can never be
     /// returned regardless of the entropy source.
+    // dead_code: wired to the shuffle timer in Task 9.
+    #[allow(dead_code)]
     pub fn random_other(&self, current: Option<&Path>) -> Option<&ImageEntry> {
         if self.images.len() < 2 {
             return None;
