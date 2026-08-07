@@ -11,7 +11,7 @@ This machine's linuxbrew `pkg-config` shadows the system one and misses
 exports it, so prefer `just` recipes; otherwise export it yourself:
 
 ```bash
-just check        # cargo fmt --check + clippy -D warnings + cargo test
+just check        # cargo fmt --check + clippy --all-targets -D warnings + cargo test
 just build        # cargo build --release
 just install      # install binary + .desktop + icon into ~/.local (no sudo)
 just uninstall
@@ -22,6 +22,10 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt
 ```
+
+Logging goes through `tracing` with an env-filter and is silent by default;
+set `RUST_LOG` to see it, e.g. `RUST_LOG=cosmic_bing_wallpaper=debug` (or
+`RUST_LOG=info` for everything) when running the binary or a test.
 
 `rustfmt`/`clippy` binaries live in `~/.local/bin` (extracted from Fedora RPMs to
 match system rustc 1.97.1 — the distro rustc package ships without them).
@@ -44,11 +48,16 @@ the pinned rev before coding against remembered names.
 
 - `src/main.rs` — entry point: `cosmic::applet::run::<Window>(())`.
 - `src/app.rs` — the `cosmic::Application` impl (`Window`): message loop, popup
-  open/close, startup restore (catalogue + config, no network), the async refresh
-  pipeline (`run_refresh`: fetch list → download missing + thumbnails → merge →
-  prune → auto-apply per the "don't clobber" rule → reschedule), one-shot
+  open/close, startup restore (catalogue + config, no network), the refresh
+  pipeline split in two: `run_refresh`/`fetch_and_download` (async, off the UI
+  thread, injectable dirs + base URL for tests: fetch list → download missing →
+  thumbnails) and the `RefreshFinished` handler (UI thread, against *live*
+  state: merge → prune protecting the live current wallpaper → save →
+  auto-apply per the "don't clobber" rule → reschedule — never merge/prune in
+  the async task, its snapshot goes stale during a long fetch), one-shot
   generation-counter timers for refresh and shuffle (a stale tick is ignored, so
-  rescheduling atomically replaces the pending timer), `state_dir()`/`catalogue_path()`.
+  rescheduling atomically replaces the pending timer), `state_dir()`/`catalogue_path()`,
+  and the tested pure decisions `refresh_success_plan`/`config_diff`.
 - `src/view.rs` — popup UI (thumbnail, title/copyright, About link, prev/next/
   newest/refresh controls, shuffle + retention rows, status footer) plus the pure
   display helpers (`displayed`/`prev_target`/`next_target`/`newest_target`,
@@ -71,16 +80,27 @@ the pinned rev before coding against remembered names.
   write-on-change setters, watch subscription for external edits.
 - `src/wallpaper.rs` — cosmic-bg config writer: `updated_entry` mutates only
   `source`, `apply` writes the `all` entry *before* flipping `same-on-all`,
-  `current_source`/`is_ours` back the don't-clobber rule, `download_dir()`.
+  `current_source`/`is_ours`/`should_auto_apply` back the don't-clobber rule,
+  `download_dir()`. `apply`/`current_source` have no automated coverage (the
+  cosmic-bg config context cannot be rooted in a tempdir from this crate — see
+  the comment on `apply`); they are covered by the manual smoke test only.
 - `src/schedule.rs` — pure timing math: `next_refresh` (reference-exact,
   including the out-of-range reset to 60 s and the +300 s fudge),
-  `next_shuffle_delay`, `fetch_count(retention_days)`, `should_auto_apply`,
-  `retention_reduced`.
+  `shuffle_interval` (sanitizes hand-edited values — `0`/tiny must never
+  strobe), `fetch_count(retention_days)`, `retention_reduced`.
+- `src/testutil.rs` — test-only loopback HTTP mock server (`spawn_mock`) and
+  in-memory JPEG factory; all network branches are tested hermetically, nothing
+  ever reaches the real Bing.
+
+UI convention: dropdowns inside the applet popup must use
+`widget::dropdown::popup_dropdown(..)` with the `Message::Surface(cosmic::surface::Action)`
+forwarder (see the interval/retention rows in `view.rs`) — a plain `dropdown`
+renders its menu as an overlay clipped to the popup surface.
 
 Design decisions, live-verified Bing/cosmic-bg facts, and per-task
 implementation notes live in `docs/plans/` (see
-`20260807-cosmic-bing-wallpaper-applet.md`, archived under `docs/plans/completed/`
-once done). Gotchas recorded there worth
+`20260807-cosmic-bing-wallpaper-applet.md` — in `docs/plans/` or, once
+archived, `docs/plans/completed/`). Gotchas recorded there worth
 knowing: the `zune-jpeg` `log`-feature workaround in `Cargo.toml`, and the
 transitive `cosmic-config` pin living only in `Cargo.lock`.
 

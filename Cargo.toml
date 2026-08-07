@@ -36,7 +36,11 @@ chrono = { version = "0.4", default-features = false, features = [
     "std",
 ] }
 dirs = "6"
-tokio = { version = "1", features = ["full"] }
+# Only what the applet itself touches: `time::sleep` for the one-shot
+# timers, plus `rt` + `macros` for the `#[tokio::test]` harness. Everything
+# else tokio-ish (reqwest I/O, libcosmic's executor) enables its own
+# features additively.
+tokio = { version = "1", features = ["macros", "rt", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

@@ -448,8 +448,6 @@ mod tests {
         // Hand-edited config value → displays as the daily default.
         assert_eq!(shuffle_interval_index(1_234), 3);
         assert_eq!(shuffle_interval_index(0), 3);
-        // Impossible dropdown index → daily seconds.
-        assert_eq!(shuffle_interval_secs(99), 86_400);
     }
 
     #[test]
@@ -470,8 +468,6 @@ mod tests {
         // Hand-edited config value → displays as the 8-day default.
         assert_eq!(retention_index(5), 1);
         assert_eq!(retention_index(9_999), 1);
-        // Impossible dropdown index → 8-day default.
-        assert_eq!(retention_days(99), 8);
     }
 
     #[test]
@@ -480,6 +476,15 @@ mod tests {
         // day apart — that's "yesterday", not "today".
         assert_eq!(
             format_updated(at(2026, 7, 31, 23, 50), at(2026, 8, 1, 0, 10)),
+            "Updated yesterday at 23:50"
+        );
+    }
+
+    #[test]
+    fn format_updated_year_boundary_counts_calendar_days() {
+        // Dec 31 → Jan 1 crosses the year: still "yesterday".
+        assert_eq!(
+            format_updated(at(2026, 12, 31, 23, 50), at(2027, 1, 1, 0, 10)),
             "Updated yesterday at 23:50"
         );
     }

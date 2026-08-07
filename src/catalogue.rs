@@ -177,7 +177,14 @@ impl Catalogue {
                         existing.copyrightlink = incoming.copyrightlink;
                         existing.fullstartdate = incoming.fullstartdate;
                         // `filename` deliberately kept: the already
-                        // downloaded file wins.
+                        // downloaded file wins…
+                    }
+                    // …unless that file vanished externally while the
+                    // incoming entry holds a fresh download (the pipeline
+                    // re-downloads when `existing_file` misses) — adopt
+                    // the new path instead of orphaning the download.
+                    if !existing.filename.is_file() && incoming.filename.is_file() {
+                        existing.filename = incoming.filename;
                     }
                 }
                 None => self.images.push(incoming),
@@ -190,8 +197,12 @@ impl Catalogue {
     /// files and entries whose `fullstartdate` is older than
     /// `now - retention_days`. `retention_days == 0` means keep forever.
     /// The `currently_applied` file is never deleted. Entries whose file
-    /// vanished externally are dropped (nothing to delete). Returns the
-    /// paths actually deleted.
+    /// vanished externally are dropped (nothing to delete). When deleting
+    /// a file *fails*, the entry is kept so the next prune retries —
+    /// dropping it would orphan the file forever (a later rebuild would
+    /// resurrect it metadata-less). Returns every path removed from the
+    /// catalogue — deleted here or found vanished — so the caller can
+    /// clean up derived artifacts (cached thumbnails).
     pub fn prune(
         &mut self,
         retention_days: u16,
@@ -199,9 +210,10 @@ impl Catalogue {
         now: DateTime<Utc>,
     ) -> Vec<PathBuf> {
         let cutoff = (retention_days > 0).then(|| now - Duration::days(i64::from(retention_days)));
-        let mut deleted = Vec::new();
+        let mut removed = Vec::new();
         self.images.retain(|entry| {
             if !entry.filename.is_file() {
+                removed.push(entry.filename.clone());
                 return false; // vanished externally — drop the entry
             }
             let Some(cutoff) = cutoff else {
@@ -214,16 +226,16 @@ impl Catalogue {
             }
             match fs::remove_file(&entry.filename) {
                 Ok(()) => {
-                    deleted.push(entry.filename.clone());
+                    removed.push(entry.filename.clone());
                     false
                 }
                 Err(e) => {
                     tracing::warn!("failed to prune {}: {e}", entry.filename.display());
-                    false // entry goes; file cleanup retried never (best effort)
+                    true // keep the entry — retry the deletion next prune
                 }
             }
         });
-        deleted
+        removed
     }
 
     /// Newest image (last in ascending order).
@@ -345,6 +357,24 @@ mod tests {
         // Atomic write leaves no .tmp behind.
         assert!(!path.with_extension("json.tmp").exists());
         assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn load_sorts_out_of_order_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CATALOGUE_FILENAME);
+        let older = entry_with_file(dir.path(), "20260806", "Old_ROW1");
+        let newer = entry_with_file(dir.path(), "20260807", "New_ROW2");
+        // Hand-write the file newest-first: load must restore ascending
+        // order (navigation and `newest()` rely on it).
+        let unsorted = Catalogue {
+            images: vec![newer.clone(), older.clone()],
+        };
+        fs::write(&path, serde_json::to_string(&unsorted).unwrap()).unwrap();
+
+        let loaded = Catalogue::load(&path).unwrap();
+
+        assert_eq!(loaded.images, vec![older, newer]);
     }
 
     #[test]
@@ -490,6 +520,31 @@ mod tests {
     }
 
     #[test]
+    fn merge_adopts_the_fresh_download_when_the_old_file_vanished() {
+        let dir = tempfile::tempdir().unwrap();
+        // A real (non-rebuilt) entry whose file vanished externally.
+        let real = entry_with_file(dir.path(), "20260807", "Foo_ROW1");
+        fs::remove_file(&real.filename).unwrap();
+        let mut cat = Catalogue {
+            images: vec![real.clone()],
+        };
+
+        // The pipeline re-downloaded the image (existing_file missed) —
+        // the incoming entry carries the fresh file.
+        let fresh_path = dir.path().join("20260807-Foo_ROW1_UHD_fresh.jpg");
+        fs::write(&fresh_path, b"fresh jpeg").unwrap();
+        let mut incoming = real.clone();
+        incoming.filename = fresh_path.clone();
+        cat.merge(vec![incoming]);
+
+        // The entry now points at the fresh download instead of the
+        // vanished path (which prune would drop, orphaning the download).
+        assert_eq!(cat.images.len(), 1);
+        assert_eq!(cat.images[0].filename, fresh_path);
+        assert_eq!(cat.images[0].title, real.title); // metadata untouched
+    }
+
+    #[test]
     fn merge_never_overwrites_real_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let real = entry_with_file(dir.path(), "20260807", "Foo_ROW1");
@@ -585,14 +640,60 @@ mod tests {
         fs::remove_file(&gone.filename).unwrap();
         let there = entry_with_file(dir.path(), "20260807", "There_ROW2");
         let mut cat = Catalogue {
-            images: vec![gone, there.clone()],
+            images: vec![gone.clone(), there.clone()],
         };
 
-        // Even with retention "forever", vanished entries are dropped.
-        let deleted = cat.prune(0, None, now());
+        // Even with retention "forever", vanished entries are dropped —
+        // and reported, so the caller can clean up their thumbnails.
+        let removed = cat.prune(0, None, now());
 
-        assert!(deleted.is_empty()); // nothing was deleted *by us*
+        assert_eq!(removed, vec![gone.filename]);
         assert_eq!(cat.images, vec![there]);
+    }
+
+    #[test]
+    fn prune_keeps_the_entry_when_deleting_its_file_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("ro");
+        fs::create_dir(&sub).unwrap();
+        let old = entry_with_file(&sub, "20260701", "Old_ROW1");
+        let mut cat = Catalogue {
+            images: vec![old.clone()],
+        };
+        // Read-only parent dir → remove_file fails (for non-root).
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let removed = cat.prune(3, None, now());
+
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
+        if removed.is_empty() {
+            // Deletion failed as arranged: the entry must survive so the
+            // next prune retries — dropping it would orphan the file.
+            assert_eq!(cat.images, vec![old.clone()]);
+            assert!(old.filename.exists());
+        }
+        // (Running as root, remove_file succeeds despite the read-only dir
+        // and the ordinary prune path applies — nothing to assert.)
+    }
+
+    #[test]
+    fn prune_keeps_the_exact_cutoff_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        // now = 2026-08-07 12:00, retention 3 → cutoff 2026-08-04 12:00.
+        // The comparison is strict `<`: exactly-at-cutoff is kept.
+        let mut boundary = entry_with_file(dir.path(), "20260804", "Edge_ROW1");
+        boundary.fullstartdate = "202608041200".to_owned();
+        let mut cat = Catalogue {
+            images: vec![boundary.clone()],
+        };
+
+        let removed = cat.prune(3, None, now());
+
+        assert!(removed.is_empty());
+        assert_eq!(cat.images, vec![boundary.clone()]);
+        assert!(boundary.filename.exists());
     }
 
     #[test]

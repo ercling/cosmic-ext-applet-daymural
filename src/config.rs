@@ -3,8 +3,10 @@
 // The `CosmicConfigEntry` derive stores each field as its own RON file under
 // `$XDG_CONFIG_HOME/cosmic/<APP_ID>/v1/<field>` and generates per-field
 // `set_<field>(&mut self, &Config, value) -> Result<bool>` setters that write
-// to disk only when the value actually changed (the write-on-change hooks the
-// shuffle/retention UI of later tasks calls into).
+// to disk only when the value actually changed. The applet itself persists
+// whole configs via `write_entry` (`Window::set_config`), so the generated
+// setters are exercised only by the tests below (hence the module-level
+// `#[allow(dead_code)]` in main.rs).
 
 use cosmic::cosmic_config::{
     self, Config, CosmicConfigEntry, cosmic_config_derive::CosmicConfigEntry,

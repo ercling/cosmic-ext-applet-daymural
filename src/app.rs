@@ -9,8 +9,8 @@
 // pending timer. The pipeline itself runs as one async task and reports
 // back via `RefreshFinished`.
 
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use cosmic::{
@@ -84,14 +84,39 @@ pub struct Window {
     shuffle_generation: u64,
     /// A shuffle tick is currently scheduled.
     shuffle_armed: bool,
-    /// The last user action that resets the shuffle countdown (enabling
-    /// shuffle, changing the interval, manual navigation). Cleared after
-    /// each tick so the following cycle waits one full interval again.
-    last_user_action: Option<Instant>,
     /// When the last successful fetch completed (status footer).
     last_updated: Option<DateTime<Utc>>,
     /// The last fetch error, cleared on success (status footer).
-    last_error: Option<String>,
+    last_error: Option<RefreshError>,
+}
+
+/// Why a refresh failed — the footer distinguishes local disk trouble from
+/// Bing being unreachable.
+#[derive(Debug, Clone)]
+pub enum RefreshError {
+    /// Transport/status/parse trouble (including an empty image list).
+    Network(String),
+    /// Local I/O failure persisting a download.
+    Disk(String),
+}
+
+impl From<bing::FetchError> for RefreshError {
+    fn from(error: bing::FetchError) -> Self {
+        let text = error.to_string();
+        if error.is_local() {
+            Self::Disk(text)
+        } else {
+            Self::Network(text)
+        }
+    }
+}
+
+impl std::fmt::Display for RefreshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Network(detail) | Self::Disk(detail) => write!(f, "{detail}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -102,8 +127,9 @@ pub enum Message {
     ConfigUpdated(AppletConfig),
     /// The refresh timer fired (payload: the generation it was armed with).
     RefreshDue(u64),
-    /// The fetch pipeline finished.
-    RefreshFinished(Result<Catalogue, String>),
+    /// The fetch pipeline finished (payload: the freshly fetched entries,
+    /// merged into the live catalogue on the UI thread).
+    RefreshFinished(Result<Vec<ImageEntry>, RefreshError>),
     /// Apply this downloaded file as the wallpaper (prev/next/newest
     /// buttons — browsing applies immediately).
     ApplyImage(PathBuf),
@@ -145,6 +171,10 @@ impl Window {
 
     /// Arm the one-shot refresh timer for `delay` from now, invalidating any
     /// previously armed timer via the generation counter.
+    ///
+    /// Accepted v1 limitation (same as the GNOME reference): the sleep is
+    /// monotonic and does not advance during system suspend, so a refresh
+    /// due while suspended fires late after resume instead of immediately.
     fn schedule_refresh(&mut self, delay: Duration) -> app::Task<Message> {
         self.timer_generation += 1;
         let generation = self.timer_generation;
@@ -155,17 +185,13 @@ impl Window {
         })
     }
 
-    /// Arm (or re-arm) the one-shot shuffle timer, invalidating any pending
-    /// tick. The delay counts down from the last user action.
+    /// Arm (or re-arm) the one-shot shuffle timer for one full (sanitized)
+    /// interval, invalidating any pending tick.
     fn arm_shuffle(&mut self) -> app::Task<Message> {
         self.shuffle_generation += 1;
         self.shuffle_armed = true;
         let generation = self.shuffle_generation;
-        let delay = schedule::next_shuffle_delay(
-            self.config.shuffle_interval_secs,
-            self.last_user_action,
-            Instant::now(),
-        );
+        let delay = schedule::shuffle_interval(self.config.shuffle_interval_secs);
         tracing::info!("next shuffle in {}s", delay.as_secs());
         cosmic::task::future(async move {
             tokio::time::sleep(delay).await;
@@ -206,11 +232,15 @@ impl Window {
         if let Some(live) = wallpaper::current_source() {
             self.current = Some(live);
         }
-        self.catalogue.prune(
+        let removed = self.catalogue.prune(
             self.config.retention_days,
             self.current.as_deref(),
             Utc::now(),
         );
+        // Drop cached thumbnails of the pruned images too — later prunes
+        // never report these entries again, so skipping this would orphan
+        // them permanently (the RefreshFinished path does the same).
+        thumbs::remove_thumbnails(&removed, &state_dir());
         if let Err(error) = self.catalogue.save(&catalogue_path()) {
             // Non-fatal: the catalogue is rebuildable from the folder scan.
             tracing::warn!("failed to persist catalogue after prune: {error}");
@@ -219,24 +249,18 @@ impl Window {
         self.sync_shuffle(false)
     }
 
-    /// Kick off the fetch pipeline unless one is already running.
+    /// Kick off the fetch pipeline unless one is already running. The
+    /// pipeline only fetches and downloads; merge/prune/save happen back
+    /// on the UI thread in `RefreshFinished` against the live state.
     fn start_refresh(&mut self) -> app::Task<Message> {
         if self.refresh_pending {
             return Task::none();
         }
         self.refresh_pending = true;
-        // Refresh our idea of what is applied (cheap config read), so prune
-        // protects the right file even after external wallpaper changes.
-        if let Some(live) = wallpaper::current_source() {
-            self.current = Some(live);
-        }
         let catalogue = self.catalogue.clone();
         let retention_days = self.config.retention_days;
-        let currently_applied = self.current.clone();
         cosmic::task::future(async move {
-            Message::RefreshFinished(
-                run_refresh(catalogue, retention_days, currently_applied).await,
-            )
+            Message::RefreshFinished(run_refresh(catalogue, retention_days).await)
         })
     }
 
@@ -244,8 +268,11 @@ impl Window {
     pub(crate) fn status_line(&self) -> String {
         if self.refresh_pending {
             "Checking for new images…".to_owned()
-        } else if self.last_error.is_some() {
-            "Bing unreachable — retrying in 1 h".to_owned()
+        } else if let Some(error) = &self.last_error {
+            match error {
+                RefreshError::Network(_) => "Bing unreachable — retrying in 1 h".to_owned(),
+                RefreshError::Disk(_) => "Disk error — retrying in 1 h".to_owned(),
+            }
         } else if let Some(updated) = self.last_updated {
             crate::view::format_updated(
                 updated.with_timezone(&chrono::Local).naive_local(),
@@ -261,52 +288,127 @@ impl Window {
     }
 }
 
-/// The whole refresh pipeline, run off the UI thread: fetch the image list,
-/// download what's missing (+ thumbnails), merge, prune, persist. Any
-/// HTTP/parse failure aborts with an error string (→ 1 h retry); files
-/// downloaded before the failure stay on disk and are skipped next time.
+/// The network half of the refresh pipeline, run off the UI thread: fetch
+/// the image list, download what's missing, cache thumbnails. Merging,
+/// pruning, and persisting happen back on the UI thread (`RefreshFinished`)
+/// against the *live* catalogue and wallpaper — a long fetch must never act
+/// on a stale snapshot (it could delete the currently applied file or
+/// resurrect concurrently pruned entries). Any HTTP/parse failure aborts
+/// (→ 1 h retry); files downloaded before the failure stay on disk and are
+/// skipped next time.
 async fn run_refresh(
-    mut catalogue: Catalogue,
+    catalogue: Catalogue,
     retention_days: u16,
-    currently_applied: Option<PathBuf>,
-) -> Result<Catalogue, String> {
-    let download_dir = wallpaper::download_dir();
-    let state = state_dir();
+) -> Result<Vec<ImageEntry>, RefreshError> {
+    let client = bing::http_client()?;
+    fetch_and_download(
+        &client,
+        bing::BING_BASE_URL,
+        &catalogue,
+        schedule::fetch_count(retention_days),
+        &wallpaper::download_dir(),
+        &state_dir(),
+    )
+    .await
+    .map_err(RefreshError::from)
+}
 
-    let client = bing::http_client().map_err(|e| e.to_string())?;
-    let archive = bing::fetch_image_list(&client, schedule::fetch_count(retention_days))
-        .await
-        .map_err(|e| e.to_string())?;
+/// Fetch the latest `count` images from `base_url` and download the
+/// missing ones into `download_dir` (thumbnails cached under `state_dir`).
+/// All roots and the endpoint are injected so tests can run the whole
+/// pipeline against tempdirs and a loopback mock server.
+async fn fetch_and_download(
+    client: &reqwest::Client,
+    base_url: &str,
+    catalogue: &Catalogue,
+    count: u8,
+    download_dir: &Path,
+    state_dir: &Path,
+) -> Result<Vec<ImageEntry>, bing::FetchError> {
+    // A crash mid-download leaves an orphaned `.part` behind; sweep first.
+    bing::sweep_part_files(download_dir);
+
+    let archive = bing::fetch_image_list(client, base_url, count).await?;
 
     let mut fetched = Vec::with_capacity(archive.images.len());
     for image in &archive.images {
         // A rebuilt entry may already hold this image at a different
         // resolution suffix — that file stays authoritative (no
-        // re-download); the merge below refills its metadata.
+        // re-download); the merge refills its metadata.
         let path = match catalogue.existing_file(&image.urlbase) {
             Some(existing) => existing,
-            None => bing::download_image(&client, image, &download_dir)
-                .await
-                .map_err(|e| e.to_string())?,
+            None => bing::download_image(client, base_url, image, download_dir).await?,
         };
-        // A failed thumbnail is not fatal: `ensure_thumbnail` regenerates
-        // missing thumbs on the next refresh.
-        if let Err(error) = thumbs::ensure_thumbnail(&path, &state) {
-            tracing::warn!(
-                "thumbnail generation failed for {}: {error}",
-                path.display()
-            );
-        }
+        ensure_thumbnail_logged(&path, state_dir);
         fetched.push(ImageEntry::from_bing(image, path));
     }
 
-    catalogue.merge(fetched);
-    catalogue.prune(retention_days, currently_applied.as_deref(), Utc::now());
-    if let Err(error) = catalogue.save(&catalogue_path()) {
-        // Non-fatal: the catalogue is rebuildable from the folder scan.
-        tracing::warn!("failed to persist catalogue: {error}");
+    // Backfill thumbnails for catalogue entries outside this fetch window —
+    // rebuilt or older entries would otherwise show the placeholder forever.
+    for entry in &catalogue.images {
+        if entry.filename.is_file() {
+            ensure_thumbnail_logged(&entry.filename, state_dir);
+        }
     }
-    Ok(catalogue)
+
+    Ok(fetched)
+}
+
+/// A failed thumbnail is not fatal: `ensure_thumbnail` regenerates missing
+/// thumbs on the next refresh.
+fn ensure_thumbnail_logged(path: &Path, state_dir: &Path) {
+    if let Err(error) = thumbs::ensure_thumbnail(path, state_dir) {
+        tracing::warn!(
+            "thumbnail generation failed for {}: {error}",
+            path.display()
+        );
+    }
+}
+
+/// Pure decisions after a successful fetch (tested): whether to auto-apply
+/// the newest image, whether the cold-start flag is spent, and when the
+/// next refresh is due.
+struct RefreshSuccessPlan {
+    auto_apply: bool,
+    clear_cold_start: bool,
+    delay: Duration,
+}
+
+fn refresh_success_plan(
+    cold_start_pending: bool,
+    live_current: Option<&Path>,
+    newest_fullstartdate: Option<&str>,
+    now: DateTime<Utc>,
+) -> RefreshSuccessPlan {
+    let has_images = newest_fullstartdate.is_some();
+    RefreshSuccessPlan {
+        auto_apply: has_images && wallpaper::should_auto_apply(cold_start_pending, live_current),
+        // The one-shot cold-start auto-apply is spent only once images
+        // actually arrived; a success that somehow yielded none keeps it
+        // armed for the fetch that finally delivers.
+        clear_cold_start: has_images,
+        delay: match newest_fullstartdate {
+            Some(date) => schedule::next_refresh(Some(date), now),
+            // A success that leaves the catalogue empty must not reuse the
+            // 5 s cold-start delay — that would tight-loop against Bing.
+            None => schedule::ERROR_RETRY_DELAY,
+        },
+    }
+}
+
+/// Pure diff of an incoming (externally edited or echoed-back) config
+/// against the current one — which reactions the update handler owes.
+struct ConfigDiff {
+    shuffle_changed: bool,
+    retention_reduced: bool,
+}
+
+fn config_diff(old: &AppletConfig, new: &AppletConfig) -> ConfigDiff {
+    ConfigDiff {
+        shuffle_changed: new.shuffle_enabled != old.shuffle_enabled
+            || new.shuffle_interval_secs != old.shuffle_interval_secs,
+        retention_reduced: schedule::retention_reduced(old.retention_days, new.retention_days),
+    }
 }
 
 impl cosmic::Application for Window {
@@ -363,7 +465,6 @@ impl cosmic::Application for Window {
             timer_generation: 0,
             shuffle_generation: 0,
             shuffle_armed: false,
-            last_user_action: None,
             last_updated: None,
             last_error: None,
         };
@@ -412,21 +513,13 @@ impl cosmic::Application for Window {
                 // an *external* edit of the shuffle settings restarts the
                 // countdown against the new values, and an externally
                 // reduced retention prunes immediately.
-                let shuffle_changed = config.shuffle_enabled != self.config.shuffle_enabled
-                    || config.shuffle_interval_secs != self.config.shuffle_interval_secs;
-                let newly_enabled = config.shuffle_enabled && !self.config.shuffle_enabled;
-                let retention_reduced =
-                    schedule::retention_reduced(self.config.retention_days, config.retention_days);
+                let diff = config_diff(&self.config, &config);
                 self.config = config;
-                if newly_enabled {
-                    // First fire one full interval after enabling.
-                    self.last_user_action = Some(Instant::now());
-                }
                 let mut tasks = Vec::new();
-                if retention_reduced {
+                if diff.retention_reduced {
                     tasks.push(self.prune_immediately());
                 }
-                if shuffle_changed {
+                if diff.shuffle_changed {
                     tasks.push(self.sync_shuffle(true));
                 }
                 if !tasks.is_empty() {
@@ -446,7 +539,6 @@ impl cosmic::Application for Window {
                 match wallpaper::apply(&path) {
                     Ok(()) => {
                         self.current = Some(path);
-                        self.last_user_action = Some(Instant::now());
                         return self.sync_shuffle(true);
                     }
                     Err(error) => {
@@ -484,19 +576,15 @@ impl cosmic::Application for Window {
                         }
                     }
                 }
-                // A tick starts a fresh cycle: the next one comes a full
-                // interval from now, not from the last user action.
-                self.last_user_action = None;
+                // A tick starts a fresh cycle: re-arming waits one full
+                // interval again.
                 return self.sync_shuffle(false);
             }
             Message::SetShuffleEnabled(enabled) => {
                 let mut config = self.config.clone();
                 config.shuffle_enabled = enabled;
                 self.set_config(config);
-                if enabled {
-                    // First fire one full interval after enabling.
-                    self.last_user_action = Some(Instant::now());
-                }
+                // Enabling starts a fresh full-interval countdown.
                 return self.sync_shuffle(true);
             }
             Message::SetShuffleInterval(index) => {
@@ -504,7 +592,6 @@ impl cosmic::Application for Window {
                 config.shuffle_interval_secs = crate::view::shuffle_interval_secs(index);
                 self.set_config(config);
                 // Picking an interval restarts the countdown at that length.
-                self.last_user_action = Some(Instant::now());
                 return self.sync_shuffle(true);
             }
             Message::SetRetention(index) => {
@@ -526,37 +613,58 @@ impl cosmic::Application for Window {
             Message::RefreshFinished(result) => {
                 self.refresh_pending = false;
                 match result {
-                    Ok(catalogue) => {
-                        self.catalogue = catalogue;
-                        self.last_updated = Some(Utc::now());
-                        self.last_error = None;
+                    Ok(fetched) => {
+                        // Merge into the *live* catalogue: a wholesale
+                        // replacement from the pipeline's snapshot would
+                        // resurrect entries a concurrent prune removed.
+                        self.catalogue.merge(fetched);
 
-                        // Auto-apply per the "don't clobber" rule, judged
-                        // against what is applied *right now*.
+                        // Prune here on the UI thread, against what is
+                        // applied *right now* and the *current* retention —
+                        // the pipeline's start-of-fetch snapshot may be
+                        // stale on both counts, and the currently applied
+                        // file must never be deleted.
                         let live = wallpaper::current_source();
                         if let Some(live) = &live {
                             self.current = Some(live.clone());
                         }
-                        if let Some(newest) = self.catalogue.newest()
-                            && schedule::should_auto_apply(
-                                self.first_fetch_pending,
-                                live.as_deref(),
-                            )
+                        let removed = self.catalogue.prune(
+                            self.config.retention_days,
+                            self.current.as_deref(),
+                            Utc::now(),
+                        );
+                        thumbs::remove_thumbnails(&removed, &state_dir());
+                        if let Err(error) = self.catalogue.save(&catalogue_path()) {
+                            // Non-fatal: the catalogue is rebuildable from
+                            // the folder scan.
+                            tracing::warn!("failed to persist catalogue: {error}");
+                        }
+
+                        self.last_updated = Some(Utc::now());
+                        self.last_error = None;
+
+                        let plan = refresh_success_plan(
+                            self.first_fetch_pending,
+                            live.as_deref(),
+                            self.catalogue.newest().map(|e| e.fullstartdate.as_str()),
+                            Utc::now(),
+                        );
+                        if plan.auto_apply
+                            && let Some(newest) = self.catalogue.newest()
                         {
-                            match wallpaper::apply(&newest.filename) {
-                                Ok(()) => self.current = Some(newest.filename.clone()),
+                            let path = newest.filename.clone();
+                            match wallpaper::apply(&path) {
+                                Ok(()) => self.current = Some(path),
                                 Err(error) => {
                                     tracing::warn!("failed to apply wallpaper: {error}");
                                 }
                             }
                         }
-                        self.first_fetch_pending = false;
+                        if plan.clear_cold_start {
+                            self.first_fetch_pending = false;
+                        }
 
-                        let delay = schedule::next_refresh(
-                            self.catalogue.newest().map(|e| e.fullstartdate.as_str()),
-                            Utc::now(),
-                        );
-                        let refresh_timer = self.schedule_refresh(delay);
+                        let refresh_timer = self.schedule_refresh(plan.delay);
                         // A grown catalogue may unlock a waiting shuffle
                         // (≥2 images); a pending tick keeps its countdown.
                         let shuffle = self.sync_shuffle(false);
@@ -620,6 +728,10 @@ mod tests {
 
     #[test]
     fn state_paths_live_under_the_app_id() {
+        if dirs::home_dir().is_none() {
+            eprintln!("skipping: no home dir in this environment");
+            return;
+        }
         let state = state_dir();
         assert!(state.ends_with(APP_ID));
         assert!(state.is_absolute());
@@ -638,15 +750,179 @@ mod tests {
         assert_eq!(window.status_line(), "Checking for new images…");
         window.refresh_pending = false;
 
-        // Fetch failed → the plan's exact error footer.
-        window.last_error = Some("boom".to_owned());
+        // Fetch failed → the plan's exact error footer for network trouble…
+        window.last_error = Some(RefreshError::Network("boom".to_owned()));
         assert_eq!(window.status_line(), "Bing unreachable — retrying in 1 h");
+        // …while a local I/O failure is not blamed on Bing.
+        window.last_error = Some(RefreshError::Disk("disk full".to_owned()));
+        assert_eq!(window.status_line(), "Disk error — retrying in 1 h");
 
         // Success clears the error and records the time (relative wording
-        // itself is covered by `view::format_updated`'s tests).
+        // itself is covered by `view::format_updated`'s tests; only the
+        // prefix is asserted here so the test cannot flake across a local
+        // midnight between the two `now()` reads).
         window.last_error = None;
         window.last_updated = Some(Utc::now());
-        assert!(window.status_line().starts_with("Updated today at "));
+        assert!(window.status_line().starts_with("Updated"));
+    }
+
+    #[test]
+    fn refresh_error_classifies_local_versus_network() {
+        let disk: RefreshError = bing::FetchError::from(std::io::Error::other("disk full")).into();
+        assert!(matches!(disk, RefreshError::Disk(_)));
+        let net: RefreshError = bing::FetchError::EmptyList.into();
+        assert!(matches!(net, RefreshError::Network(_)));
+    }
+
+    #[test]
+    fn config_diff_detects_shuffle_and_retention_changes() {
+        let base = AppletConfig::default();
+
+        // Echoed-back identical config: nothing owed.
+        let diff = config_diff(&base, &base.clone());
+        assert!(!diff.shuffle_changed);
+        assert!(!diff.retention_reduced);
+
+        // Shuffle toggled.
+        let mut toggled = base.clone();
+        toggled.shuffle_enabled = true;
+        assert!(config_diff(&base, &toggled).shuffle_changed);
+
+        // Interval changed.
+        let mut interval = base.clone();
+        interval.shuffle_interval_secs = 1_800;
+        assert!(config_diff(&base, &interval).shuffle_changed);
+
+        // Retention reduced (8 → 3) prunes; loosened (8 → 30) does not.
+        let mut reduced = base.clone();
+        reduced.retention_days = 3;
+        let diff = config_diff(&base, &reduced);
+        assert!(diff.retention_reduced);
+        assert!(!diff.shuffle_changed);
+        let mut loosened = base.clone();
+        loosened.retention_days = 30;
+        assert!(!config_diff(&base, &loosened).retention_reduced);
+    }
+
+    #[test]
+    fn refresh_success_plan_with_images_applies_and_reschedules() {
+        let now = Utc::now();
+        // Cold start: auto-apply regardless of the live wallpaper, spend
+        // the cold-start flag, reschedule off the newest fullstartdate.
+        let plan = refresh_success_plan(
+            true,
+            Some(std::path::Path::new("/usr/share/backgrounds/x.jpg")),
+            Some("202608070700"),
+            now,
+        );
+        assert!(plan.auto_apply);
+        assert!(plan.clear_cold_start);
+        assert_eq!(
+            plan.delay,
+            schedule::next_refresh(Some("202608070700"), now)
+        );
+
+        // Warm, foreign wallpaper: never clobber, but the flag is spent.
+        let plan = refresh_success_plan(
+            false,
+            Some(std::path::Path::new("/usr/share/backgrounds/x.jpg")),
+            Some("202608070700"),
+            now,
+        );
+        assert!(!plan.auto_apply);
+        assert!(plan.clear_cold_start);
+    }
+
+    #[test]
+    fn refresh_success_plan_without_images_backs_off_and_keeps_cold_start() {
+        // A "successful" fetch that still leaves no images: no 5 s
+        // cold-start delay (tight loop against Bing), no auto-apply, and
+        // the cold-start flag stays armed for the fetch that delivers.
+        let plan = refresh_success_plan(true, None, None, Utc::now());
+        assert!(!plan.auto_apply);
+        assert!(!plan.clear_cold_start);
+        assert_eq!(plan.delay, schedule::ERROR_RETRY_DELAY);
+    }
+
+    /// One-image HPImageArchive response for the pipeline tests below.
+    const LIST_JSON: &str = r#"{"images":[{"urlbase":"/th?id=OHR.Foo_ROW1","startdate":"20260807","fullstartdate":"202608070700","copyright":"Foo place (© Bar)","copyrightlink":"https://example.com/foo"}]}"#;
+
+    #[tokio::test]
+    async fn pipeline_downloads_missing_images_and_thumbnails() {
+        let dir = tempfile::tempdir().unwrap();
+        let download_dir = dir.path().join("images");
+        let state = dir.path().join("state");
+        // A stale .part from a crashed download must be swept.
+        std::fs::create_dir_all(&download_dir).unwrap();
+        let stale_part = download_dir.join("20260101-Old_ROW0_UHD.jpg.part");
+        std::fs::write(&stale_part, b"torn").unwrap();
+
+        let jpeg = crate::testutil::tiny_jpeg(64, 36);
+        let expected = jpeg.clone();
+        let base = crate::testutil::spawn_mock(move |path| {
+            if path.starts_with("/HPImageArchive.aspx") {
+                (200, LIST_JSON.as_bytes().to_vec())
+            } else if path.starts_with("/th?id=OHR.") {
+                (200, jpeg.clone())
+            } else {
+                (404, Vec::new())
+            }
+        });
+
+        let client = bing::http_client().unwrap();
+        let fetched = fetch_and_download(
+            &client,
+            &base,
+            &Catalogue::default(),
+            1,
+            &download_dir,
+            &state,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fetched.len(), 1);
+        let path = &fetched[0].filename;
+        assert_eq!(path, &download_dir.join("20260807-Foo_ROW1_UHD.jpg"));
+        assert_eq!(std::fs::read(path).unwrap(), expected);
+        assert_eq!(fetched[0].title, "Foo place");
+        assert!(thumbs::thumbnail_path(path, &state).is_file());
+        assert!(!stale_part.exists(), "orphaned .part must be swept");
+    }
+
+    #[tokio::test]
+    async fn pipeline_never_downloads_when_the_catalogue_holds_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let download_dir = dir.path().join("images");
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&download_dir).unwrap();
+        // The image already on disk at a *different* resolution suffix
+        // (folder written by the reference GNOME extension) — only a
+        // catalogue lookup finds it; a bare UHD-path existence check would
+        // re-download.
+        let existing = download_dir.join("20260807-Foo_ROW1_1920x1080.jpg");
+        std::fs::write(&existing, crate::testutil::tiny_jpeg(64, 36)).unwrap();
+        let catalogue = Catalogue::rebuild_from_folder(&download_dir);
+
+        // Any download attempt gets a 500 and would fail the pipeline.
+        let base = crate::testutil::spawn_mock(|path| {
+            if path.starts_with("/HPImageArchive.aspx") {
+                (200, LIST_JSON.as_bytes().to_vec())
+            } else {
+                (500, Vec::new())
+            }
+        });
+
+        let client = bing::http_client().unwrap();
+        let fetched = fetch_and_download(&client, &base, &catalogue, 1, &download_dir, &state)
+            .await
+            .expect("existing file must be reused, not re-downloaded");
+
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].filename, existing);
+        assert!(!download_dir.join("20260807-Foo_ROW1_UHD.jpg").exists());
+        // The thumbnail backfill covered the pre-existing entry too.
+        assert!(thumbs::thumbnail_path(&existing, &state).is_file());
     }
 
     #[test]

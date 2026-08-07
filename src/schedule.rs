@@ -6,12 +6,9 @@
 // is *reset* to 60 s (not clamped), and a 5-minute fudge offset is added
 // afterwards in case of an inaccurate local clock.
 
-use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use chrono::{DateTime, NaiveDateTime, Utc};
-
-use crate::wallpaper;
 
 /// Cold start (empty catalogue): fetch shortly after startup.
 pub const COLD_START_DELAY: Duration = Duration::from_secs(5);
@@ -78,36 +75,26 @@ pub fn retention_reduced(old_days: u16, new_days: u16) -> bool {
     old_days == 0 || new_days < old_days
 }
 
-/// How long until the next shuffle tick.
-///
-/// The countdown runs from the last user action that resets it — enabling
-/// shuffle, changing the interval, or manual prev/next/newest navigation —
-/// so the first fire comes one full interval after enabling, and browsing
-/// by hand postpones the next automatic rotation. `None` (no reset this
-/// session, e.g. shuffle restored as enabled at startup, or the cycle
-/// after a tick) also waits one full interval. An action more than one
-/// interval ago yields [`Duration::ZERO`] (fire now).
-pub fn next_shuffle_delay(
-    interval_secs: u32,
-    last_user_action: Option<Instant>,
-    now: Instant,
-) -> Duration {
-    let interval = Duration::from_secs(u64::from(interval_secs));
-    match last_user_action {
-        None => interval,
-        Some(at) => interval.saturating_sub(now.saturating_duration_since(at)),
-    }
-}
+/// Fallback when a hand-edited `shuffle_interval_secs` is `0` (the daily
+/// default, matching the dropdown's garbage fallback).
+const SHUFFLE_FALLBACK_SECS: u64 = 86_400;
 
-/// The "don't clobber" auto-apply rule: apply the freshly fetched image iff
-/// (a) this is the very first successful fetch after a cold start (the
-/// reason the user installed the applet), or (b) the currently applied
-/// wallpaper is a file inside our download folder. If the user picked
-/// another wallpaper in COSMIC Settings (or uses a color/per-output setup,
-/// where `current_source` is `None`), the applet downloads but does not
-/// apply until they act.
-pub fn should_auto_apply(cold_start_first_fetch: bool, current_source: Option<&Path>) -> bool {
-    cold_start_first_fetch || current_source.is_some_and(wallpaper::is_ours)
+/// Floor for non-zero hand-edited intervals: anything shorter would strobe
+/// the wallpaper.
+const SHUFFLE_MIN_SECS: u64 = 60;
+
+/// The shuffle timer's arming delay: one full sanitized interval. Enabling
+/// shuffle, changing the interval, and manual navigation all re-arm the
+/// timer, so each acts as a countdown reset; after every automatic tick
+/// the next cycle is again one full interval. Hand-edited config values
+/// are sanitized here — `0` falls back to the daily default and anything
+/// under a minute is floored — so a bad value can never produce a
+/// zero-delay wallpaper-strobe loop.
+pub fn shuffle_interval(interval_secs: u32) -> Duration {
+    match u64::from(interval_secs) {
+        0 => Duration::from_secs(SHUFFLE_FALLBACK_SECS),
+        s => Duration::from_secs(s.max(SHUFFLE_MIN_SECS)),
+    }
 }
 
 #[cfg(test)]
@@ -211,79 +198,26 @@ mod tests {
         assert!(!retention_reduced(8, 8));
     }
 
-    /// A "now" far enough from the process start that subtracting test
-    /// offsets can never underflow the monotonic clock.
-    fn shuffle_now() -> Instant {
-        Instant::now() + Duration::from_secs(100_000)
+    #[test]
+    fn shuffle_interval_passes_real_choices_through() {
+        for secs in [1_800u32, 3_600, 21_600, 86_400] {
+            assert_eq!(
+                shuffle_interval(secs),
+                Duration::from_secs(u64::from(secs)),
+                "{secs}"
+            );
+        }
     }
 
     #[test]
-    fn shuffle_fresh_enable_waits_one_full_interval() {
-        let now = shuffle_now();
-        // No reset recorded this session → full interval…
-        assert_eq!(
-            next_shuffle_delay(1_800, None, now),
-            Duration::from_secs(1_800)
-        );
-        // …and an action at this very instant (the enable itself) too.
-        assert_eq!(
-            next_shuffle_delay(86_400, Some(now), now),
-            Duration::from_secs(86_400)
-        );
-    }
-
-    #[test]
-    fn shuffle_reset_counts_down_from_the_action() {
-        let now = shuffle_now();
-        // Manual navigation 10 minutes ago, 30-minute interval → 20 minutes.
-        let action = now - Duration::from_secs(600);
-        assert_eq!(
-            next_shuffle_delay(1_800, Some(action), now),
-            Duration::from_secs(1_200)
-        );
-    }
-
-    #[test]
-    fn shuffle_elapsed_interval_fires_immediately() {
-        let now = shuffle_now();
-        // Exactly one interval since the action → due now.
-        assert_eq!(
-            next_shuffle_delay(1_800, Some(now - Duration::from_secs(1_800)), now),
-            Duration::ZERO
-        );
-        // Long past it → still zero, never negative (saturating).
-        assert_eq!(
-            next_shuffle_delay(1_800, Some(now - Duration::from_secs(7_200)), now),
-            Duration::ZERO
-        );
-    }
-
-    #[test]
-    fn auto_apply_on_cold_start_first_fetch_regardless_of_current() {
-        assert!(should_auto_apply(true, None));
-        assert!(should_auto_apply(
-            true,
-            Some(Path::new("/usr/share/backgrounds/cosmic/x.jpg"))
-        ));
-    }
-
-    #[test]
-    fn auto_apply_when_current_is_ours() {
-        let ours = wallpaper::download_dir().join("20260807-Foo_UHD.jpg");
-        assert!(should_auto_apply(false, Some(&ours)));
-    }
-
-    #[test]
-    fn no_auto_apply_when_current_is_not_ours() {
-        // The user's own wallpaper must not be clobbered.
-        assert!(!should_auto_apply(
-            false,
-            Some(Path::new("/usr/share/backgrounds/cosmic/x.jpg"))
-        ));
-        // Unknown current (color source, per-output mode, unreadable
-        // config) is conservatively "not ours".
-        assert!(!should_auto_apply(false, None));
-        // The download dir itself (slideshow source) is not "our image".
-        assert!(!should_auto_apply(false, Some(&wallpaper::download_dir())));
+    fn shuffle_interval_sanitizes_hand_edited_garbage() {
+        // A hand-edited 0 must never yield a zero-delay strobe loop.
+        assert_eq!(shuffle_interval(0), Duration::from_secs(86_400));
+        // Tiny non-zero values are floored to a minute.
+        assert_eq!(shuffle_interval(1), Duration::from_secs(60));
+        assert_eq!(shuffle_interval(59), Duration::from_secs(60));
+        assert_eq!(shuffle_interval(60), Duration::from_secs(60));
+        // Custom-but-sane values are honored as-is.
+        assert_eq!(shuffle_interval(7_200), Duration::from_secs(7_200));
     }
 }

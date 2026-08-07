@@ -22,19 +22,35 @@ from the GNOME extension is picked up as-is — no re-downloads.
   ("Bing unreachable — retrying in 1 h") and retry automatically.
 - **Shuffle** — rotate among downloaded images every 30 min / 1 h / 6 h / daily.
 - **Retention** — keep 3 / 8 / 30 days of images, or forever.
+- **Image details** — click the thumbnail to open the full-size image in your
+  default viewer, or use "About this image" to open Bing's info page in the
+  browser (both launched via `xdg-open`, so `xdg-utils` is needed at runtime).
 - **Respects your choices** — if you set a different wallpaper in COSMIC
   Settings, the applet keeps downloading but stops auto-applying until you act
   (prev/next/newest/shuffle).
 
 ## Build & install
 
-Requires Rust (edition 2024, rustc ≥ 1.85) and [`just`](https://github.com/casey/just).
+Requires Rust (edition 2024; developed and tested with rustc 1.97),
+[`just`](https://github.com/casey/just), and the native libraries libcosmic
+links against — `pkg-config`, the libxkbcommon development headers, and the
+Wayland development libraries. On Fedora:
+
+```bash
+sudo dnf install cargo just pkgconf-pkg-config libxkbcommon-devel wayland-devel
+```
 
 ```bash
 just build              # release build
 just install            # install to ~/.local (binary, .desktop, icon)
 just uninstall
 ```
+
+`just uninstall` removes only what `just install` put in place (binary,
+desktop entry, icon). Downloaded images (`~/Pictures/BingWallpaper`), the
+catalogue/thumbnails (`~/.local/state/io.github.ercling.CosmicBingWallpaper/`),
+and settings (`~/.config/cosmic/io.github.ercling.CosmicBingWallpaper/`) are
+left behind — delete them by hand if you want a clean sweep.
 
 `just install` needs no sudo (per-user install). For a system-wide or packaged
 install, override the prefix: `just prefix=/usr/local install` or
@@ -68,28 +84,34 @@ Bing's UHD images are roughly **5 MB each**. Expect about:
 
 ## Limitations (v1)
 
-- **External wallpaper changes are not watched.** If you change the wallpaper in
-  COSMIC Settings while the applet runs, the applet's idea of "current" only
-  refreshes on its next apply or on restart. (It does correctly refrain from
-  clobbering your choice on background refreshes.)
+- **External wallpaper changes are not watched live.** The applet re-reads
+  cosmic-bg's config at startup, around every fetch, and when it prunes — not
+  the instant you change the wallpaper in COSMIC Settings. Between those reads
+  its idea of "current" can be stale, but it still correctly refrains from
+  clobbering your choice on background refreshes.
 - **Per-output backgrounds collapse to same-on-all.** Applying a wallpaper sets
   `same-on-all = true` and writes the shared `all` entry — a per-display
   background setup is intentionally replaced on first apply.
 - **Timers only run while the panel runs.** There is no daemon; a machine that
   is off at refresh time catches up at next login (same trade-off as the GNOME
-  extension).
+  extension). Timers also don't advance during suspend, so a refresh that came
+  due while the machine slept fires late after resume rather than immediately.
 - Market is auto-detected, resolution is fixed at UHD, and the download folder
   is fixed at `~/Pictures/BingWallpaper`.
 
 ## Development
 
 ```bash
-just check              # fmt --check + clippy -D warnings + test
+just check              # fmt --check + clippy --all-targets -D warnings + test
 cargo test
-cargo clippy
+cargo clippy --all-targets -- -D warnings
 cargo fmt
 ```
 
 Note: on machines where linuxbrew's `pkg-config` shadows the system one, cargo
 needs `PKG_CONFIG_PATH=/usr/lib64/pkgconfig:/usr/share/pkgconfig` — the
 `justfile` exports this automatically, so prefer `just check` / `just build`.
+
+## License
+
+[GPL-3.0-only](LICENSE), like the GNOME extension that inspired it.

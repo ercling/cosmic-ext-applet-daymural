@@ -22,7 +22,7 @@ build:
 
 check:
     cargo fmt --check
-    cargo clippy -- -D warnings
+    cargo clippy --all-targets -- -D warnings
     cargo test
 
 # Install binary, desktop entry (Exec= rewritten to the absolute binary path — cosmic-panel may not have the bindir in PATH), and icon.

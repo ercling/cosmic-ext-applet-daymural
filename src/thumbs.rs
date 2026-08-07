@@ -51,6 +51,21 @@ pub fn ensure_thumbnail(image_path: &Path, state_dir: &Path) -> Result<PathBuf, 
     Ok(thumb)
 }
 
+/// Best-effort removal of the cached thumbnails belonging to `images`
+/// (called with the paths a prune removed, so the thumbs dir does not
+/// grow without bound). A missing thumbnail is fine; any other failure is
+/// logged and skipped.
+pub fn remove_thumbnails(images: &[PathBuf], state_dir: &Path) {
+    for image in images {
+        let thumb = thumbnail_path(image, state_dir);
+        match fs::remove_file(&thumb) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!("failed to remove thumbnail {}: {e}", thumb.display()),
+        }
+    }
+}
+
 /// A thumbnail is fresh when it exists and is at least as new as the
 /// source image. Unreadable mtimes count as stale (regenerate — cheap
 /// and safe).
@@ -156,5 +171,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nope.jpg");
         assert!(ensure_thumbnail(&missing, dir.path()).is_err());
+    }
+
+    #[test]
+    fn remove_thumbnails_deletes_matching_thumbs_and_ignores_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let pruned = dir.path().join("20260801-Gone_ROW1_UHD.jpg");
+        let kept = dir.path().join("20260807-Kept_ROW2_UHD.jpg");
+        let pruned_thumb = thumbnail_path(&pruned, &state);
+        let kept_thumb = thumbnail_path(&kept, &state);
+        fs::create_dir_all(pruned_thumb.parent().unwrap()).unwrap();
+        fs::write(&pruned_thumb, b"thumb").unwrap();
+        fs::write(&kept_thumb, b"thumb").unwrap();
+
+        // One image without a thumbnail in the list: must not panic.
+        let no_thumb = dir.path().join("20260805-NoThumb_ROW3_UHD.jpg");
+        remove_thumbnails(&[pruned, no_thumb], &state);
+
+        assert!(!pruned_thumb.exists(), "pruned image's thumb must go");
+        assert!(kept_thumb.exists(), "unrelated thumbs must survive");
     }
 }

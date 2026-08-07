@@ -21,9 +21,8 @@ use cosmic_bg_config::{Config, DEFAULT_BACKGROUND, Entry, Source};
 
 /// A cosmic-bg config operation failed. Carries the underlying error's
 /// message (the concrete error type lives in a crate instance this crate
-/// cannot name — see module comment). `Clone` so it can ride in iced
-/// messages.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// cannot name — see module comment). Only ever logged, never matched on.
+#[derive(Debug)]
 pub struct WallpaperError(String);
 
 impl fmt::Display for WallpaperError {
@@ -69,6 +68,14 @@ pub fn updated_entry(existing: Option<Entry>, path: &Path) -> Entry {
 /// `same-on-all` flips to true, cosmic-bg already sees the new image (no
 /// flash of the previous default). Both writes are change-only, so a
 /// re-apply of the current image touches nothing.
+///
+/// Test note: `apply` and `current_source` have no automated coverage —
+/// `cosmic_bg_config::context()` always opens the *real* user config, and
+/// building a `Context` rooted elsewhere requires naming the crate's own
+/// `cosmic_config` instance, which this crate cannot (see module comment).
+/// They remain covered by the Post-Completion manual smoke test; the pure
+/// halves (`updated_entry`, `is_ours`, `should_auto_apply`) are unit-tested
+/// below.
 pub fn apply(path: &Path) -> Result<(), WallpaperError> {
     let context = cosmic_bg_config::context().map_err(config_err)?;
     let entry = updated_entry(context.entry(DEFAULT_BACKGROUND).ok(), path);
@@ -102,6 +109,17 @@ pub fn current_source() -> Option<PathBuf> {
 /// rule's test for "the current wallpaper is one of ours".
 pub fn is_ours(path: &Path) -> bool {
     is_inside(path, &download_dir())
+}
+
+/// The "don't clobber" auto-apply rule: apply the freshly fetched image iff
+/// (a) this is the very first successful fetch after a cold start (the
+/// reason the user installed the applet), or (b) the currently applied
+/// wallpaper is a file inside our download folder. If the user picked
+/// another wallpaper in COSMIC Settings (or uses a color/per-output setup,
+/// where `current_source` is `None`), the applet downloads but does not
+/// apply until they act.
+pub fn should_auto_apply(cold_start_first_fetch: bool, current_source: Option<&Path>) -> bool {
+    cold_start_first_fetch || current_source.is_some_and(is_ours)
 }
 
 /// Lexical containment: `path` is strictly inside `dir` (the dir itself does
@@ -180,9 +198,13 @@ mod tests {
 
     #[test]
     fn download_dir_is_under_home_pictures() {
+        if dirs::home_dir().is_none() {
+            eprintln!("skipping: no home dir in this environment");
+            return;
+        }
         let dir = download_dir();
         assert!(dir.ends_with("Pictures/BingWallpaper"));
-        assert!(dir.is_absolute(), "home dir should resolve in tests");
+        assert!(dir.is_absolute());
     }
 
     #[test]
@@ -197,6 +219,39 @@ mod tests {
         assert!(!is_ours(Path::new("/usr/share/backgrounds/cosmic/x.jpg")));
         assert!(!is_ours(Path::new("Pictures/BingWallpaper/x.jpg"))); // relative
         assert!(!is_ours(&download_dir())); // the folder, not a file in it
+    }
+
+    #[test]
+    fn auto_apply_on_cold_start_first_fetch_regardless_of_current() {
+        assert!(should_auto_apply(true, None));
+        assert!(should_auto_apply(
+            true,
+            Some(Path::new("/usr/share/backgrounds/cosmic/x.jpg"))
+        ));
+    }
+
+    #[test]
+    fn auto_apply_when_current_is_ours() {
+        if dirs::home_dir().is_none() {
+            eprintln!("skipping: no home dir in this environment");
+            return;
+        }
+        let ours = download_dir().join("20260807-Foo_UHD.jpg");
+        assert!(should_auto_apply(false, Some(&ours)));
+    }
+
+    #[test]
+    fn no_auto_apply_when_current_is_not_ours() {
+        // The user's own wallpaper must not be clobbered.
+        assert!(!should_auto_apply(
+            false,
+            Some(Path::new("/usr/share/backgrounds/cosmic/x.jpg"))
+        ));
+        // Unknown current (color source, per-output mode, unreadable
+        // config) is conservatively "not ours".
+        assert!(!should_auto_apply(false, None));
+        // The download dir itself (slideshow source) is not "our image".
+        assert!(!should_auto_apply(false, Some(&download_dir())));
     }
 
     #[test]
