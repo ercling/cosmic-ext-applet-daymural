@@ -10,6 +10,8 @@ mod catalogue;
 mod config;
 #[allow(dead_code)]
 mod thumbs;
+#[allow(dead_code)]
+mod wallpaper;
 
 fn main() -> cosmic::iced::Result {
     tracing_subscriber::fmt()

@@ -299,11 +299,11 @@ struct AppletConfig {
 **Files:**
 - Create: `src/wallpaper.rs`
 
-- [ ] pure helper `updated_entry(existing: Option<Entry>, path: &Path) -> Entry`: change only `source: Source::Path(..)`, preserve scaling_mode/filter_method/etc.; `None` → build from cosmic-bg's defaults
-- [ ] `apply(path)`: load cosmic-bg config via `cosmic-bg-config` helper, set `same-on-all = true`, write the `all` entry (decision: per-output setups collapse to same-on-all — verify the exact keys cosmic-settings writes in `pop-os/cosmic-bg` + cosmic-settings source); errors surfaced, not panicking
-- [ ] `current_source() -> Option<PathBuf>`: read back what's applied; also `is_ours(path) -> bool` (file inside `~/Pictures/BingWallpaper`) for the auto-apply rule
-- [ ] write tests for `updated_entry` (preserves fields, sets source, `None` case) and `is_ours` (inside/outside/relative paths); live config write verified manually
-- [ ] run tests - must pass before task 7
+- [x] pure helper `updated_entry(existing: Option<Entry>, path: &Path) -> Entry`: change only `source: Source::Path(..)`, preserve scaling_mode/filter_method/etc.; `None` → build from cosmic-bg's defaults (also pins `output` to `"all"` — the key we write under)
+- [x] `apply(path)`: load cosmic-bg config via `cosmic-bg-config` helper, set `same-on-all = true`, write the `all` entry (decision: per-output setups collapse to same-on-all — verify the exact keys cosmic-settings writes in `pop-os/cosmic-bg` + cosmic-settings source); errors surfaced, not panicking (keys verified against cosmic-bg's own watch handler at the pinned rev — `same-on-all`, `all`, `backgrounds`, `output.*`; writes go through `Config::set_entry` + `Context::set_same_on_all` — both change-only — with the `all` entry written **before** flipping `same-on-all` so no old-image flash; errors map into local `WallpaperError` because cosmic-bg-config's `cosmic_config` error type lives in a crate instance we cannot name)
+- [x] `current_source() -> Option<PathBuf>`: read back what's applied; also `is_ours(path) -> bool` (file inside `~/Pictures/BingWallpaper`) for the auto-apply rule (`current_source` returns `None` for color sources, unreadable config, or `same-on-all = false` — per-output mode conservatively counts as "not ours"; `download_dir()` helper added here for Task 7 reuse)
+- [x] write tests for `updated_entry` (preserves fields, sets source, `None` case) and `is_ours` (inside/outside/relative paths); live config write verified manually (also: output pinned to `all`, color→path source swap keeps scaling, component-wise not string-prefix containment, dir-itself excluded; live apply deferred to Post-Completion manual smoke test — user's wallpaper untouched during implementation)
+- [x] run tests - must pass before task 7 (`cargo test`: 55 passed; clippy clean; fmt clean)
 
 ### Task 7: Refresh scheduling + fetch pipeline in the update loop
 
