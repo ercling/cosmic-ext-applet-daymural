@@ -10,7 +10,7 @@ use std::net::TcpListener;
 /// query string) to `(status, body)`. The server thread runs detached for
 /// the rest of the test process; every response closes its connection so
 /// the client's pool never holds a stale socket.
-pub(crate) fn spawn_mock(routes: impl Fn(&str) -> (u16, Vec<u8>) + Send + 'static) -> String {
+pub fn spawn_mock(routes: impl Fn(&str) -> (u16, Vec<u8>) + Send + 'static) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback mock server");
     let base = format!("http://{}", listener.local_addr().unwrap());
     std::thread::spawn(move || {
@@ -46,7 +46,7 @@ pub(crate) fn spawn_mock(routes: impl Fn(&str) -> (u16, Vec<u8>) + Send + 'stati
 
 /// A real, decodable JPEG of the given size, in memory (for mock download
 /// bodies that must pass both the magic-byte check and thumbnailing).
-pub(crate) fn tiny_jpeg(width: u32, height: u32) -> Vec<u8> {
+pub fn tiny_jpeg(width: u32, height: u32) -> Vec<u8> {
     let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(width, height, |x, y| {
         image::Rgb([(x % 256) as u8, (y % 256) as u8, 128])
     }));

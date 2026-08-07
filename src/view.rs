@@ -10,11 +10,11 @@ use chrono::NaiveDateTime;
 use cosmic::{
     Element,
     applet::{menu_button, padded_control},
-    iced::{Alignment, Length},
+    iced::{Alignment, Length, window::Id},
     widget,
 };
 
-use crate::app::{self, Message, Window};
+use crate::app::{self, Message, RefreshError, Window};
 use crate::catalogue::{Catalogue, ImageEntry};
 use crate::thumbs;
 
@@ -29,6 +29,10 @@ const SHUFFLE_INTERVAL_SECS: [u32; 4] = [1_800, 3_600, 21_600, 86_400];
 
 /// Dropdown labels for the shuffle intervals.
 const SHUFFLE_INTERVAL_LABELS: &[&str] = &["30 minutes", "1 hour", "6 hours", "Daily"];
+
+/// Dropdown index of the default shuffle interval (daily) — the fallback
+/// for hand-edited config values that match no choice.
+const SHUFFLE_DEFAULT_INDEX: usize = SHUFFLE_INTERVAL_SECS.len() - 1;
 
 /// Retention choices in days (0 = keep forever), index-aligned with
 /// [`RETENTION_LABELS`].
@@ -49,10 +53,7 @@ const RETENTION_DEFAULT_INDEX: usize = 1;
 /// of ours, otherwise the newest downloaded image (the user's own wallpaper
 /// cannot be thumbnailed without decoding it — accepted, matches the
 /// reference which also only previews its own images).
-pub(crate) fn displayed<'a>(
-    catalogue: &'a Catalogue,
-    current: Option<&Path>,
-) -> Option<&'a ImageEntry> {
+pub fn displayed<'a>(catalogue: &'a Catalogue, current: Option<&Path>) -> Option<&'a ImageEntry> {
     current
         .and_then(|c| catalogue.images.iter().find(|e| e.filename == c))
         .or_else(|| catalogue.newest())
@@ -61,10 +62,7 @@ pub(crate) fn displayed<'a>(
 /// Target for the "previous" button. Browsing our history walks one step
 /// older; a foreign (or unknown) current wallpaper enters the history at
 /// its newest end. `None` = disabled (oldest end, or nothing downloaded).
-pub(crate) fn prev_target<'a>(
-    catalogue: &'a Catalogue,
-    current: Option<&Path>,
-) -> Option<&'a ImageEntry> {
+pub fn prev_target<'a>(catalogue: &'a Catalogue, current: Option<&Path>) -> Option<&'a ImageEntry> {
     match current {
         Some(c) if catalogue.contains(c) => catalogue.prev(c),
         _ => catalogue.newest(),
@@ -74,10 +72,7 @@ pub(crate) fn prev_target<'a>(
 /// Target for the "next" button: one step newer, only meaningful while the
 /// current wallpaper is inside our history. `None` = disabled (newest end,
 /// foreign wallpaper, or nothing downloaded).
-pub(crate) fn next_target<'a>(
-    catalogue: &'a Catalogue,
-    current: Option<&Path>,
-) -> Option<&'a ImageEntry> {
+pub fn next_target<'a>(catalogue: &'a Catalogue, current: Option<&Path>) -> Option<&'a ImageEntry> {
     current
         .filter(|c| catalogue.contains(c))
         .and_then(|c| catalogue.next(c))
@@ -85,7 +80,7 @@ pub(crate) fn next_target<'a>(
 
 /// Target for the "jump to newest" button. `None` = disabled (already
 /// applied, or nothing downloaded).
-pub(crate) fn newest_target<'a>(
+pub fn newest_target<'a>(
     catalogue: &'a Catalogue,
     current: Option<&Path>,
 ) -> Option<&'a ImageEntry> {
@@ -97,7 +92,7 @@ pub(crate) fn newest_target<'a>(
 /// Heading text for an entry. Entries rebuilt from a folder scan carry no
 /// title until the next fetch refills it — fall back to the file stem so
 /// the user still sees which image is applied.
-pub(crate) fn display_title(entry: &ImageEntry) -> String {
+pub fn display_title(entry: &ImageEntry) -> String {
     if !entry.title.is_empty() {
         return entry.title.clone();
     }
@@ -111,7 +106,7 @@ pub(crate) fn display_title(entry: &ImageEntry) -> String {
 
 /// Footer timestamp: "Updated today at 09:12" / "… yesterday at …" /
 /// "Updated Aug 5 at 09:12". Both instants are local wall-clock time.
-pub(crate) fn format_updated(updated: NaiveDateTime, now: NaiveDateTime) -> String {
+pub fn format_updated(updated: NaiveDateTime, now: NaiveDateTime) -> String {
     let time = updated.format("%H:%M");
     if updated.date() == now.date() {
         format!("Updated today at {time}")
@@ -125,23 +120,26 @@ pub(crate) fn format_updated(updated: NaiveDateTime, now: NaiveDateTime) -> Stri
 /// Dropdown index for a stored interval. Unknown values (hand-edited
 /// config) display as the daily default rather than crashing or showing
 /// an empty selection.
-pub(crate) fn shuffle_interval_index(secs: u32) -> usize {
+pub fn shuffle_interval_index(secs: u32) -> usize {
     SHUFFLE_INTERVAL_SECS
         .iter()
         .position(|&s| s == secs)
-        .unwrap_or(SHUFFLE_INTERVAL_SECS.len() - 1)
+        .unwrap_or(SHUFFLE_DEFAULT_INDEX)
 }
 
 /// Interval seconds for a dropdown index. Out-of-range indices (cannot
 /// happen through the UI) fall back to daily.
-pub(crate) fn shuffle_interval_secs(index: usize) -> u32 {
-    SHUFFLE_INTERVAL_SECS.get(index).copied().unwrap_or(86_400)
+pub fn shuffle_interval_secs(index: usize) -> u32 {
+    SHUFFLE_INTERVAL_SECS
+        .get(index)
+        .copied()
+        .unwrap_or(SHUFFLE_INTERVAL_SECS[SHUFFLE_DEFAULT_INDEX])
 }
 
 /// Dropdown index for a stored retention value. Unknown values
 /// (hand-edited config) display as the 8-day default rather than crashing
 /// or showing an empty selection.
-pub(crate) fn retention_index(days: u16) -> usize {
+pub fn retention_index(days: u16) -> usize {
     RETENTION_DAYS
         .iter()
         .position(|&d| d == days)
@@ -150,11 +148,34 @@ pub(crate) fn retention_index(days: u16) -> usize {
 
 /// Retention days for a dropdown index. Out-of-range indices (cannot
 /// happen through the UI) fall back to the 8-day default.
-pub(crate) fn retention_days(index: usize) -> u16 {
+pub fn retention_days(index: usize) -> u16 {
     RETENTION_DAYS
         .get(index)
         .copied()
         .unwrap_or(RETENTION_DAYS[RETENTION_DEFAULT_INDEX])
+}
+
+/// Status footer text.
+pub fn status_line(window: &Window) -> String {
+    if window.refresh_pending {
+        "Checking for new images…".to_owned()
+    } else if let Some(error) = &window.last_error {
+        match error {
+            RefreshError::Network(_) => "Bing unreachable — retrying in 1 h".to_owned(),
+            RefreshError::Disk(_) => "Disk error — retrying in 1 h".to_owned(),
+        }
+    } else if let Some(updated) = window.last_updated {
+        format_updated(
+            updated.with_timezone(&chrono::Local).naive_local(),
+            chrono::Local::now().naive_local(),
+        )
+    } else if window.catalogue.images.is_empty() {
+        "No images yet — fetching…".to_owned()
+    } else {
+        // Restored from the catalogue; no fetch has completed yet this
+        // session.
+        "Up to date".to_owned()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -163,7 +184,7 @@ pub(crate) fn retention_days(index: usize) -> u16 {
 
 /// The whole popup body, wrapped by the caller in
 /// `core.applet.popup_container(..)`.
-pub(crate) fn popup_view(window: &Window) -> Element<'_, Message> {
+pub fn popup_view(window: &Window) -> Element<'_, Message> {
     let space = cosmic::theme::spacing();
     let mut content = widget::Column::new().padding([space.space_xxs, 0]);
 
@@ -174,7 +195,7 @@ pub(crate) fn popup_view(window: &Window) -> Element<'_, Message> {
         if !entry.copyrightlink.is_empty() {
             content = content.push(
                 menu_button(widget::text::body("About this image"))
-                    .on_press(Message::Open(entry.copyrightlink.clone())),
+                    .on_press(Message::OpenUrl(entry.copyrightlink.clone())),
             );
         }
         content = content
@@ -196,7 +217,7 @@ pub(crate) fn popup_view(window: &Window) -> Element<'_, Message> {
             .push(padded_control(widget::divider::horizontal::default()));
     }
 
-    content = content.push(padded_control(widget::text::caption(window.status_line())));
+    content = content.push(padded_control(widget::text::caption(status_line(window))));
     window.core.applet.popup_container(content).into()
 }
 
@@ -204,7 +225,7 @@ pub(crate) fn popup_view(window: &Window) -> Element<'_, Message> {
 /// never decodes the full ~5 MB UHD file). Click opens the full image in
 /// the default viewer.
 fn thumbnail(entry: &ImageEntry) -> Element<'_, Message> {
-    let thumb = thumbs::thumbnail_path(&entry.filename, &app::state_dir());
+    let thumb = thumbs::thumbnail_path(&entry.filename, app::state_dir());
     let inner: Element<'_, Message> = if thumb.is_file() {
         widget::image(widget::image::Handle::from_path(thumb))
             .width(Length::Fill)
@@ -219,7 +240,7 @@ fn thumbnail(entry: &ImageEntry) -> Element<'_, Message> {
     };
     widget::button::custom_image_button(inner, None)
         .class(cosmic::theme::Button::Image)
-        .on_press(Message::Open(entry.filename.display().to_string()))
+        .on_press(Message::OpenFile(entry.filename.clone()))
         .into()
 }
 
@@ -281,7 +302,7 @@ fn interval_row(window: &Window) -> Element<'_, Message> {
             SHUFFLE_INTERVAL_LABELS,
             Some(shuffle_interval_index(window.config.shuffle_interval_secs)),
             Message::SetShuffleInterval,
-            window.popup.unwrap_or(cosmic::iced::window::Id::NONE),
+            window.popup.unwrap_or(Id::NONE),
             Message::Surface,
             |message| message,
         ))
@@ -298,7 +319,7 @@ fn retention_row(window: &Window) -> Element<'_, Message> {
             RETENTION_LABELS,
             Some(retention_index(window.config.retention_days)),
             Message::SetRetention,
-            window.popup.unwrap_or(cosmic::iced::window::Id::NONE),
+            window.popup.unwrap_or(Id::NONE),
             Message::Surface,
             |message| message,
         ))
@@ -468,6 +489,41 @@ mod tests {
         // Hand-edited config value → displays as the 8-day default.
         assert_eq!(retention_index(5), 1);
         assert_eq!(retention_index(9_999), 1);
+    }
+
+    #[test]
+    fn status_line_reflects_the_fetch_lifecycle() {
+        let mut window = Window::default();
+
+        // Fresh cold start: nothing on disk, nothing fetched yet.
+        assert_eq!(status_line(&window), "No images yet — fetching…");
+
+        // Pipeline running.
+        window.refresh_pending = true;
+        assert_eq!(status_line(&window), "Checking for new images…");
+        window.refresh_pending = false;
+
+        // Fetch failed → the plan's exact error footer for network trouble…
+        window.last_error = Some(RefreshError::Network("boom".to_owned()));
+        assert_eq!(status_line(&window), "Bing unreachable — retrying in 1 h");
+        // …while a local I/O failure is not blamed on Bing.
+        window.last_error = Some(RefreshError::Disk("disk full".to_owned()));
+        assert_eq!(status_line(&window), "Disk error — retrying in 1 h");
+
+        // Success clears the error and records the time (relative wording
+        // itself is covered by `format_updated`'s tests; only the prefix is
+        // asserted here so the test cannot flake across a local midnight
+        // between the two `now()` reads).
+        window.last_error = None;
+        window.last_updated = Some(chrono::Utc::now());
+        assert!(status_line(&window).starts_with("Updated"));
+    }
+
+    #[test]
+    fn status_line_restored_catalogue_without_fetch_is_up_to_date() {
+        let mut window = Window::default();
+        window.catalogue.images.push(entry("20260807", "Foo_ROW1"));
+        assert_eq!(status_line(&window), "Up to date");
     }
 
     #[test]

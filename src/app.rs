@@ -9,7 +9,9 @@
 // pending timer. The pipeline itself runs as one async task and reports
 // back via `RefreshFinished`.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -21,7 +23,7 @@ use cosmic::{
 
 use crate::catalogue::{self, Catalogue, ImageEntry};
 use crate::config::AppletConfig;
-use crate::{bing, schedule, thumbs, wallpaper};
+use crate::{bing, schedule, thumbs, view, wallpaper};
 
 /// One name everywhere: cosmic-config app ID, state dir, desktop entry.
 pub const APP_ID: &str = "io.github.ercling.CosmicBingWallpaper";
@@ -34,16 +36,20 @@ pub fn run() -> cosmic::iced::Result {
 }
 
 /// The applet's state dir (`~/.local/state/<APP_ID>/`): catalogue JSON +
-/// cached thumbnails.
-pub fn state_dir() -> PathBuf {
-    dirs::state_dir()
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_default()
-                .join(".local")
-                .join("state")
-        })
-        .join(APP_ID)
+/// cached thumbnails. Resolved once — the view asks for it on every
+/// re-render and must not repeat env/home lookups per frame.
+pub fn state_dir() -> &'static Path {
+    static STATE_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
+        dirs::state_dir()
+            .unwrap_or_else(|| {
+                dirs::home_dir()
+                    .unwrap_or_default()
+                    .join(".local")
+                    .join("state")
+            })
+            .join(APP_ID)
+    });
+    &STATE_DIR
 }
 
 /// Where the catalogue JSON is persisted.
@@ -85,9 +91,9 @@ pub struct Window {
     /// A shuffle tick is currently scheduled.
     shuffle_armed: bool,
     /// When the last successful fetch completed (status footer).
-    last_updated: Option<DateTime<Utc>>,
+    pub(crate) last_updated: Option<DateTime<Utc>>,
     /// The last fetch error, cleared on success (status footer).
-    last_error: Option<RefreshError>,
+    pub(crate) last_error: Option<RefreshError>,
 }
 
 /// Why a refresh failed — the footer distinguishes local disk trouble from
@@ -135,9 +141,13 @@ pub enum Message {
     ApplyImage(PathBuf),
     /// The popup's refresh button (debounced while a fetch is pending).
     RefreshNow,
-    /// Open a file or URL with the default handler (`xdg-open`): thumbnail
-    /// click → full image, "About this image" → copyright link.
-    Open(String),
+    /// Open a URL in the default browser (`xdg-open`): "About this image"
+    /// → copyright link.
+    OpenUrl(String),
+    /// Open a downloaded file in the default viewer (`xdg-open`):
+    /// thumbnail click → full image. The path stays a `PathBuf` end to
+    /// end — no lossy string conversion.
+    OpenFile(PathBuf),
     /// The shuffle timer fired (payload: the generation it was armed with).
     ShuffleDue(u64),
     /// The popup's shuffle toggler.
@@ -227,26 +237,35 @@ impl Window {
     /// protected; the shuffle timer follows the (possibly shrunken)
     /// catalogue.
     fn prune_immediately(&mut self) -> app::Task<Message> {
-        // Refresh our idea of what is applied (cheap config read), so prune
-        // protects the right file even after external wallpaper changes.
-        if let Some(live) = wallpaper::current_source() {
-            self.current = Some(live);
+        self.prune_and_persist();
+        // Pruning may leave fewer than two images — disarm shuffle if so.
+        self.sync_shuffle(false)
+    }
+
+    /// The one prune sequence both the immediate path and the post-fetch
+    /// path run: refresh our idea of what is applied from cosmic-bg's live
+    /// config (so the right file is protected even after external
+    /// wallpaper changes), prune against the *current* retention, drop the
+    /// pruned images' cached thumbnails (later prunes never report these
+    /// entries again — skipping this would orphan them permanently), and
+    /// persist the catalogue. Returns the live wallpaper source that was
+    /// read.
+    fn prune_and_persist(&mut self) -> Option<PathBuf> {
+        let live = wallpaper::current_source();
+        if let Some(live) = &live {
+            self.current = Some(live.clone());
         }
         let removed = self.catalogue.prune(
             self.config.retention_days,
             self.current.as_deref(),
             Utc::now(),
         );
-        // Drop cached thumbnails of the pruned images too — later prunes
-        // never report these entries again, so skipping this would orphan
-        // them permanently (the RefreshFinished path does the same).
-        thumbs::remove_thumbnails(&removed, &state_dir());
+        thumbs::remove_thumbnails(&removed, state_dir());
         if let Err(error) = self.catalogue.save(&catalogue_path()) {
             // Non-fatal: the catalogue is rebuildable from the folder scan.
             tracing::warn!("failed to persist catalogue after prune: {error}");
         }
-        // Pruning may leave fewer than two images — disarm shuffle if so.
-        self.sync_shuffle(false)
+        live
     }
 
     /// Kick off the fetch pipeline unless one is already running. The
@@ -264,27 +283,74 @@ impl Window {
         })
     }
 
-    /// Status footer text.
-    pub(crate) fn status_line(&self) -> String {
-        if self.refresh_pending {
-            "Checking for new images…".to_owned()
-        } else if let Some(error) = &self.last_error {
-            match error {
-                RefreshError::Network(_) => "Bing unreachable — retrying in 1 h".to_owned(),
-                RefreshError::Disk(_) => "Disk error — retrying in 1 h".to_owned(),
+    /// React to the fetch pipeline finishing: merge the fetched entries
+    /// into the live catalogue, prune + persist, auto-apply per the plan,
+    /// and reschedule the next refresh.
+    fn finish_refresh(
+        &mut self,
+        result: Result<Vec<ImageEntry>, RefreshError>,
+    ) -> app::Task<Message> {
+        self.refresh_pending = false;
+        let fetched = match result {
+            Ok(fetched) => fetched,
+            Err(error) => {
+                tracing::warn!("refresh failed: {error}");
+                self.last_error = Some(error);
+                return self.schedule_refresh(schedule::ERROR_RETRY_DELAY);
             }
-        } else if let Some(updated) = self.last_updated {
-            crate::view::format_updated(
-                updated.with_timezone(&chrono::Local).naive_local(),
-                chrono::Local::now().naive_local(),
-            )
-        } else if self.catalogue.images.is_empty() {
-            "No images yet — fetching…".to_owned()
-        } else {
-            // Restored from the catalogue; no fetch has completed yet this
-            // session.
-            "Up to date".to_owned()
+        };
+
+        // Merge into the *live* catalogue: a wholesale replacement from
+        // the pipeline's snapshot would resurrect entries a concurrent
+        // prune removed. The prune likewise runs here on the UI thread,
+        // against what is applied *right now* and the *current* retention
+        // — the pipeline's start-of-fetch snapshot may be stale on both
+        // counts, and the currently applied file must never be deleted.
+        self.catalogue.merge(fetched);
+        let live = self.prune_and_persist();
+
+        self.last_updated = Some(Utc::now());
+        self.last_error = None;
+
+        let plan = refresh_success_plan(
+            self.first_fetch_pending,
+            live.as_deref(),
+            self.catalogue.newest().map(|e| e.fullstartdate.as_str()),
+            Utc::now(),
+        );
+        if plan.auto_apply
+            && let Some(newest) = self.catalogue.newest()
+        {
+            let path = newest.filename.clone();
+            match wallpaper::apply(&path) {
+                Ok(()) => self.current = Some(path),
+                Err(error) => {
+                    tracing::warn!("failed to apply wallpaper: {error}");
+                }
+            }
         }
+        if plan.clear_cold_start {
+            self.first_fetch_pending = false;
+        }
+
+        let refresh_timer = self.schedule_refresh(plan.delay);
+        // A grown catalogue may unlock a waiting shuffle (≥2 images); a
+        // pending tick keeps its countdown.
+        let shuffle = self.sync_shuffle(false);
+        Task::batch([refresh_timer, shuffle])
+    }
+}
+
+/// Open `target` with the default handler (`xdg-open`), detached; a
+/// thread reaps the child so no zombie lingers per click.
+fn open_detached(target: OsString) {
+    match std::process::Command::new("xdg-open").arg(&target).spawn() {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(error) => tracing::warn!("xdg-open {} failed: {error}", target.display()),
     }
 }
 
@@ -307,7 +373,7 @@ async fn run_refresh(
         &catalogue,
         schedule::fetch_count(retention_days),
         &wallpaper::download_dir(),
-        &state_dir(),
+        state_dir(),
     )
     .await
     .map_err(RefreshError::from)
@@ -345,8 +411,11 @@ async fn fetch_and_download(
 
     // Backfill thumbnails for catalogue entries outside this fetch window —
     // rebuilt or older entries would otherwise show the placeholder forever.
+    // Files the fetch loop above just handled are skipped.
+    let handled: std::collections::HashSet<&Path> =
+        fetched.iter().map(|e| e.filename.as_path()).collect();
     for entry in &catalogue.images {
-        if entry.filename.is_file() {
+        if !handled.contains(entry.filename.as_path()) && entry.filename.is_file() {
             ensure_thumbnail_logged(&entry.filename, state_dir);
         }
     }
@@ -546,18 +615,8 @@ impl cosmic::Application for Window {
                     }
                 }
             }
-            Message::Open(target) => {
-                // Detached viewer/browser; a thread reaps the child so no
-                // zombie lingers per click.
-                match std::process::Command::new("xdg-open").arg(&target).spawn() {
-                    Ok(mut child) => {
-                        std::thread::spawn(move || {
-                            let _ = child.wait();
-                        });
-                    }
-                    Err(error) => tracing::warn!("xdg-open {target} failed: {error}"),
-                }
-            }
+            Message::OpenUrl(url) => open_detached(url.into()),
+            Message::OpenFile(path) => open_detached(path.into_os_string()),
             Message::ShuffleDue(generation) => {
                 // Stale ticks (replaced by a newer re-arm) are ignored.
                 if generation != self.shuffle_generation {
@@ -589,13 +648,13 @@ impl cosmic::Application for Window {
             }
             Message::SetShuffleInterval(index) => {
                 let mut config = self.config.clone();
-                config.shuffle_interval_secs = crate::view::shuffle_interval_secs(index);
+                config.shuffle_interval_secs = view::shuffle_interval_secs(index);
                 self.set_config(config);
                 // Picking an interval restarts the countdown at that length.
                 return self.sync_shuffle(true);
             }
             Message::SetRetention(index) => {
-                let new_days = crate::view::retention_days(index);
+                let new_days = view::retention_days(index);
                 let reduced = schedule::retention_reduced(self.config.retention_days, new_days);
                 let mut config = self.config.clone();
                 config.retention_days = new_days;
@@ -610,73 +669,7 @@ impl cosmic::Application for Window {
             Message::Surface(action) => {
                 return cosmic::surface::surface_task(action);
             }
-            Message::RefreshFinished(result) => {
-                self.refresh_pending = false;
-                match result {
-                    Ok(fetched) => {
-                        // Merge into the *live* catalogue: a wholesale
-                        // replacement from the pipeline's snapshot would
-                        // resurrect entries a concurrent prune removed.
-                        self.catalogue.merge(fetched);
-
-                        // Prune here on the UI thread, against what is
-                        // applied *right now* and the *current* retention —
-                        // the pipeline's start-of-fetch snapshot may be
-                        // stale on both counts, and the currently applied
-                        // file must never be deleted.
-                        let live = wallpaper::current_source();
-                        if let Some(live) = &live {
-                            self.current = Some(live.clone());
-                        }
-                        let removed = self.catalogue.prune(
-                            self.config.retention_days,
-                            self.current.as_deref(),
-                            Utc::now(),
-                        );
-                        thumbs::remove_thumbnails(&removed, &state_dir());
-                        if let Err(error) = self.catalogue.save(&catalogue_path()) {
-                            // Non-fatal: the catalogue is rebuildable from
-                            // the folder scan.
-                            tracing::warn!("failed to persist catalogue: {error}");
-                        }
-
-                        self.last_updated = Some(Utc::now());
-                        self.last_error = None;
-
-                        let plan = refresh_success_plan(
-                            self.first_fetch_pending,
-                            live.as_deref(),
-                            self.catalogue.newest().map(|e| e.fullstartdate.as_str()),
-                            Utc::now(),
-                        );
-                        if plan.auto_apply
-                            && let Some(newest) = self.catalogue.newest()
-                        {
-                            let path = newest.filename.clone();
-                            match wallpaper::apply(&path) {
-                                Ok(()) => self.current = Some(path),
-                                Err(error) => {
-                                    tracing::warn!("failed to apply wallpaper: {error}");
-                                }
-                            }
-                        }
-                        if plan.clear_cold_start {
-                            self.first_fetch_pending = false;
-                        }
-
-                        let refresh_timer = self.schedule_refresh(plan.delay);
-                        // A grown catalogue may unlock a waiting shuffle
-                        // (≥2 images); a pending tick keeps its countdown.
-                        let shuffle = self.sync_shuffle(false);
-                        return Task::batch([refresh_timer, shuffle]);
-                    }
-                    Err(error) => {
-                        tracing::warn!("refresh failed: {error}");
-                        self.last_error = Some(error);
-                        return self.schedule_refresh(schedule::ERROR_RETRY_DELAY);
-                    }
-                }
-            }
+            Message::RefreshFinished(result) => return self.finish_refresh(result),
         }
         Task::none()
     }
@@ -699,7 +692,7 @@ impl cosmic::Application for Window {
 
     fn view_window(&self, id: window::Id) -> Element<'_, Self::Message> {
         if matches!(self.popup, Some(popup_id) if popup_id == id) {
-            crate::view::popup_view(self)
+            view::popup_view(self)
         } else {
             widget::text("").into()
         }
@@ -736,34 +729,6 @@ mod tests {
         assert!(state.ends_with(APP_ID));
         assert!(state.is_absolute());
         assert_eq!(state_dir().join("catalogue.json"), catalogue_path());
-    }
-
-    #[test]
-    fn status_line_reflects_the_fetch_lifecycle() {
-        let mut window = Window::default();
-
-        // Fresh cold start: nothing on disk, nothing fetched yet.
-        assert_eq!(window.status_line(), "No images yet — fetching…");
-
-        // Pipeline running.
-        window.refresh_pending = true;
-        assert_eq!(window.status_line(), "Checking for new images…");
-        window.refresh_pending = false;
-
-        // Fetch failed → the plan's exact error footer for network trouble…
-        window.last_error = Some(RefreshError::Network("boom".to_owned()));
-        assert_eq!(window.status_line(), "Bing unreachable — retrying in 1 h");
-        // …while a local I/O failure is not blamed on Bing.
-        window.last_error = Some(RefreshError::Disk("disk full".to_owned()));
-        assert_eq!(window.status_line(), "Disk error — retrying in 1 h");
-
-        // Success clears the error and records the time (relative wording
-        // itself is covered by `view::format_updated`'s tests; only the
-        // prefix is asserted here so the test cannot flake across a local
-        // midnight between the two `now()` reads).
-        window.last_error = None;
-        window.last_updated = Some(Utc::now());
-        assert!(window.status_line().starts_with("Updated"));
     }
 
     #[test]
@@ -923,20 +888,5 @@ mod tests {
         assert!(!download_dir.join("20260807-Foo_ROW1_UHD.jpg").exists());
         // The thumbnail backfill covered the pre-existing entry too.
         assert!(thumbs::thumbnail_path(&existing, &state).is_file());
-    }
-
-    #[test]
-    fn status_line_restored_catalogue_without_fetch_is_up_to_date() {
-        let mut window = Window::default();
-        window.catalogue.images.push(ImageEntry {
-            urlbase: "/th?id=OHR.Foo_ROW1".to_owned(),
-            startdate: "20260807".to_owned(),
-            fullstartdate: "202608070700".to_owned(),
-            title: "Foo".to_owned(),
-            copyright: "© Bar".to_owned(),
-            copyrightlink: String::new(),
-            filename: PathBuf::from("/x/20260807-Foo_ROW1_UHD.jpg"),
-        });
-        assert_eq!(window.status_line(), "Up to date");
     }
 }

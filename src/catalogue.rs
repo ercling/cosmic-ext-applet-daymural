@@ -116,11 +116,7 @@ impl Catalogue {
         }
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let mut tmp = path.as_os_str().to_owned();
-        tmp.push(".tmp");
-        let tmp = PathBuf::from(tmp);
-        fs::write(&tmp, json)?;
-        fs::rename(&tmp, path)
+        crate::fsutil::write_atomic(path, ".tmp", |tmp| fs::write(tmp, &json))
     }
 
     /// Rebuild by scanning `dir` for wallpaper files

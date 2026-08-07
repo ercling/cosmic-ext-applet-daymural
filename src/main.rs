@@ -8,6 +8,7 @@ mod catalogue;
 // output cannot be annotated more narrowly.
 #[allow(dead_code)]
 mod config;
+mod fsutil;
 mod schedule;
 #[cfg(test)]
 mod testutil;

@@ -43,11 +43,9 @@ pub fn ensure_thumbnail(image_path: &Path, state_dir: &Path) -> Result<PathBuf, 
     let full = image::open(image_path)?;
     let small = full.resize_to_fill(THUMB_WIDTH, THUMB_HEIGHT, FilterType::Triangle);
 
-    let mut part = thumb.as_os_str().to_owned();
-    part.push(".part");
-    let part = PathBuf::from(part);
-    small.save_with_format(&part, image::ImageFormat::Jpeg)?;
-    fs::rename(&part, &thumb)?;
+    crate::fsutil::write_atomic(&thumb, ".part", |part| {
+        small.save_with_format(part, image::ImageFormat::Jpeg)
+    })?;
     Ok(thumb)
 }
 
