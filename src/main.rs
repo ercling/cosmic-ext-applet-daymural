@@ -1,4 +1,7 @@
 mod app;
+// Consumed by the fetch pipeline from Task 3 onwards; until then only tests use it.
+#[allow(dead_code)]
+mod bing;
 
 fn main() -> cosmic::iced::Result {
     tracing_subscriber::fmt()

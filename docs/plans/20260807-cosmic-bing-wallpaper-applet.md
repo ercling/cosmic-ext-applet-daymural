@@ -249,14 +249,14 @@ struct AppletConfig {
 **Files:**
 - Create: `src/bing.rs`, `tests/fixtures/hpimagearchive.json`
 
-- [ ] fetch one real response from `https://www.bing.com/HPImageArchive.aspx?format=js&idx=0&n=8&mbl=1&mkt=` and check it in as the fixture (strip nothing; real shape)
-- [ ] serde types for the response (`images[]`: `urlbase`, `startdate`, `fullstartdate`, `copyright`, `copyrightlink`) — do **not** keep Bing's `title` (it is literally `"Info"`) or `wp` (unused; we hardcode UHD)
-- [ ] title/copyright derivation: `ImageEntry.title` = `copyright` text before the parenthesised part, `ImageEntry.copyright` = the `(© …)` part; handle Japanese full-width parens `（）` (see `extension.js:908-910`) and copyright strings with **no** parens (whole string becomes title, copyright empty — reference crashes on this, we must not)
-- [ ] pure builders: `image_url(urlbase) -> String` (`…_UHD.jpg&qlt=100`) and `image_filename(startdate, urlbase) -> String` (`<startdate>-<name>_UHD.jpg`, name = urlbase minus `/th?id=OHR.` prefix — must match the GNOME extension's naming)
-- [ ] inverse mapping for catalogue rebuild: `parse_filename("<8digits>-<name>_<res>.jpg") -> Option<(startdate, urlbase)>` reconstructing `urlbase = "/th?id=OHR." + name` (accept any `_<res>` suffix, not just `_UHD`)
-- [ ] write tests: fixture parses; derived title is a real title (not `"Info"`); URL/filename builders match known-good values; `parse_filename(image_filename(..)) ` roundtrips; non-UHD suffixes parse
-- [ ] write tests: malformed/empty JSON → error, not panic; no-parens copyright
-- [ ] run tests - must pass before task 3
+- [x] fetch one real response from `https://www.bing.com/HPImageArchive.aspx?format=js&idx=0&n=8&mbl=1&mkt=` and check it in as the fixture (strip nothing; real shape) (fetched 2026-08-07, 8 images, `tests/fixtures/hpimagearchive.json`)
+- [x] serde types for the response (`images[]`: `urlbase`, `startdate`, `fullstartdate`, `copyright`, `copyrightlink`) — do **not** keep Bing's `title` (it is literally `"Info"`) or `wp` (unused; we hardcode UHD)
+- [x] title/copyright derivation: `ImageEntry.title` = `copyright` text before the parenthesised part, `ImageEntry.copyright` = the `(© …)` part; handle Japanese full-width parens `（）` (see `extension.js:908-910`) and copyright strings with **no** parens (whole string becomes title, copyright empty — reference crashes on this, we must not) (`split_copyright`; stores the notice **without** the surrounding parens, matching the reference's `match[1]` incl. its `**` stripping)
+- [x] pure builders: `image_url(urlbase) -> String` (`…_UHD.jpg&qlt=100`) and `image_filename(startdate, urlbase) -> String` (`<startdate>-<name>_UHD.jpg`, name = urlbase minus `/th?id=OHR.` prefix — must match the GNOME extension's naming)
+- [x] inverse mapping for catalogue rebuild: `parse_filename("<8digits>-<name>_<res>.jpg") -> Option<(startdate, urlbase)>` reconstructing `urlbase = "/th?id=OHR." + name` (accept any `_<res>` suffix, not just `_UHD`)
+- [x] write tests: fixture parses; derived title is a real title (not `"Info"`); URL/filename builders match known-good values; `parse_filename(image_filename(..)) ` roundtrips; non-UHD suffixes parse
+- [x] write tests: malformed/empty JSON → error, not panic; no-parens copyright
+- [x] run tests - must pass before task 3 (`cargo test`: 13 passed; clippy clean; fmt clean)
 
 ### Task 3: Bing HTTP client + image download + thumbnail
 
