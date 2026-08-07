@@ -1,0 +1,4 @@
+# Reference material only — independent clone with its own .git, never tracked here
+/examples/
+
+/target/
