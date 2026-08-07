@@ -188,13 +188,61 @@ struct AppletConfig {
 - Create: `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml` (if needed), `.gitignore`
 - Create: `src/main.rs`, `src/app.rs`
 
-- [ ] verify current libcosmic applet API + Cargo git deps by reading one small applet in `pop-os/cosmic-applets` (e.g. cosmic-applet-battery) and `pop-os/cosmic-bg`'s config crate; record exact feature flags and API names as comments/notes here in the plan
-- [ ] `Cargo.toml` with libcosmic (applet features), cosmic-bg-config, image, reqwest(rustls), serde, serde_json, chrono, dirs; `tempfile` as dev-dep
-- [ ] pin both git deps with `rev = "<sha>"` (current upstream HEAD) and commit `Cargo.lock`
-- [ ] `src/main.rs` + `src/app.rs`: minimal `cosmic::Application` in applet mode — panel icon button toggles an empty popup ("Hello" placeholder)
-- [ ] `cargo build` succeeds; binary runs standalone without panicking (popup needs panel, that's fine)
-- [ ] add a trivial smoke test (e.g. config default values) so `cargo test` runs green
-- [ ] run tests - must pass before task 2
+**Upstream API notes (verified 2026-08-07 against live sources):**
+
+- Pinned revs: libcosmic `8a017a15ee7753241c0a631b4294a68edf79b13b`, cosmic-bg
+  `1685f7fc99cbb9cbe981ac672d6451ba6faff7db` (both = upstream HEAD today;
+  cosmic-applets reference tree read at `ec8ffdc85d1f316b387cf89672609933064e6e88`).
+- libcosmic feature flags (copied from cosmic-applets workspace `Cargo.toml`):
+  `default-features = false`, features `applet, applet-token, dbus-config,
+  multi-window, tokio, wayland, desktop-systemd-scope, winit` — all confirmed to
+  exist in libcosmic's `[features]` at the pinned rev. Crates use edition 2024.
+- Applet entry point: `cosmic::applet::run::<App>(())`; `App: cosmic::Application`
+  with `type Executor = cosmic::SingleThreadExecutor`, `const APP_ID`,
+  `init/core/core_mut/update/view/view_window/on_close_requested`, and
+  `fn style() -> Option<iced::theme::Style>` returning `Some(cosmic::applet::style())`.
+- Popup idiom (current, from `cosmic-applet-power/src/lib.rs`): panel button is
+  `self.core.applet.icon_button(name).on_press_down(Msg::TogglePopup)`; open =
+  `cosmic::surface::surface_task(cosmic::surface::action::app_popup(|_| Default::default(), |app| { … core.applet.get_popup_settings(core.main_window_id().unwrap(), new_id, None, None, None) }, None))`;
+  close = `cosmic::surface::surface_task(cosmic::surface::action::destroy_popup(id))`;
+  popup content wrapped in `self.core.applet.popup_container(content)`. Popup-row
+  helpers for Task 8: `cosmic::applet::{menu_button, padded_control}` +
+  `cosmic::widget::divider`.
+- cosmic-bg-config API (`config/src/lib.rs` in pop-os/cosmic-bg): consts
+  `NAME = "com.system76.CosmicBackground"`, `BACKGROUNDS`, `DEFAULT_BACKGROUND = "all"`,
+  `SAME_ON_ALL = "same-on-all"`; `context() -> Result<Context, cosmic_config::Error>`;
+  `Context::{backgrounds, default_background, entry(output), same_on_all, set_same_on_all}`;
+  types `Entry { … }` (`Entry::new(output, source)`, `Entry::fallback()`, `entry.key()`),
+  `Source::Path(..)`, `ScalingMode`, `FilterMethod`, `SamplingMethod`, `Color`,
+  `Gradient`; higher-level `Config::{load(ctx), entry(output), entry_mut, set_entry, load_backgrounds}`.
+- Gotcha: cosmic-bg-config depends on `cosmic-config` from the libcosmic repo
+  **unpinned**; a `[patch]` to unify it with our rev-pinned libcosmic is rejected by
+  cargo while upstream HEAD == the pinned rev ("points to the same source"), so the
+  transitive source is pinned via the committed `Cargo.lock` only (two identical-sha
+  `cosmic-config` entries in the lock — harmless duplication).
+- `rust-toolchain.toml` not needed: system rustc 1.97.1 builds edition-2024 crates.
+
+**Build-environment notes for this machine (discovered during Task 1):**
+
+- ⚠️ linuxbrew's `pkg-config` shadows the system one and misses `/usr/lib64/pkgconfig`,
+  so `smithay-client-toolkit` fails on `xkbcommon`. All cargo build/test/clippy
+  invocations need `PKG_CONFIG_PATH=/usr/lib64/pkgconfig:/usr/share/pkgconfig` exported.
+- ⚠️ zune-jpeg 0.5.x (image's jpeg decoder) fails to compile on rustc 1.97 unless its
+  `log` feature is on (no-op `warn!` in expression position, `src/mcu_prog.rs:463`);
+  worked around with a direct `zune-jpeg` dep enabling `["std", "log"]` (features are
+  additive) — see comment in `Cargo.toml`.
+- Fedora's rustc package ships without rustfmt/clippy and no sudo was available;
+  `rustfmt`, `cargo-fmt`, `cargo-clippy`, `clippy-driver` (1.97.1-1.fc44, exactly
+  matching system rustc) were extracted from the Fedora RPMs into `~/.local/bin`
+  (already on PATH). `cargo fmt` / `cargo clippy` now work normally.
+
+- [x] verify current libcosmic applet API + Cargo git deps by reading one small applet in `pop-os/cosmic-applets` (e.g. cosmic-applet-battery) and `pop-os/cosmic-bg`'s config crate; record exact feature flags and API names as comments/notes here in the plan (used `cosmic-applet-power` — the cleanest icon-button + popup example; notes above)
+- [x] `Cargo.toml` with libcosmic (applet features), cosmic-bg-config, image, reqwest(rustls), serde, serde_json, chrono, dirs; `tempfile` as dev-dep (plus tokio, tracing, tracing-subscriber, and the zune-jpeg feature workaround)
+- [x] pin both git deps with `rev = "<sha>"` (current upstream HEAD) and commit `Cargo.lock`
+- [x] `src/main.rs` + `src/app.rs`: minimal `cosmic::Application` in applet mode — panel icon button toggles an empty popup ("Hello" placeholder)
+- [x] `cargo build` succeeds; binary runs standalone without panicking (ran 5 s under `timeout`, clean until SIGTERM)
+- [x] add a trivial smoke test (e.g. config default values) so `cargo test` runs green (APP_ID + symbolic-icon smoke tests in `src/app.rs`)
+- [x] run tests - must pass before task 2 (`cargo test`: 2 passed; clippy clean; fmt clean)
 
 ### Task 2: Bing API module — types, parsing, URL/filename building
 
