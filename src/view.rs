@@ -30,6 +30,17 @@ const SHUFFLE_INTERVAL_SECS: [u32; 4] = [1_800, 3_600, 21_600, 86_400];
 /// Dropdown labels for the shuffle intervals.
 const SHUFFLE_INTERVAL_LABELS: &[&str] = &["30 minutes", "1 hour", "6 hours", "Daily"];
 
+/// Retention choices in days (0 = keep forever), index-aligned with
+/// [`RETENTION_LABELS`].
+const RETENTION_DAYS: [u16; 4] = [3, 8, 30, 0];
+
+/// Dropdown labels for the retention choices.
+const RETENTION_LABELS: &[&str] = &["3 days", "8 days", "30 days", "Forever"];
+
+/// Dropdown index of the default retention (8 days) — the fallback for
+/// hand-edited config values that match no choice.
+const RETENTION_DEFAULT_INDEX: usize = 1;
+
 // ---------------------------------------------------------------------------
 // Pure decisions (tested)
 // ---------------------------------------------------------------------------
@@ -127,6 +138,25 @@ pub(crate) fn shuffle_interval_secs(index: usize) -> u32 {
     SHUFFLE_INTERVAL_SECS.get(index).copied().unwrap_or(86_400)
 }
 
+/// Dropdown index for a stored retention value. Unknown values
+/// (hand-edited config) display as the 8-day default rather than crashing
+/// or showing an empty selection.
+pub(crate) fn retention_index(days: u16) -> usize {
+    RETENTION_DAYS
+        .iter()
+        .position(|&d| d == days)
+        .unwrap_or(RETENTION_DEFAULT_INDEX)
+}
+
+/// Retention days for a dropdown index. Out-of-range indices (cannot
+/// happen through the UI) fall back to the 8-day default.
+pub(crate) fn retention_days(index: usize) -> u16 {
+    RETENTION_DAYS
+        .get(index)
+        .copied()
+        .unwrap_or(RETENTION_DAYS[RETENTION_DEFAULT_INDEX])
+}
+
 // ---------------------------------------------------------------------------
 // View (exempt from unit tests per plan)
 // ---------------------------------------------------------------------------
@@ -154,7 +184,9 @@ pub(crate) fn popup_view(window: &Window) -> Element<'_, Message> {
         if window.config.shuffle_enabled {
             content = content.push(padded_control(interval_row(window)));
         }
-        content = content.push(padded_control(widget::divider::horizontal::default()));
+        content = content
+            .push(padded_control(widget::divider::horizontal::default()))
+            .push(padded_control(retention_row(window)));
     } else {
         // Empty catalogue: everything except the status footer is gone;
         // refresh stays reachable so an offline start can be retried by
@@ -249,6 +281,23 @@ fn interval_row(window: &Window) -> Element<'_, Message> {
             SHUFFLE_INTERVAL_LABELS,
             Some(shuffle_interval_index(window.config.shuffle_interval_secs)),
             Message::SetShuffleInterval,
+            window.popup.unwrap_or(cosmic::iced::window::Id::NONE),
+            Message::Surface,
+            |message| message,
+        ))
+        .align_y(Alignment::Center)
+        .into()
+}
+
+/// "Keep images <retention>" dropdown row. Same `popup_dropdown` idiom as
+/// the shuffle interval (the menu opens as its own wayland popup).
+fn retention_row(window: &Window) -> Element<'_, Message> {
+    widget::Row::new()
+        .push(widget::text::body("Keep images").width(Length::Fill))
+        .push(widget::dropdown::popup_dropdown(
+            RETENTION_LABELS,
+            Some(retention_index(window.config.retention_days)),
+            Message::SetRetention,
             window.popup.unwrap_or(cosmic::iced::window::Id::NONE),
             Message::Surface,
             |message| message,
@@ -401,6 +450,28 @@ mod tests {
         assert_eq!(shuffle_interval_index(0), 3);
         // Impossible dropdown index → daily seconds.
         assert_eq!(shuffle_interval_secs(99), 86_400);
+    }
+
+    #[test]
+    fn retention_mapping_roundtrips() {
+        // The plan's exact choices, in dropdown order (0 = forever).
+        assert_eq!(RETENTION_DAYS, [3, 8, 30, 0]);
+        assert_eq!(RETENTION_LABELS.len(), RETENTION_DAYS.len());
+        for (index, &days) in RETENTION_DAYS.iter().enumerate() {
+            assert_eq!(retention_index(days), index);
+            assert_eq!(retention_days(index), days);
+            // Full roundtrip both ways.
+            assert_eq!(retention_days(retention_index(days)), days);
+        }
+    }
+
+    #[test]
+    fn retention_mapping_tolerates_garbage() {
+        // Hand-edited config value → displays as the 8-day default.
+        assert_eq!(retention_index(5), 1);
+        assert_eq!(retention_index(9_999), 1);
+        // Impossible dropdown index → 8-day default.
+        assert_eq!(retention_days(99), 8);
     }
 
     #[test]

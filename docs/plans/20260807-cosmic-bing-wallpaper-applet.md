@@ -345,11 +345,11 @@ struct AppletConfig {
 **Files:**
 - Modify: `src/app.rs`
 
-- [ ] "Keep images" dropdown (3 / 8 / 30 days / forever) persisted to `AppletConfig`
-- [ ] prune runs after every successful fetch and immediately when retention is reduced; current image always protected (guaranteed by Task 4 — covered by its tests)
-- [ ] fetch size follows retention: `n = min(8, retention_days)` when 1–8 (don't download 8 × 5 MB just to delete 5)
-- [ ] write tests: retention-value ↔ dropdown mapping; prune-on-change decision logic; fetch-n computation (3, 8, 30, forever)
-- [ ] run tests - must pass before task 11
+- [x] "Keep images" dropdown (3 / 8 / 30 days / forever) persisted to `AppletConfig` (`retention_row` in `view.rs`, same `popup_dropdown` + `Message::Surface` idiom as the shuffle interval; placed per the popup layout — after the second divider, above the status footer — and hidden while the catalogue is empty, matching Task 8's empty-state rule; persists through the existing write-on-change `set_config`)
+- [x] prune runs after every successful fetch and immediately when retention is reduced; current image always protected (guaranteed by Task 4 — covered by its tests) (post-fetch prune existed since Task 7's `run_refresh`; new `prune_immediately` in `app.rs` fires on `SetRetention` when `schedule::retention_reduced(old, new)` — and on externally edited config via `ConfigUpdated` — re-reads `current_source()` first so the live wallpaper is protected, persists the catalogue, and re-syncs the shuffle timer in case the catalogue dropped below 2 images)
+- [x] fetch size follows retention: `n = min(8, retention_days)` when 1–8 (don't download 8 × 5 MB just to delete 5) (already wired in Task 7: `schedule::fetch_count` used by `run_refresh`; nothing new needed)
+- [x] write tests: retention-value ↔ dropdown mapping; prune-on-change decision logic; fetch-n computation (3, 8, 30, forever) (`retention_mapping_roundtrips` + `retention_mapping_tolerates_garbage` in `view.rs`; `retention_reduced_only_when_the_new_policy_is_stricter` in `schedule.rs` — forever↔finite in both directions, unchanged, loosened; fetch-n already covered by Task 7's `fetch_count_follows_retention` (1/3/8/30/0))
+- [x] run tests - must pass before task 11 (`cargo test`: 84 passed; clippy clean; fmt clean; binary not smoke-run — cold-start would trigger a real fetch + apply)
 
 ### Task 11: Packaging — desktop entry, icon, justfile
 

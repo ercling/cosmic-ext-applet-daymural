@@ -118,6 +118,9 @@ pub enum Message {
     SetShuffleEnabled(bool),
     /// The popup's shuffle-interval dropdown (payload: dropdown index).
     SetShuffleInterval(usize),
+    /// The popup's "Keep images" retention dropdown (payload: dropdown
+    /// index).
+    SetRetention(usize),
     /// Forwarded surface actions (the dropdown's menu opens as its own
     /// wayland popup and drives it through these).
     Surface(cosmic::surface::Action),
@@ -190,6 +193,30 @@ impl Window {
         } else {
             Task::none()
         }
+    }
+
+    /// Prune the catalogue against the current retention setting right now
+    /// (retention was reduced — no point keeping over-limit files on disk
+    /// until the next fetch). The currently applied file is always
+    /// protected; the shuffle timer follows the (possibly shrunken)
+    /// catalogue.
+    fn prune_immediately(&mut self) -> app::Task<Message> {
+        // Refresh our idea of what is applied (cheap config read), so prune
+        // protects the right file even after external wallpaper changes.
+        if let Some(live) = wallpaper::current_source() {
+            self.current = Some(live);
+        }
+        self.catalogue.prune(
+            self.config.retention_days,
+            self.current.as_deref(),
+            Utc::now(),
+        );
+        if let Err(error) = self.catalogue.save(&catalogue_path()) {
+            // Non-fatal: the catalogue is rebuildable from the folder scan.
+            tracing::warn!("failed to persist catalogue after prune: {error}");
+        }
+        // Pruning may leave fewer than two images — disarm shuffle if so.
+        self.sync_shuffle(false)
     }
 
     /// Kick off the fetch pipeline unless one is already running.
@@ -377,17 +404,27 @@ impl cosmic::Application for Window {
             Message::ConfigUpdated(config) => {
                 // Our own setter writes echo back here unchanged (no-op);
                 // an *external* edit of the shuffle settings restarts the
-                // countdown against the new values.
+                // countdown against the new values, and an externally
+                // reduced retention prunes immediately.
                 let shuffle_changed = config.shuffle_enabled != self.config.shuffle_enabled
                     || config.shuffle_interval_secs != self.config.shuffle_interval_secs;
                 let newly_enabled = config.shuffle_enabled && !self.config.shuffle_enabled;
+                let retention_reduced =
+                    schedule::retention_reduced(self.config.retention_days, config.retention_days);
                 self.config = config;
                 if newly_enabled {
                     // First fire one full interval after enabling.
                     self.last_user_action = Some(Instant::now());
                 }
+                let mut tasks = Vec::new();
+                if retention_reduced {
+                    tasks.push(self.prune_immediately());
+                }
                 if shuffle_changed {
-                    return self.sync_shuffle(true);
+                    tasks.push(self.sync_shuffle(true));
+                }
+                if !tasks.is_empty() {
+                    return Task::batch(tasks);
                 }
             }
             Message::RefreshDue(generation) => {
@@ -463,6 +500,19 @@ impl cosmic::Application for Window {
                 // Picking an interval restarts the countdown at that length.
                 self.last_user_action = Some(Instant::now());
                 return self.sync_shuffle(true);
+            }
+            Message::SetRetention(index) => {
+                let new_days = crate::view::retention_days(index);
+                let reduced = schedule::retention_reduced(self.config.retention_days, new_days);
+                let mut config = self.config.clone();
+                config.retention_days = new_days;
+                self.set_config(config);
+                if reduced {
+                    // Reduced retention prunes immediately (the routine
+                    // post-fetch prune would otherwise leave over-limit
+                    // files around for up to a day).
+                    return self.prune_immediately();
+                }
             }
             Message::Surface(action) => {
                 return cosmic::surface::surface_task(action);

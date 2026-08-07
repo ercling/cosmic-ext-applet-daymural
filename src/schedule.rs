@@ -66,6 +66,18 @@ pub fn fetch_count(retention_days: u16) -> u8 {
     }
 }
 
+/// Whether a retention change made the policy stricter — i.e. images that
+/// were within the old limit may now be over the new one, so prune runs
+/// immediately instead of waiting for the next fetch. `0` = keep forever:
+/// never stricter as the new value, always loosened *from* (any finite new
+/// value can only cut into a previously unbounded set).
+pub fn retention_reduced(old_days: u16, new_days: u16) -> bool {
+    if new_days == 0 {
+        return false;
+    }
+    old_days == 0 || new_days < old_days
+}
+
 /// How long until the next shuffle tick.
 ///
 /// The countdown runs from the last user action that resets it — enabling
@@ -182,6 +194,21 @@ mod tests {
         assert_eq!(fetch_count(8), 8);
         assert_eq!(fetch_count(30), 8); // capped at the API max
         assert_eq!(fetch_count(0), 8); // forever → full window
+    }
+
+    #[test]
+    fn retention_reduced_only_when_the_new_policy_is_stricter() {
+        // Stricter: fewer days, or finite where it was forever.
+        assert!(retention_reduced(8, 3));
+        assert!(retention_reduced(30, 8));
+        assert!(retention_reduced(0, 30));
+        assert!(retention_reduced(0, 3));
+        // Loosened or unchanged: wait for the next fetch's routine prune.
+        assert!(!retention_reduced(3, 8));
+        assert!(!retention_reduced(8, 30));
+        assert!(!retention_reduced(30, 0)); // forever keeps everything
+        assert!(!retention_reduced(0, 0));
+        assert!(!retention_reduced(8, 8));
     }
 
     /// A "now" far enough from the process start that subtracting test
