@@ -372,9 +372,9 @@ struct AppletConfig {
 
 ### Task 13: [Final] Update documentation
 
-- [ ] write real `README.md`: what it is, screenshot, build/install via `just`, settings explained, disk usage note (~5 MB/image: ≈40 MB at 8-day retention, ≈150 MB at 30), documented limitations (external wallpaper changes not watched; per-output backgrounds collapse to same-on-all)
-- [ ] update `CLAUDE.md`: replace the "no source code yet" section with actual build/test/run commands and module architecture
-- [ ] move this plan to `docs/plans/completed/`
+- [x] write real `README.md`: what it is, screenshot, build/install via `just`, settings explained, disk usage note (~5 MB/image: ≈40 MB at 8-day retention, ≈150 MB at 30), documented limitations (external wallpaper changes not watched; per-output backgrounds collapse to same-on-all) (features, settings table, GNOME-extension folder compatibility, prefix-override install, dev commands incl. the PKG_CONFIG_PATH note; screenshot left as an HTML-comment TODO — cannot be taken without a live panel session)
+- [x] update `CLAUDE.md`: replace the "no source code yet" section with actual build/test/run commands and module architecture (build/test/run via `just` with the PKG_CONFIG_PATH workaround and the ~/.local/bin rustfmt/clippy note, cold-start-run warning, test-isolation rule, per-module architecture map of main/app/view/bing/thumbs/catalogue/config/wallpaper/schedule; `examples/` reference section kept unchanged)
+- [x] move this plan to `docs/plans/completed/` (moved by orchestrator at completion)
 
 ## Post-Completion
 
