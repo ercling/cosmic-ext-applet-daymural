@@ -65,6 +65,20 @@ impl ImageEntry {
         self.title.is_empty() && self.copyright.is_empty()
     }
 
+    /// The entry's `filename` legitimately names the entry's *own* image:
+    /// its basename is a wallpaper filename whose `<name>` part matches
+    /// `urlbase` ([`bing::filename_names_urlbase`]). The catalogue JSON is
+    /// user-editable state, so an entry is never trusted to act on a file
+    /// it does not name — a tampered entry pointing at a *different*
+    /// image's valid file must neither have prune delete that file nor
+    /// have `existing_file` skip its own image's download.
+    fn names_own_file(&self) -> bool {
+        self.filename
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| bing::filename_names_urlbase(n, &self.urlbase))
+    }
+
     /// The entry's start time, if its `fullstartdate` parses.
     fn start_time(&self) -> Option<DateTime<Utc>> {
         NaiveDateTime::parse_from_str(&self.fullstartdate, "%Y%m%d%H%M")
@@ -125,11 +139,24 @@ impl Catalogue {
     /// Entries get empty titles (refilled on next fetch merge) and a
     /// `fullstartdate` synthesized as `startdate + "0000"`. A missing or
     /// unreadable dir yields an empty catalogue.
+    ///
+    /// One entry per `urlbase`: a migrated folder may hold the same image
+    /// several times — at multiple resolutions (the reference extension's
+    /// resolution setting changed over time) or on multiple dates (Bing
+    /// repeats images). Duplicate entries would break the catalogue's
+    /// dedupe invariant (`merge` and `existing_file` match the *first*
+    /// hit). The winner is the greatest `(startdate, filename)` — newest
+    /// date first, and for same-date ties `_UHD` beats numeric resolution
+    /// suffixes (ASCII `U` > digits), i.e. our own download target. Loser
+    /// files stay on disk untracked, like any foreign file in the folder.
     pub fn rebuild_from_folder(dir: &Path) -> Self {
+        use std::collections::HashMap;
+
         let mut cat = Self::default();
         let Ok(read) = fs::read_dir(dir) else {
             return cat;
         };
+        let mut best: HashMap<String, ImageEntry> = HashMap::new();
         for entry in read.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
@@ -139,7 +166,7 @@ impl Catalogue {
             if !entry.path().is_file() {
                 continue;
             }
-            cat.images.push(ImageEntry {
+            let candidate = ImageEntry {
                 urlbase,
                 fullstartdate: format!("{startdate}0000"),
                 startdate,
@@ -147,18 +174,30 @@ impl Catalogue {
                 copyright: String::new(),
                 copyrightlink: String::new(),
                 filename: entry.path(),
-            });
+            };
+            let key = |e: &ImageEntry| (e.startdate.clone(), e.filename.clone());
+            match best.entry(candidate.urlbase.clone()) {
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    if key(&candidate) > key(slot.get()) {
+                        slot.insert(candidate);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(candidate);
+                }
+            }
         }
+        cat.images = best.into_values().collect();
         cat.sort();
         cat
     }
 
     /// Merge freshly fetched entries in, deduping by `urlbase`. When a
     /// fetched entry matches a rebuilt one, the missing metadata (title,
-    /// copyright, link, real `fullstartdate`) is filled in while the
-    /// existing `filename` is kept — the file on disk (possibly at a
-    /// different resolution suffix) stays authoritative, so nothing is
-    /// re-downloaded. Result stays sorted ascending by `fullstartdate`.
+    /// copyright, link) is filled in while the existing `filename` is
+    /// kept — the file on disk (possibly at a different resolution
+    /// suffix) stays authoritative, so nothing is re-downloaded. Result
+    /// stays sorted ascending by `fullstartdate`.
     pub fn merge(&mut self, new_entries: Vec<ImageEntry>) {
         for incoming in new_entries {
             match self
@@ -171,15 +210,34 @@ impl Catalogue {
                         existing.title = incoming.title;
                         existing.copyright = incoming.copyright;
                         existing.copyrightlink = incoming.copyrightlink;
-                        existing.fullstartdate = incoming.fullstartdate;
                         // `filename` deliberately kept: the already
                         // downloaded file wins…
                     }
-                    // …unless that file vanished externally while the
-                    // incoming entry holds a fresh download (the pipeline
-                    // re-downloads when `existing_file` misses) — adopt
-                    // the new path instead of orphaning the download.
-                    if !existing.filename.is_file() && incoming.filename.is_file() {
+                    // Bing occasionally re-runs an image under an
+                    // unchanged `urlbase` on a later day (the same
+                    // assumption `rebuild_from_folder`'s dedupe makes).
+                    // Adopt the newer dates — keeping the stale ones
+                    // would make `newest()`/auto-apply target the wrong
+                    // image and derive the refresh schedule from a date
+                    // in the past (a tight retry loop until the date
+                    // rolls over). Also refreshes a rebuilt entry's
+                    // synthesized `…0000` with Bing's real time.
+                    // Fixed-width digit strings: lexical order is
+                    // chronological.
+                    if incoming.fullstartdate > existing.fullstartdate {
+                        existing.fullstartdate = incoming.fullstartdate;
+                        existing.startdate = incoming.startdate;
+                    }
+                    // …unless the entry's file claim is dead or
+                    // illegitimate while the incoming entry holds a fresh
+                    // download: the file vanished externally, or a
+                    // tampered catalogue pointed the entry at a file it
+                    // does not name (either way `existing_file` misses
+                    // and the pipeline re-downloads) — adopt the new
+                    // path instead of orphaning the download.
+                    if (!existing.filename.is_file() || !existing.names_own_file())
+                        && incoming.filename.is_file()
+                    {
                         existing.filename = incoming.filename;
                     }
                 }
@@ -197,10 +255,24 @@ impl Catalogue {
     /// a file *fails*, the entry is kept so the next prune retries —
     /// dropping it would orphan the file forever (a later rebuild would
     /// resurrect it metadata-less). Returns every path removed from the
-    /// catalogue — deleted here or found vanished — so the caller can
-    /// clean up derived artifacts (cached thumbnails).
+    /// catalogue — deleted here, found vanished, or rejected as foreign —
+    /// so the caller can clean up derived artifacts (cached thumbnails) —
+    /// except paths a surviving entry still references (a scrubbed entry
+    /// may have pointed at another entry's file; its thumbnail must live).
+    ///
+    /// The catalogue JSON is user-editable state, so a deserialized path
+    /// is never trusted with deletion: only files directly inside
+    /// `images_dir` whose name is a Bing wallpaper filename naming the
+    /// entry's *own* `urlbase` ([`ImageEntry::names_own_file`]) qualify —
+    /// an entry may only delete the file it legitimately names. A
+    /// tampered entry pointing anywhere else — outside the dir, at a
+    /// non-wallpaper name, or at a *different* image's valid file — is
+    /// dropped from the catalogue with its file left untouched, so a
+    /// hand-edited `catalogue.json` can never make the prune delete
+    /// arbitrary files or another entry's image.
     pub fn prune(
         &mut self,
+        images_dir: &Path,
         retention_days: u16,
         currently_applied: Option<&Path>,
         now: DateTime<Utc>,
@@ -208,6 +280,15 @@ impl Catalogue {
         let cutoff = (retention_days > 0).then(|| now - Duration::days(i64::from(retention_days)));
         let mut removed = Vec::new();
         self.images.retain(|entry| {
+            let ours = entry.filename.parent() == Some(images_dir) && entry.names_own_file();
+            if !ours {
+                tracing::warn!(
+                    "dropping catalogue entry with foreign path {} (file left untouched)",
+                    entry.filename.display()
+                );
+                removed.push(entry.filename.clone());
+                return false;
+            }
             if !entry.filename.is_file() {
                 removed.push(entry.filename.clone());
                 return false; // vanished externally — drop the entry
@@ -231,6 +312,19 @@ impl Catalogue {
                 }
             }
         });
+        // A scrubbed entry may have pointed at a file another (legitimate)
+        // entry still holds — never report a path the catalogue still
+        // references, or the caller would delete the survivor's cached
+        // thumbnail. Thumbnails are keyed by *basename*
+        // ([`crate::thumbs::thumbnail_path`]), so the comparison must be
+        // too: a foreign path merely *sharing* a survivor's basename
+        // would otherwise take the survivor's thumbnail with it.
+        removed.retain(|path| {
+            !self
+                .images
+                .iter()
+                .any(|e| e.filename.file_name() == path.file_name())
+        });
         removed
     }
 
@@ -250,10 +344,16 @@ impl Catalogue {
     /// resolution suffix (e.g. `_1920x1080` from the reference extension),
     /// where the mere existence check on the UHD path would miss it and
     /// re-download ~5 MB the merge then orphans.
+    ///
+    /// Only files the entry legitimately names count
+    /// ([`ImageEntry::names_own_file`]): a tampered catalogue pointing an
+    /// entry at a *different* image's file must not skip this image's
+    /// download — the pipeline re-downloads and the merge then heals the
+    /// entry with the fresh path.
     pub fn existing_file(&self, urlbase: &str) -> Option<PathBuf> {
         self.images
             .iter()
-            .find(|e| e.urlbase == urlbase && e.filename.is_file())
+            .find(|e| e.urlbase == urlbase && e.names_own_file() && e.filename.is_file())
             .map(|e| e.filename.clone())
     }
 
@@ -284,6 +384,13 @@ impl Catalogue {
             .iter()
             .filter(|e| Some(e.filename.as_path()) != current)
             .collect();
+        // `images.len() >= 2` does not guarantee candidates exist: entries
+        // sharing `current`'s filename (only constructible via catalogue
+        // tampering — merge dedupes and prune scrubs such entries) would
+        // all be filtered out, and the modulo below must never see zero.
+        if candidates.is_empty() {
+            return None;
+        }
         // Wallpaper shuffle needs no cryptographic randomness; clock
         // subsecond nanos avoid pulling in a rand dependency.
         let nanos = std::time::SystemTime::now()
@@ -430,6 +537,39 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_dedupes_by_urlbase() {
+        let dir = tempfile::tempdir().unwrap();
+        // The same image at two resolutions (reference extension's setting
+        // changed over time) — one entry, the UHD file wins the tie.
+        fs::write(dir.path().join("20260806-Foo_ROW1_1920x1080.jpg"), b"x").unwrap();
+        fs::write(dir.path().join("20260806-Foo_ROW1_UHD.jpg"), b"x").unwrap();
+        // The same image repeated by Bing on two dates — the newest wins.
+        fs::write(dir.path().join("20240101-Bar_ROW2_UHD.jpg"), b"x").unwrap();
+        fs::write(dir.path().join("20260807-Bar_ROW2_UHD.jpg"), b"x").unwrap();
+
+        let cat = Catalogue::rebuild_from_folder(dir.path());
+
+        assert_eq!(cat.images.len(), 2);
+        let foo = cat
+            .images
+            .iter()
+            .find(|e| e.urlbase.contains("Foo"))
+            .unwrap();
+        assert_eq!(foo.filename, dir.path().join("20260806-Foo_ROW1_UHD.jpg"));
+        let bar = cat
+            .images
+            .iter()
+            .find(|e| e.urlbase.contains("Bar"))
+            .unwrap();
+        assert_eq!(bar.startdate, "20260807");
+        // A later merge of the same urlbase updates the one entry cleanly.
+        assert_eq!(
+            cat.existing_file(&urlbase("Foo_ROW1")),
+            Some(dir.path().join("20260806-Foo_ROW1_UHD.jpg"))
+        );
+    }
+
+    #[test]
     fn rebuild_of_missing_dir_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         let cat = Catalogue::rebuild_from_folder(&dir.path().join("nope"));
@@ -516,6 +656,64 @@ mod tests {
     }
 
     #[test]
+    fn existing_file_rejects_entries_naming_a_different_image() {
+        // Tampered entry: urlbase A but the filename of image B (which
+        // exists). The pipeline must re-download A rather than skip it —
+        // otherwise A is never actually on disk under its own name.
+        let dir = tempfile::tempdir().unwrap();
+        let b = entry_with_file(dir.path(), "20260806", "B_ROW2");
+        let mut tampered = entry_with_file(dir.path(), "20260807", "A_ROW1");
+        fs::remove_file(&tampered.filename).unwrap();
+        tampered.filename = b.filename.clone();
+        let cat = Catalogue {
+            images: vec![tampered, b.clone()],
+        };
+
+        assert_eq!(cat.existing_file(&urlbase("A_ROW1")), None);
+        // The legitimate entry is unaffected.
+        assert_eq!(
+            cat.existing_file(&urlbase("B_ROW2")),
+            Some(b.filename.clone())
+        );
+    }
+
+    #[test]
+    fn merge_heals_an_entry_pointing_at_a_different_images_file() {
+        // Follow-up to the tampered `existing_file` case: the pipeline
+        // re-downloaded image A (the tampered claim was rejected), and the
+        // merge must adopt the fresh legitimate path even though the
+        // tampered path still exists on disk.
+        let dir = tempfile::tempdir().unwrap();
+        let other = entry_with_file(dir.path(), "20260806", "B_ROW2");
+        let mut tampered = entry_with_file(dir.path(), "20260807", "A_ROW1");
+        let legit_path = tampered.filename.clone();
+        fs::remove_file(&legit_path).unwrap();
+        tampered.filename = other.filename.clone();
+        let mut cat = Catalogue {
+            images: vec![tampered.clone(), other.clone()],
+        };
+
+        fs::write(&legit_path, b"fresh jpeg").unwrap();
+        let mut incoming = tampered.clone();
+        incoming.filename = legit_path.clone();
+        cat.merge(vec![incoming]);
+
+        let healed = cat
+            .images
+            .iter()
+            .find(|e| e.urlbase == urlbase("A_ROW1"))
+            .unwrap();
+        assert_eq!(healed.filename, legit_path);
+        // The legitimate B entry keeps its own file.
+        let b_entry = cat
+            .images
+            .iter()
+            .find(|e| e.urlbase == urlbase("B_ROW2"))
+            .unwrap();
+        assert_eq!(b_entry.filename, other.filename);
+    }
+
+    #[test]
     fn merge_adopts_the_fresh_download_when_the_old_file_vanished() {
         let dir = tempfile::tempdir().unwrap();
         // A real (non-rebuilt) entry whose file vanished externally.
@@ -538,6 +736,56 @@ mod tests {
         assert_eq!(cat.images.len(), 1);
         assert_eq!(cat.images[0].filename, fresh_path);
         assert_eq!(cat.images[0].title, real.title); // metadata untouched
+    }
+
+    #[test]
+    fn merge_adopts_newer_dates_when_bing_repeats_an_image() {
+        // Bing re-runs an image under an unchanged urlbase on a later
+        // day. The existing (real-metadata) entry must adopt the new
+        // dates, or `newest()` would target yesterday's image and the
+        // refresh schedule would derive from a stale date.
+        let dir = tempfile::tempdir().unwrap();
+        let old = entry_with_file(dir.path(), "20240101", "Foo_ROW1");
+        let newer = entry_with_file(dir.path(), "20260807", "Bar_ROW2");
+        let mut cat = Catalogue {
+            images: vec![old.clone(), newer.clone()],
+        };
+
+        let mut incoming = old.clone();
+        incoming.startdate = "20260808".to_owned();
+        incoming.fullstartdate = "202608080700".to_owned();
+        incoming.filename = dir.path().join("20260808-Foo_ROW1_UHD.jpg");
+        cat.merge(vec![incoming]);
+
+        let repeated = cat
+            .images
+            .iter()
+            .find(|e| e.urlbase == urlbase("Foo_ROW1"))
+            .unwrap();
+        assert_eq!(repeated.startdate, "20260808");
+        assert_eq!(repeated.fullstartdate, "202608080700");
+        // The already-downloaded file (named with the old date) is kept.
+        assert_eq!(repeated.filename, old.filename);
+        assert_eq!(repeated.title, old.title);
+        // The re-run is now the newest — auto-apply and scheduling
+        // follow it.
+        assert_eq!(cat.newest().unwrap().urlbase, urlbase("Foo_ROW1"));
+    }
+
+    #[test]
+    fn merge_never_moves_dates_backwards() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = entry_with_file(dir.path(), "20260807", "Foo_ROW1");
+        let mut cat = Catalogue {
+            images: vec![real.clone()],
+        };
+
+        let mut incoming = real.clone();
+        incoming.startdate = "20240101".to_owned();
+        incoming.fullstartdate = "202401010700".to_owned();
+        cat.merge(vec![incoming]);
+
+        assert_eq!(cat.images, vec![real]);
     }
 
     #[test]
@@ -588,7 +836,7 @@ mod tests {
             images: vec![old.clone(), edge.clone(), kept.clone(), new.clone()],
         };
 
-        let deleted = cat.prune(3, None, now());
+        let deleted = cat.prune(dir.path(), 3, None, now());
 
         assert_eq!(deleted, vec![old.filename.clone(), edge.filename.clone()]);
         assert!(!old.filename.exists());
@@ -606,7 +854,7 @@ mod tests {
             images: vec![ancient.clone()],
         };
 
-        let deleted = cat.prune(0, None, now());
+        let deleted = cat.prune(dir.path(), 0, None, now());
 
         assert!(deleted.is_empty());
         assert_eq!(cat.images, vec![ancient.clone()]);
@@ -622,7 +870,7 @@ mod tests {
             images: vec![old_applied.clone(), old_other.clone()],
         };
 
-        let deleted = cat.prune(3, Some(&old_applied.filename), now());
+        let deleted = cat.prune(dir.path(), 3, Some(&old_applied.filename), now());
 
         assert_eq!(deleted, vec![old_other.filename.clone()]);
         assert!(old_applied.filename.exists());
@@ -641,7 +889,7 @@ mod tests {
 
         // Even with retention "forever", vanished entries are dropped —
         // and reported, so the caller can clean up their thumbnails.
-        let removed = cat.prune(0, None, now());
+        let removed = cat.prune(dir.path(), 0, None, now());
 
         assert_eq!(removed, vec![gone.filename]);
         assert_eq!(cat.images, vec![there]);
@@ -661,7 +909,7 @@ mod tests {
         // Read-only parent dir → remove_file fails (for non-root).
         fs::set_permissions(&sub, fs::Permissions::from_mode(0o555)).unwrap();
 
-        let removed = cat.prune(3, None, now());
+        let removed = cat.prune(&sub, 3, None, now());
 
         fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
         if removed.is_empty() {
@@ -685,7 +933,7 @@ mod tests {
             images: vec![boundary.clone()],
         };
 
-        let removed = cat.prune(3, None, now());
+        let removed = cat.prune(dir.path(), 3, None, now());
 
         assert!(removed.is_empty());
         assert_eq!(cat.images, vec![boundary.clone()]);
@@ -701,9 +949,127 @@ mod tests {
             images: vec![odd.clone()],
         };
 
-        cat.prune(3, None, now());
+        cat.prune(dir.path(), 3, None, now());
 
         assert_eq!(cat.images, vec![odd]); // never delete on a guess
+    }
+
+    #[test]
+    fn prune_never_deletes_files_outside_the_images_dir() {
+        // The tampered-catalogue scenario: an entry with an old
+        // fullstartdate pointing at a user file elsewhere. Prune must not
+        // honor it with deletion — the entry is scrubbed, the file stays.
+        let dir = tempfile::tempdir().unwrap();
+        let images = dir.path().join("BingWallpaper");
+        fs::create_dir_all(&images).unwrap();
+        let victim = dir.path().join("important.pdf");
+        fs::write(&victim, b"precious").unwrap();
+        let mut hostile = entry_with_file(&images, "20200101", "Evil_ROW1");
+        fs::remove_file(&hostile.filename).unwrap();
+        hostile.filename = victim.clone();
+        // A pattern-valid wallpaper filename *outside* the images dir is
+        // just as foreign — dir containment alone must protect it.
+        let outside = entry_with_file(dir.path(), "20200102", "Outside_ROW2");
+        let kept = entry_with_file(&images, "20260807", "Kept_ROW3");
+        let mut cat = Catalogue {
+            images: vec![hostile, outside.clone(), kept.clone()],
+        };
+
+        let removed = cat.prune(&images, 3, None, now());
+
+        assert!(victim.is_file(), "foreign file must never be deleted");
+        assert!(outside.filename.is_file(), "outside-dir file must survive");
+        assert_eq!(cat.images, vec![kept]); // hostile entries scrubbed
+        // Reported so their cached thumbnails (namespaced by file name
+        // under the thumbs dir) are cleaned up like any removal.
+        assert_eq!(removed, vec![victim, outside.filename.clone()]);
+    }
+
+    #[test]
+    fn prune_never_deletes_non_wallpaper_names_inside_the_images_dir() {
+        // The download folder is shared with the user's own files: an
+        // entry whose name fails the wallpaper pattern is not ours even
+        // when it lives inside the images dir.
+        let dir = tempfile::tempdir().unwrap();
+        let vacation = dir.path().join("vacation.jpg");
+        fs::write(&vacation, b"mine").unwrap();
+        let mut hostile = entry_with_file(dir.path(), "20200101", "Evil_ROW1");
+        fs::remove_file(&hostile.filename).unwrap();
+        hostile.filename = vacation.clone();
+        let mut cat = Catalogue {
+            images: vec![hostile],
+        };
+
+        let removed = cat.prune(dir.path(), 3, None, now());
+
+        assert!(
+            vacation.is_file(),
+            "non-wallpaper file must never be deleted"
+        );
+        assert!(cat.images.is_empty());
+        assert_eq!(removed, vec![vacation]);
+    }
+
+    #[test]
+    fn prune_never_deletes_a_different_images_file() {
+        // Tampered catalogue: an old entry (urlbase Evil) pointing at
+        // *another* image's perfectly valid wallpaper file inside the
+        // images dir. The dir + pattern gate alone would pass it — the
+        // urlbase-consistency gate must not: an entry may only delete
+        // the file it legitimately names.
+        let dir = tempfile::tempdir().unwrap();
+        let victim = entry_with_file(dir.path(), "20260807", "Victim_ROW2");
+        let mut hostile = entry_with_file(dir.path(), "20200101", "Evil_ROW1");
+        fs::remove_file(&hostile.filename).unwrap();
+        hostile.filename = victim.filename.clone();
+        let mut cat = Catalogue {
+            images: vec![hostile, victim.clone()],
+        };
+
+        let removed = cat.prune(dir.path(), 3, None, now());
+
+        assert!(
+            victim.filename.is_file(),
+            "another image's file must never be deleted"
+        );
+        assert_eq!(cat.images, vec![victim.clone()]);
+        // The scrubbed entry's path is still held by the surviving entry,
+        // so it must NOT be reported — the caller would delete the
+        // survivor's cached thumbnail.
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn tampered_catalogue_json_cannot_delete_arbitrary_files() {
+        // End-to-end through the JSON boundary: a hand-edited catalogue
+        // on disk round-trips through load + prune without the victim
+        // file being touched, and the hostile entry does not survive.
+        let dir = tempfile::tempdir().unwrap();
+        let images = dir.path().join("BingWallpaper");
+        fs::create_dir_all(&images).unwrap();
+        let victim = dir.path().join("Documents").join("important.pdf");
+        fs::create_dir_all(victim.parent().unwrap()).unwrap();
+        fs::write(&victim, b"precious").unwrap();
+        let json = serde_json::json!({
+            "images": [{
+                "urlbase": "/th?id=OHR.Evil_ROW1",
+                "startdate": "20200101",
+                "fullstartdate": "202001010700",
+                "title": "Evil",
+                "copyright": "© Nobody",
+                "copyrightlink": "https://example.com",
+                "filename": victim,
+            }]
+        });
+        let path = dir.path().join(CATALOGUE_FILENAME);
+        fs::write(&path, json.to_string()).unwrap();
+
+        let mut cat = Catalogue::load(&path).unwrap();
+        let removed = cat.prune(&images, 3, None, now());
+
+        assert!(victim.is_file(), "tampered entry must not delete the file");
+        assert!(cat.images.is_empty());
+        assert_eq!(removed, vec![victim]);
     }
 
     #[test]
@@ -765,5 +1131,50 @@ mod tests {
         }
         // With no current, any image qualifies — but it must pick one.
         assert!(cat.random_other(None).is_some());
+    }
+
+    #[test]
+    fn random_other_survives_duplicate_filenames_without_panicking() {
+        // Tampered-catalogue shape: two entries (different urlbases) both
+        // pointing at the current file. `images.len() >= 2` passes but
+        // every candidate is filtered out — must yield None, not a
+        // modulo-by-zero panic.
+        let dir = tempfile::tempdir().unwrap();
+        let a = entry_with_file(dir.path(), "20260807", "A_ROW1");
+        let mut b = entry_with_file(dir.path(), "20260806", "B_ROW2");
+        b.filename = a.filename.clone();
+        let cat = Catalogue {
+            images: vec![b, a.clone()],
+        };
+
+        assert!(cat.random_other(Some(&a.filename)).is_none());
+    }
+
+    #[test]
+    fn prune_reports_no_path_sharing_a_survivors_basename() {
+        // Thumbnails are keyed by basename: a scrubbed foreign path that
+        // merely *shares* a surviving entry's basename must not be
+        // reported, or the caller would delete the survivor's thumbnail.
+        let dir = tempfile::tempdir().unwrap();
+        let images = dir.path().join("BingWallpaper");
+        fs::create_dir_all(&images).unwrap();
+        let kept = entry_with_file(&images, "20260807", "Kept_ROW1");
+        let elsewhere = dir.path().join(kept.filename.file_name().unwrap());
+        fs::write(&elsewhere, b"foreign copy").unwrap();
+        let mut hostile = kept.clone();
+        hostile.urlbase = urlbase("Evil_ROW2");
+        hostile.filename = elsewhere.clone();
+        let mut cat = Catalogue {
+            images: vec![hostile, kept.clone()],
+        };
+
+        let removed = cat.prune(&images, 3, None, now());
+
+        assert!(elsewhere.is_file(), "foreign file must never be deleted");
+        assert_eq!(cat.images, vec![kept]);
+        assert!(
+            removed.is_empty(),
+            "a path with a survivor's basename must not be reported"
+        );
     }
 }

@@ -35,8 +35,9 @@ const SHUFFLE_INTERVAL_LABELS: &[&str] = &["30 minutes", "1 hour", "6 hours", "D
 const SHUFFLE_DEFAULT_INDEX: usize = SHUFFLE_INTERVAL_SECS.len() - 1;
 
 /// Retention choices in days (0 = keep forever), index-aligned with
-/// [`RETENTION_LABELS`].
-const RETENTION_DAYS: [u16; 4] = [3, 8, 30, 0];
+/// [`RETENTION_LABELS`]. Shared with `AppletConfig::normalize` so a loaded
+/// value the dropdown cannot display never drives prune/fetch behavior.
+const RETENTION_DAYS: [u16; 4] = crate::config::RETENTION_CHOICES;
 
 /// Dropdown labels for the retention choices.
 const RETENTION_LABELS: &[&str] = &["3 days", "8 days", "30 days", "Forever"];

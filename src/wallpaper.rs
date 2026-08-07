@@ -19,22 +19,23 @@ use std::path::{Path, PathBuf};
 
 use cosmic_bg_config::{Config, DEFAULT_BACKGROUND, Entry, Source};
 
-/// A cosmic-bg config operation failed. Carries the underlying error's
-/// message (the concrete error type lives in a crate instance this crate
-/// cannot name — see module comment). Only ever logged, never matched on.
+/// Applying a wallpaper failed: either a cosmic-bg config operation errored
+/// (the concrete error type lives in a crate instance this crate cannot
+/// name — see module comment) or the source file failed the [`apply`]
+/// precondition. Carries a message only; only ever logged, never matched on.
 #[derive(Debug)]
 pub struct WallpaperError(String);
 
 impl fmt::Display for WallpaperError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "cosmic-bg config error: {}", self.0)
+        write!(f, "{}", self.0)
     }
 }
 
 impl std::error::Error for WallpaperError {}
 
 fn config_err(err: impl fmt::Display) -> WallpaperError {
-    WallpaperError(err.to_string())
+    WallpaperError(format!("cosmic-bg config error: {err}"))
 }
 
 /// The hardcoded download folder, `~/Pictures/BingWallpaper` — same location
@@ -63,8 +64,29 @@ pub fn updated_entry(existing: Option<Entry>, path: &Path) -> Entry {
     }
 }
 
+/// Precondition for [`apply`]: the source must still be an existing regular
+/// file when it is written into cosmic-bg's config. A catalogue image can
+/// vanish externally between the last prune and an apply (user deletes the
+/// folder, another tool cleans it); writing the dead path anyway would
+/// persist it in cosmic-bg's config and mark it current in the applet.
+/// Directories are rejected too — the applet only ever applies single
+/// catalogue images, never a slideshow folder. Best-effort (TOCTOU is
+/// inherent), but it closes the ordinary window.
+fn check_apply_source(path: &Path) -> Result<(), WallpaperError> {
+    if path.is_file() {
+        Ok(())
+    } else {
+        Err(WallpaperError(format!(
+            "wallpaper source is not an existing file: {}",
+            path.display()
+        )))
+    }
+}
+
 /// Apply `path` as the wallpaper on all displays by writing cosmic-bg's
-/// config. Order matters: the `all` entry is written first so that when
+/// config. Errors without touching the config if `path` no longer exists
+/// (see [`check_apply_source`]). Order matters: the `all` entry is written
+/// first so that when
 /// `same-on-all` flips to true, cosmic-bg already sees the new image (no
 /// flash of the previous default). Both writes are change-only, so a
 /// re-apply of the current image touches nothing.
@@ -74,9 +96,10 @@ pub fn updated_entry(existing: Option<Entry>, path: &Path) -> Entry {
 /// building a `Context` rooted elsewhere requires naming the crate's own
 /// `cosmic_config` instance, which this crate cannot (see module comment).
 /// They remain covered by the Post-Completion manual smoke test; the pure
-/// halves (`updated_entry`, `is_ours`, `should_auto_apply`) are unit-tested
-/// below.
+/// halves (`updated_entry`, `check_apply_source`, `is_ours`,
+/// `should_auto_apply`) are unit-tested below.
 pub fn apply(path: &Path) -> Result<(), WallpaperError> {
+    check_apply_source(path)?;
     let context = cosmic_bg_config::context().map_err(config_err)?;
     let entry = updated_entry(context.entry(DEFAULT_BACKGROUND).ok(), path);
 
@@ -86,22 +109,85 @@ pub fn apply(path: &Path) -> Result<(), WallpaperError> {
     Ok(())
 }
 
-/// What is currently applied, per cosmic-bg's config: the `all` entry's
-/// `Source::Path`. Returns `None` for a color/gradient source, an unreadable
-/// config, or per-output mode (`same-on-all = false`) — in per-output mode
-/// the `all` entry is not what is displayed, and `None` keeps the
-/// auto-apply "don't clobber" rule conservative.
+/// What cosmic-bg currently displays, as far as its config can tell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CurrentWallpaper {
+    /// Same-on-all mode showing this file.
+    File(PathBuf),
+    /// No catalogue file can be displayed: same-on-all with a
+    /// color/gradient source, or no readable `all` entry (cosmic-bg then
+    /// shows its built-in default).
+    NoFile,
+    /// Per-output mode (`same-on-all = false`) or an unreadable config —
+    /// which file(s) are displayed cannot be determined from the `all`
+    /// entry, so callers must stay conservative.
+    Unknown,
+}
+
+/// Read what cosmic-bg currently displays from its config.
 ///
-/// Accepted v1 limitation: this is read on demand (startup / next apply),
-/// not watched — external changes are picked up then.
-pub fn current_source() -> Option<PathBuf> {
-    let context = cosmic_bg_config::context().ok()?;
+/// Accepted v1 limitation: this is read on demand (startup / next apply /
+/// prune), not watched — external changes are picked up then.
+///
+/// Test note: no automated coverage for the same reason as [`apply`] (the
+/// real user config is the only constructible context); the decisions built
+/// on the result ([`prune_retention`], [`should_auto_apply`]) are pure and
+/// tested.
+pub fn current_wallpaper() -> CurrentWallpaper {
+    let Ok(context) = cosmic_bg_config::context() else {
+        return CurrentWallpaper::Unknown;
+    };
     if !context.same_on_all() {
-        return None;
+        return CurrentWallpaper::Unknown;
     }
-    match context.entry(DEFAULT_BACKGROUND).ok()?.source {
-        Source::Path(path) => Some(path),
-        Source::Color(_) => None,
+    match context.entry(DEFAULT_BACKGROUND) {
+        Ok(entry) => match entry.source {
+            Source::Path(path) => CurrentWallpaper::File(path),
+            Source::Color(_) => CurrentWallpaper::NoFile,
+        },
+        // Same-on-all but no readable `all` entry: cosmic-bg falls back to
+        // its default wallpaper — none of our files is displayed.
+        Err(_) => CurrentWallpaper::NoFile,
+    }
+}
+
+/// What is currently applied, per cosmic-bg's config: the `all` entry's
+/// `Source::Path`. `None` for every non-file state (see
+/// [`current_wallpaper`]) — keeps the auto-apply "don't clobber" rule
+/// conservative.
+pub fn current_source() -> Option<PathBuf> {
+    match current_wallpaper() {
+        CurrentWallpaper::File(path) => Some(path),
+        CurrentWallpaper::NoFile | CurrentWallpaper::Unknown => None,
+    }
+}
+
+/// The applet's tracked "current" after a fresh read of the live state:
+/// a [`CurrentWallpaper::File`] replaces it, [`CurrentWallpaper::NoFile`]
+/// clears it (no catalogue file is *known* to be displayed — keeping a
+/// stale path would present it as current and shield it from shuffle),
+/// and [`CurrentWallpaper::Unknown`] keeps the previous value (some
+/// output may still display it, so stay conservative).
+pub fn synced_current(live: &CurrentWallpaper, previous: Option<PathBuf>) -> Option<PathBuf> {
+    match live {
+        CurrentWallpaper::File(path) => Some(path.clone()),
+        CurrentWallpaper::NoFile => None,
+        CurrentWallpaper::Unknown => previous,
+    }
+}
+
+/// The retention to prune with, given what cosmic-bg says is displayed.
+/// The invariant is "never delete the currently applied file"; in
+/// [`CurrentWallpaper::Unknown`] (per-output mode, unreadable config) the
+/// displayed files are unknowable from the `all` entry, so age-based
+/// deletion is disabled entirely (`0` = keep forever — the prune then only
+/// drops entries whose file already vanished). Disk cleanup resumes as
+/// soon as the state is knowable again — e.g. the first apply through the
+/// applet collapses per-output setups to same-on-all.
+pub fn prune_retention(current: &CurrentWallpaper, configured_days: u16) -> u16 {
+    match current {
+        CurrentWallpaper::Unknown => 0,
+        CurrentWallpaper::File(_) | CurrentWallpaper::NoFile => configured_days,
     }
 }
 
@@ -124,9 +210,18 @@ pub fn should_auto_apply(cold_start_first_fetch: bool, current_source: Option<&P
 
 /// Lexical containment: `path` is strictly inside `dir` (the dir itself does
 /// not count — a slideshow source pointing at the folder is not "our image").
-/// Relative paths can never match an absolute dir.
+/// Relative paths can never match an absolute dir. Paths containing `..`
+/// are rejected outright: `starts_with` is purely lexical, so
+/// `<dir>/../elsewhere/x.jpg` would otherwise count as inside — and since
+/// "ours" feeds the auto-apply rule, that would let a foreign wallpaper
+/// spelled with `..` be clobbered. Rejecting is the conservative
+/// direction (fewer paths count as ours → less auto-apply).
 fn is_inside(path: &Path, dir: &Path) -> bool {
-    path != dir && path.starts_with(dir)
+    path != dir
+        && path.starts_with(dir)
+        && !path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
 }
 
 #[cfg(test)]
@@ -197,6 +292,26 @@ mod tests {
     }
 
     #[test]
+    fn apply_source_must_be_an_existing_regular_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // A missing path (e.g. a catalogue image deleted externally) is
+        // refused — apply() must error before writing cosmic-bg config.
+        let vanished = dir.path().join("20260807-Foo_UHD.jpg");
+        let err = check_apply_source(&vanished).expect_err("missing file must be refused");
+        assert!(err.to_string().contains("not an existing file"));
+        assert!(err.to_string().contains("20260807-Foo_UHD.jpg"));
+
+        // A directory is not an applyable image either.
+        check_apply_source(dir.path()).expect_err("directory must be refused");
+
+        // An existing regular file passes.
+        let present = dir.path().join("20260808-Bar_UHD.jpg");
+        std::fs::write(&present, b"jpg").expect("write");
+        check_apply_source(&present).expect("existing file must pass");
+    }
+
+    #[test]
     fn download_dir_is_under_home_pictures() {
         if dirs::home_dir().is_none() {
             eprintln!("skipping: no home dir in this environment");
@@ -255,6 +370,43 @@ mod tests {
     }
 
     #[test]
+    fn prune_retention_disables_age_deletion_when_current_is_unknowable() {
+        // Per-output mode / unreadable config: the applied files are
+        // unknowable, so pruning must not delete by age (0 = forever).
+        assert_eq!(prune_retention(&CurrentWallpaper::Unknown, 8), 0);
+        assert_eq!(prune_retention(&CurrentWallpaper::Unknown, 3), 0);
+        // Known states prune with the configured retention.
+        let file = CurrentWallpaper::File(PathBuf::from("/x.jpg"));
+        assert_eq!(prune_retention(&file, 8), 8);
+        assert_eq!(prune_retention(&CurrentWallpaper::NoFile, 3), 3);
+        assert_eq!(prune_retention(&CurrentWallpaper::NoFile, 0), 0);
+    }
+
+    #[test]
+    fn synced_current_clears_on_no_file_keeps_on_unknown() {
+        let stale = Some(PathBuf::from("/home/u/Pictures/BingWallpaper/old.jpg"));
+        // A live file always wins, stale or not.
+        let live = CurrentWallpaper::File(PathBuf::from("/x.jpg"));
+        assert_eq!(
+            synced_current(&live, stale.clone()),
+            Some(PathBuf::from("/x.jpg"))
+        );
+        assert_eq!(synced_current(&live, None), Some(PathBuf::from("/x.jpg")));
+        // NoFile: we *know* no catalogue file is displayed — clear the
+        // stale path instead of presenting it as current.
+        assert_eq!(
+            synced_current(&CurrentWallpaper::NoFile, stale.clone()),
+            None
+        );
+        // Unknown: stay conservative, keep whatever we last knew.
+        assert_eq!(
+            synced_current(&CurrentWallpaper::Unknown, stale.clone()),
+            stale
+        );
+        assert_eq!(synced_current(&CurrentWallpaper::Unknown, None), None);
+    }
+
+    #[test]
     fn is_inside_is_component_wise_not_string_prefix() {
         let dir = Path::new("/home/u/Pictures/BingWallpaper");
         assert!(is_inside(
@@ -268,5 +420,22 @@ mod tests {
         ));
         assert!(!is_inside(Path::new("/home/u/Pictures"), dir));
         assert!(!is_inside(dir, dir));
+    }
+
+    #[test]
+    fn is_inside_rejects_parent_dir_traversal() {
+        let dir = Path::new("/home/u/Pictures/BingWallpaper");
+        // Lexically "starts with" the dir but resolves outside it — a
+        // foreign wallpaper spelled this way must not count as ours (it
+        // would get clobbered by auto-apply).
+        assert!(!is_inside(
+            Path::new("/home/u/Pictures/BingWallpaper/../Documents/x.jpg"),
+            dir
+        ));
+        // Even a `..` that resolves back inside is rejected — conservative.
+        assert!(!is_inside(
+            Path::new("/home/u/Pictures/BingWallpaper/sub/../a.jpg"),
+            dir
+        ));
     }
 }

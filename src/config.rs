@@ -15,6 +15,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::APP_ID;
 
+/// The retention values the applet supports (the "Keep images" dropdown's
+/// choices; 0 = forever). Loaded values outside this set normalize to the
+/// default — `view::RETENTION_DAYS` is built from this array so the UI can
+/// never drift from it.
+pub const RETENTION_CHOICES: [u16; 4] = [3, 8, 30, 0];
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, CosmicConfigEntry)]
 #[version = 1]
 pub struct AppletConfig {
@@ -44,7 +50,8 @@ impl AppletConfig {
 
     /// Load settings from `config`, falling back to defaults for any key that
     /// is missing or unreadable. Never fails: a fresh install (no keys yet) and
-    /// a corrupt key both degrade to defaults per-field.
+    /// a corrupt key both degrade to defaults per-field. The result is
+    /// [normalized](Self::normalize).
     pub fn load(config: &Config) -> Self {
         match Self::get_entry(config) {
             Ok(loaded) => loaded,
@@ -55,6 +62,27 @@ impl AppletConfig {
                 partial
             }
         }
+        .normalize()
+    }
+
+    /// Snap semantically invalid loaded values to what the applet supports:
+    /// a `retention_days` outside [`RETENTION_CHOICES`] falls back to the
+    /// default, so the popup's dropdown display and prune/fetch behavior
+    /// always agree — a hand-edited `1` must not silently delete images
+    /// while the UI claims 8 days. (`shuffle_interval_secs` is deliberately
+    /// *not* snapped: a custom sane interval is honored by the timer, and
+    /// `schedule::shuffle_interval` defuses the dangerous values; a wrong
+    /// dropdown selection there is cosmetic, not destructive.)
+    pub fn normalize(mut self) -> Self {
+        if !RETENTION_CHOICES.contains(&self.retention_days) {
+            let fallback = Self::default().retention_days;
+            tracing::warn!(
+                "unsupported retention_days {} in config (using {fallback})",
+                self.retention_days
+            );
+            self.retention_days = fallback;
+        }
+        self
     }
 }
 
@@ -144,6 +172,40 @@ mod tests {
         // …while intact fields keep their stored values.
         assert!(loaded.shuffle_enabled);
         assert_eq!(loaded.retention_days, 30);
+    }
+
+    #[test]
+    fn normalize_snaps_unsupported_retention_to_the_default() {
+        // Every supported choice passes through untouched.
+        for days in RETENTION_CHOICES {
+            let config = AppletConfig {
+                retention_days: days,
+                ..Default::default()
+            };
+            assert_eq!(config.clone().normalize(), config, "{days}");
+        }
+        // Hand-edited values outside the set fall back to the default —
+        // a `1` must not prune to 1 day while the dropdown shows 8.
+        for days in [1u16, 2, 7, 9, 365, u16::MAX] {
+            let config = AppletConfig {
+                retention_days: days,
+                ..Default::default()
+            };
+            assert_eq!(config.normalize().retention_days, 8, "{days}");
+        }
+    }
+
+    #[test]
+    fn load_normalizes_hand_edited_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_context(&dir);
+
+        // Write an unsupported value through the raw setter (bypasses the
+        // applet's own UI, like a hand edit of the RON file).
+        let mut config = AppletConfig::default();
+        config.set_retention_days(&ctx, 1).expect("setter write");
+
+        assert_eq!(AppletConfig::load(&ctx).retention_days, 8);
     }
 
     /// Locate the per-field RON file cosmic-config wrote inside the TempDir.

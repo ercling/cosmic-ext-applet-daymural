@@ -204,18 +204,28 @@ pub async fn download_image(
 /// The two bytes every JPEG stream starts with (SOI marker).
 const JPEG_MAGIC: [u8; 2] = [0xFF, 0xD8];
 
-/// Remove orphaned `*.part` files a crash mid-download may have left in
+/// Remove orphaned `.part` temps a crash mid-download may have left in
 /// `dir` (the pipeline sweeps before downloading anew; downloads are
-/// single-flight, so nothing here can be in active use). Best-effort: a
-/// missing dir or a failed removal is only logged.
+/// single-flight, so nothing here can be in active use). Only *our own*
+/// temps qualify: a `.part` whose stem is a Bing wallpaper filename
+/// (`parse_filename`). The download folder is shared — the GNOME
+/// reference extension uses the same location and the user may keep
+/// arbitrary files there — so any other `*.part` must survive.
+/// Best-effort: a missing dir or a failed removal is only logged.
 pub fn sweep_part_files(dir: &Path) {
     let Ok(read) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in read.flatten() {
+        let name = entry.file_name();
+        let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(PART_SUFFIX)) else {
+            continue;
+        };
+        if parse_filename(stem).is_none() {
+            continue; // not one of our temps — leave it alone
+        }
         let path = entry.path();
-        if path.extension().is_some_and(|e| e == "part")
-            && path.is_file()
+        if path.is_file()
             && let Err(e) = std::fs::remove_file(&path)
         {
             tracing::warn!("failed to remove orphaned {}: {e}", path.display());
@@ -326,6 +336,21 @@ pub fn parse_filename(filename: &str) -> Option<(String, String)> {
         return None;
     }
     Some((startdate.to_owned(), format!("{URLBASE_PREFIX}{name}")))
+}
+
+/// Whether `filename` is a wallpaper filename ([`parse_filename`]) that
+/// names `urlbase`'s image — i.e. its `<name>` part matches. The
+/// comparison goes through [`urlbase_name`] on both sides (rather than
+/// requiring the parse to reconstruct `urlbase` verbatim) so a
+/// non-canonical urlbase (extra path components, missing `th?id=OHR.`
+/// prefix) still matches the filename [`image_filename`] would build for
+/// it. The date part is deliberately *not* compared: an entry may
+/// legitimately point at the same image downloaded under a different date
+/// (Bing repeats images; `Catalogue::merge` adopts a fresh download when
+/// an entry's file vanished).
+pub fn filename_names_urlbase(filename: &str, urlbase: &str) -> bool {
+    parse_filename(filename)
+        .is_some_and(|(_, parsed)| urlbase_name(&parsed) == urlbase_name(urlbase))
 }
 
 #[cfg(test)]
@@ -490,6 +515,29 @@ mod tests {
     }
 
     #[test]
+    fn filename_names_urlbase_matches_only_its_own_image() {
+        let foo = "/th?id=OHR.Foo_ROW1";
+        assert!(filename_names_urlbase("20260807-Foo_ROW1_UHD.jpg", foo));
+        // Any date/resolution still names the same image.
+        assert!(filename_names_urlbase(
+            "20240101-Foo_ROW1_1920x1080.jpg",
+            foo
+        ));
+        // A different image's (perfectly valid) file does not.
+        assert!(!filename_names_urlbase("20260807-Bar_ROW2_UHD.jpg", foo));
+        // Non-wallpaper names never match.
+        assert!(!filename_names_urlbase("vacation.jpg", foo));
+        assert!(!filename_names_urlbase("catalogue.json", foo));
+        // A non-canonical urlbase still matches the filename built for it
+        // (the check must not scrub legitimate entries).
+        let odd = "OHR.Odd_ROW3"; // no "/th?id=" prefix
+        assert!(filename_names_urlbase(
+            &image_filename("20260807", odd),
+            odd
+        ));
+    }
+
+    #[test]
     fn api_url_matches_reference_query() {
         assert_eq!(
             api_url(BING_BASE_URL, 8),
@@ -619,17 +667,25 @@ mod tests {
     }
 
     #[test]
-    fn sweep_part_files_removes_only_orphaned_parts() {
+    fn sweep_part_files_removes_only_our_orphaned_parts() {
         let dir = tempfile::tempdir().unwrap();
         let part = dir.path().join("20260807-Foo_UHD.jpg.part");
         let real = dir.path().join("20260807-Foo_UHD.jpg");
+        // Foreign partials in the shared folder — a user download and a
+        // temp whose stem is not a Bing wallpaper filename. Never touched.
+        let foreign = dir.path().join("vacation-video.mp4.part");
+        let not_bing = dir.path().join("holiday.jpg.part");
         std::fs::write(&part, b"torn download").unwrap();
         std::fs::write(&real, b"jpeg bytes").unwrap();
+        std::fs::write(&foreign, b"someone else's").unwrap();
+        std::fs::write(&not_bing, b"someone else's").unwrap();
 
         sweep_part_files(dir.path());
 
-        assert!(!part.exists(), "orphaned .part must be swept");
+        assert!(!part.exists(), "our orphaned .part must be swept");
         assert!(real.exists(), "finished downloads must survive");
+        assert!(foreign.exists(), "unrelated .part files must survive");
+        assert!(not_bing.exists(), "non-Bing .jpg.part files must survive");
         // A missing dir is a quiet no-op, not a panic.
         sweep_part_files(&dir.path().join("nope"));
     }

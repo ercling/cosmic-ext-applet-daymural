@@ -78,10 +78,10 @@ pub struct Window {
     pub(crate) current: Option<PathBuf>,
     /// A fetch pipeline is running (debounces refresh triggers).
     pub(crate) refresh_pending: bool,
-    /// Cold start: the catalogue was empty at startup and no fetch has
-    /// succeeded yet — the first successful fetch auto-applies
-    /// unconditionally.
-    first_fetch_pending: bool,
+    /// Cold-start auto-apply state (see [`ColdStart`]). Spent by *any*
+    /// successful apply (auto, manual navigation, shuffle tick): see
+    /// [`on_apply_success`].
+    cold_start: ColdStart,
     /// Generation counter for the one-shot refresh timer; `RefreshDue`
     /// messages carrying a stale generation are ignored.
     timer_generation: u64,
@@ -94,6 +94,47 @@ pub struct Window {
     pub(crate) last_updated: Option<DateTime<Utc>>,
     /// The last fetch error, cleared on success (status footer).
     pub(crate) last_error: Option<RefreshError>,
+}
+
+/// The one-shot cold-start auto-apply: a fresh install (empty catalogue at
+/// startup) owes the user one applied wallpaper — that's why the applet was
+/// installed — even over whatever foreign default is currently displayed.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+enum ColdStart {
+    /// Catalogue empty at startup, no apply attempted yet: the first
+    /// successful fetch auto-applies unconditionally.
+    Pending,
+    /// The cold-start auto-apply *failed* while this wallpaper (if any)
+    /// was displayed. The next scheduled fetch retries — but only while
+    /// the display still shows that same wallpaper: a user actively
+    /// picking a different wallpaper between failure and retry must win
+    /// (the retry must not clobber it the way the unconditional
+    /// `Pending` branch would).
+    RetryOver(Option<PathBuf>),
+    /// Spent (an apply succeeded, or the catalogue had images at
+    /// startup): only the warm `is_ours` rule auto-applies from here on.
+    #[default]
+    Done,
+}
+
+impl ColdStart {
+    /// Whether the cold-start branch may bypass the warm `is_ours` check
+    /// and auto-apply over `live` (the wallpaper displayed right now).
+    /// A file of ours needs no bypass — [`wallpaper::should_auto_apply`]'s
+    /// warm branch covers it regardless of what this returns.
+    fn applies_over(&self, live: Option<&Path>) -> bool {
+        match self {
+            Self::Pending => true,
+            Self::RetryOver(at_failure) => match live {
+                // Nothing knowable is displayed (color source,
+                // per-output mode) — same ground the reviewer's rule
+                // treats as safe to apply over.
+                None => true,
+                Some(path) => Some(path) == at_failure.as_deref(),
+            },
+            Self::Done => false,
+        }
+    }
 }
 
 /// Why a refresh failed — the footer distinguishes local disk trouble from
@@ -249,14 +290,18 @@ impl Window {
     /// pruned images' cached thumbnails (later prunes never report these
     /// entries again — skipping this would orphan them permanently), and
     /// persist the catalogue. Returns the live wallpaper source that was
-    /// read.
+    /// read (`None` for every non-file state).
+    ///
+    /// When what is displayed is *unknowable* (per-output mode, unreadable
+    /// config), `wallpaper::prune_retention` disables age-based deletion
+    /// entirely — protecting only the possibly stale `self.current` could
+    /// delete a Bing image some output actually displays.
     fn prune_and_persist(&mut self) -> Option<PathBuf> {
-        let live = wallpaper::current_source();
-        if let Some(live) = &live {
-            self.current = Some(live.clone());
-        }
+        let live = wallpaper::current_wallpaper();
+        self.current = wallpaper::synced_current(&live, self.current.take());
         let removed = self.catalogue.prune(
-            self.config.retention_days,
+            &wallpaper::download_dir(),
+            wallpaper::prune_retention(&live, self.config.retention_days),
             self.current.as_deref(),
             Utc::now(),
         );
@@ -265,7 +310,10 @@ impl Window {
             // Non-fatal: the catalogue is rebuildable from the folder scan.
             tracing::warn!("failed to persist catalogue after prune: {error}");
         }
-        live
+        match live {
+            wallpaper::CurrentWallpaper::File(path) => Some(path),
+            _ => None,
+        }
     }
 
     /// Kick off the fetch pipeline unless one is already running. The
@@ -313,24 +361,44 @@ impl Window {
         self.last_error = None;
 
         let plan = refresh_success_plan(
-            self.first_fetch_pending,
+            self.cold_start.applies_over(live.as_deref()),
             live.as_deref(),
             self.catalogue.newest().map(|e| e.fullstartdate.as_str()),
             Utc::now(),
         );
+        let mut apply_failed = false;
         if plan.auto_apply
             && let Some(newest) = self.catalogue.newest()
         {
             let path = newest.filename.clone();
             match wallpaper::apply(&path) {
-                Ok(()) => self.current = Some(path),
+                Ok(()) => on_apply_success(&mut self.current, &mut self.cold_start, path),
                 Err(error) => {
                     tracing::warn!("failed to apply wallpaper: {error}");
+                    apply_failed = true;
+                    // Remember what was displayed when the cold-start
+                    // apply failed: the retry on the next scheduled
+                    // fetch only fires while the display is unchanged —
+                    // a wallpaper the user picks in the meantime wins.
+                    if self.cold_start != ColdStart::Done {
+                        self.cold_start = ColdStart::RetryOver(live.clone());
+                    }
                 }
             }
         }
-        if plan.clear_cold_start {
-            self.first_fetch_pending = false;
+        // The cold-start flag is spent only once an apply actually landed
+        // (the Ok arm above already spent it via `on_apply_success`; this
+        // keeps the pure-plan contract explicit) — otherwise first use
+        // would silently end up with images downloaded but no wallpaper
+        // set, and nothing would ever retry. Keeping the flag retries the
+        // apply on the *next scheduled* fetch (no tighter loop: refresh
+        // scheduling is unchanged by an apply failure) — unless a manual
+        // or shuffle apply succeeds first, which spends it too. A retry
+        // *suppressed* because the user picked another wallpaper lands
+        // here with `auto_apply` false and spends the flag: the user's
+        // choice wins permanently, the warm rule governs from then on.
+        if plan.clear_cold_start && !apply_failed {
+            self.cold_start = ColdStart::Done;
         }
 
         let refresh_timer = self.schedule_refresh(plan.delay);
@@ -339,6 +407,47 @@ impl Window {
         let shuffle = self.sync_shuffle(false);
         Task::batch([refresh_timer, shuffle])
     }
+}
+
+/// Shared state transition for every path that successfully applied a
+/// wallpaper (post-fetch auto-apply, manual navigation, shuffle tick):
+/// remember the file as current and spend the cold-start state. Its only
+/// purpose is guaranteeing that a fresh install ends up with *some*
+/// wallpaper applied once; any successful apply through the applet
+/// fulfills that. Leaving it armed after e.g. a failed cold-start
+/// auto-apply followed by a successful manual apply would let a later
+/// refresh's cold-start branch ([`wallpaper::should_auto_apply`]) clobber
+/// a wallpaper the user picked in COSMIC Settings in the meantime.
+fn on_apply_success(current: &mut Option<PathBuf>, cold_start: &mut ColdStart, path: PathBuf) {
+    *current = Some(path);
+    *cold_start = ColdStart::Done;
+}
+
+/// Restore the catalogue at startup and drop entries whose file vanished
+/// while the applet wasn't running (folder cleaned out by the user, moved
+/// drive, …). A catalogue that is valid JSON but points at nothing must
+/// not count as "images exist" — the cold start would stay unarmed
+/// and the popup/actions would trust dead paths until a much later
+/// refresh. Pruning with retention `0` deletes nothing: it only drops
+/// vanished entries — and scrubs tampered entries pointing outside
+/// `images_dir` (their files stay untouched) — reporting them so their
+/// thumbnails go too.
+fn restore_catalogue(path: &Path, images_dir: &Path, state_dir: &Path) -> Catalogue {
+    let mut catalogue = Catalogue::load_or_rebuild(path, images_dir);
+    let removed = catalogue.prune(images_dir, 0, None, Utc::now());
+    if !removed.is_empty() {
+        tracing::info!(
+            "dropped {} catalogue entr{} whose file vanished",
+            removed.len(),
+            if removed.len() == 1 { "y" } else { "ies" }
+        );
+        thumbs::remove_thumbnails(&removed, state_dir);
+        if let Err(error) = catalogue.save(path) {
+            // Non-fatal: the catalogue is rebuildable from the folder scan.
+            tracing::warn!("failed to persist catalogue after startup sweep: {error}");
+        }
+    }
+    catalogue
 }
 
 /// Open `target` with the default handler (`xdg-open`), detached; a
@@ -510,10 +619,17 @@ impl cosmic::Application for Window {
             .unwrap_or_default();
 
         // Restore instantly from disk — no network involved. A corrupt or
-        // missing catalogue rebuilds from the download folder scan.
-        let catalogue = Catalogue::load_or_rebuild(&catalogue_path(), &wallpaper::download_dir());
+        // missing catalogue rebuilds from the download folder scan; entries
+        // whose file vanished while we weren't running are dropped so a
+        // hollow catalogue still counts as a cold start.
+        let catalogue =
+            restore_catalogue(&catalogue_path(), &wallpaper::download_dir(), state_dir());
         let current = wallpaper::current_source();
-        let first_fetch_pending = catalogue.images.is_empty();
+        let cold_start = if catalogue.images.is_empty() {
+            ColdStart::Pending
+        } else {
+            ColdStart::Done
+        };
 
         // Empty catalogue (cold start) → fetch fires ~5 s after startup;
         // otherwise the next refresh derives from the newest fullstartdate.
@@ -530,7 +646,7 @@ impl cosmic::Application for Window {
             catalogue,
             current,
             refresh_pending: false,
-            first_fetch_pending,
+            cold_start,
             timer_generation: 0,
             shuffle_generation: 0,
             shuffle_armed: false,
@@ -581,7 +697,11 @@ impl cosmic::Application for Window {
                 // Our own setter writes echo back here unchanged (no-op);
                 // an *external* edit of the shuffle settings restarts the
                 // countdown against the new values, and an externally
-                // reduced retention prunes immediately.
+                // reduced retention prunes immediately. Watched configs
+                // arrive raw — normalize like `AppletConfig::load` does,
+                // so a hand-edited retention outside the dropdown's
+                // choices never drives prune/fetch.
+                let config = config.normalize();
                 let diff = config_diff(&self.config, &config);
                 self.config = config;
                 let mut tasks = Vec::new();
@@ -604,14 +724,24 @@ impl cosmic::Application for Window {
             Message::RefreshNow => return self.start_refresh(),
             Message::ApplyImage(path) => {
                 // Browsing is setting: prev/next/newest apply immediately.
-                // Manual navigation also resets the shuffle countdown.
+                // Manual navigation also resets the shuffle countdown —
+                // and spends the cold-start flag (any successful apply
+                // fulfills its purpose; see `on_apply_success`).
                 match wallpaper::apply(&path) {
                     Ok(()) => {
-                        self.current = Some(path);
+                        on_apply_success(&mut self.current, &mut self.cold_start, path);
                         return self.sync_shuffle(true);
                     }
                     Err(error) => {
                         tracing::warn!("failed to apply {}: {error}", path.display());
+                        // If the file vanished externally (the common way
+                        // apply refuses), prune right away: the routine
+                        // prune drops entries whose file is gone, so the
+                        // dead image leaves the popup instead of failing
+                        // on every further click until the next fetch.
+                        if !path.is_file() {
+                            return self.prune_immediately();
+                        }
                     }
                 }
             }
@@ -629,9 +759,18 @@ impl cosmic::Application for Window {
                 if let Some(pick) = self.catalogue.random_other(self.current.as_deref()) {
                     let path = pick.filename.clone();
                     match wallpaper::apply(&path) {
-                        Ok(()) => self.current = Some(path),
+                        Ok(()) => on_apply_success(&mut self.current, &mut self.cold_start, path),
                         Err(error) => {
                             tracing::warn!("shuffle failed to apply {}: {error}", path.display());
+                            // A vanished file gets dropped from the
+                            // catalogue right away (see the ApplyImage
+                            // arm); no immediate re-pick — the next tick
+                            // draws from the cleaned catalogue, and the
+                            // trailing sync_shuffle disarms if it shrank
+                            // below two images.
+                            if !path.is_file() {
+                                self.prune_and_persist();
+                            }
                         }
                     }
                 }
@@ -807,6 +946,183 @@ mod tests {
         assert!(!plan.auto_apply);
         assert!(!plan.clear_cold_start);
         assert_eq!(plan.delay, schedule::ERROR_RETRY_DELAY);
+    }
+
+    #[test]
+    fn any_successful_apply_spends_the_cold_start_flag() {
+        // Scenario from review: cold start stays armed after the first
+        // fetch's auto-apply *failed*; the user then navigates (or a
+        // shuffle tick fires) and an apply succeeds. That apply fulfills
+        // the cold-start purpose — the flag must be spent, or the next
+        // refresh's unconditional cold-start branch would clobber a
+        // wallpaper the user picked in COSMIC Settings in between.
+        let mut current = None;
+        let mut cold_start = ColdStart::Pending;
+
+        on_apply_success(
+            &mut current,
+            &mut cold_start,
+            PathBuf::from("/imgs/20260807-Foo_ROW1_UHD.jpg"),
+        );
+
+        assert_eq!(
+            current.as_deref(),
+            Some(Path::new("/imgs/20260807-Foo_ROW1_UHD.jpg"))
+        );
+        assert_eq!(cold_start, ColdStart::Done);
+
+        // With the flag spent, a later refresh over a foreign (user-picked)
+        // wallpaper no longer auto-applies.
+        let user_choice = Path::new("/usr/share/backgrounds/user-choice.jpg");
+        let plan = refresh_success_plan(
+            cold_start.applies_over(Some(user_choice)),
+            Some(user_choice),
+            Some("202608070700"),
+            Utc::now(),
+        );
+        assert!(!plan.auto_apply);
+    }
+
+    #[test]
+    fn cold_start_retry_never_clobbers_a_wallpaper_picked_after_the_failure() {
+        // Iteration-5 scenario: the cold-start auto-apply failed while the
+        // system default was displayed; before the retry the user picks a
+        // different (foreign) wallpaper in COSMIC Settings. The retry must
+        // not fire — the user's choice wins.
+        let default_bg = Path::new("/usr/share/backgrounds/cosmic/default.jpg");
+        let user_choice = Path::new("/usr/share/backgrounds/user-choice.jpg");
+        let retry = ColdStart::RetryOver(Some(default_bg.to_path_buf()));
+
+        // Display unchanged since the failure: the retry still fires (a
+        // fresh install with a transient failure must not end up
+        // wallpaper-less — the iteration-3 retry decision).
+        assert!(retry.applies_over(Some(default_bg)));
+        // The user picked something else meanwhile: the retry yields.
+        assert!(!retry.applies_over(Some(user_choice)));
+        // Nothing knowable displayed (color source / per-output mode):
+        // safe ground, same as the unconditional Pending branch.
+        assert!(retry.applies_over(None));
+
+        // Failure happened over an unknowable display: a foreign file
+        // picked afterwards still wins.
+        let retry_over_none = ColdStart::RetryOver(None);
+        assert!(retry_over_none.applies_over(None));
+        assert!(!retry_over_none.applies_over(Some(user_choice)));
+
+        // The plain states bracket the retry: Pending applies over
+        // anything, Done over nothing.
+        assert!(ColdStart::Pending.applies_over(Some(user_choice)));
+        assert!(!ColdStart::Done.applies_over(None));
+
+        // End to end through the plan: a suppressed retry over the user's
+        // pick neither auto-applies nor blocks the flag from being spent.
+        let plan = refresh_success_plan(
+            retry.applies_over(Some(user_choice)),
+            Some(user_choice),
+            Some("202608070700"),
+            Utc::now(),
+        );
+        assert!(!plan.auto_apply);
+        assert!(plan.clear_cold_start);
+    }
+
+    /// A catalogue entry whose file really exists under `dir`.
+    fn entry_on_disk(dir: &Path, startdate: &str, name: &str) -> ImageEntry {
+        let filename = dir.join(format!("{startdate}-{name}_UHD.jpg"));
+        std::fs::write(&filename, b"jpeg bytes").unwrap();
+        ImageEntry {
+            urlbase: format!("/th?id=OHR.{name}"),
+            startdate: startdate.to_owned(),
+            fullstartdate: format!("{startdate}0700"),
+            title: format!("Title {name}"),
+            copyright: "© Someone".to_owned(),
+            copyrightlink: "https://example.com".to_owned(),
+            filename,
+        }
+    }
+
+    #[test]
+    fn restore_catalogue_drops_entries_whose_files_vanished() {
+        let dir = tempfile::tempdir().unwrap();
+        let images = dir.path().join("images");
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&images).unwrap();
+        let kept = entry_on_disk(&images, "20260807", "Kept_ROW1");
+        let gone = entry_on_disk(&images, "20260101", "Gone_ROW2");
+        let cat_path = state.join(catalogue::CATALOGUE_FILENAME);
+        Catalogue {
+            images: vec![gone.clone(), kept.clone()],
+        }
+        .save(&cat_path)
+        .unwrap();
+        // A cached thumbnail for the file about to vanish must go too.
+        let orphan_thumb = thumbs::thumbnail_path(&gone.filename, &state);
+        std::fs::create_dir_all(orphan_thumb.parent().unwrap()).unwrap();
+        std::fs::write(&orphan_thumb, b"thumb").unwrap();
+        std::fs::remove_file(&gone.filename).unwrap();
+
+        let restored = restore_catalogue(&cat_path, &images, &state);
+
+        // Old-but-vanished entry dropped without deleting anything else —
+        // no age-based pruning happens at startup (retention 0).
+        assert_eq!(restored.images, vec![kept.clone()]);
+        assert!(kept.filename.is_file());
+        assert!(!orphan_thumb.exists());
+        // The sweep is persisted, so a restart doesn't resurrect the entry.
+        assert_eq!(Catalogue::load(&cat_path).unwrap(), restored);
+    }
+
+    #[test]
+    fn restore_catalogue_of_valid_json_pointing_at_nothing_is_empty() {
+        // The cold-start case codex flagged: valid catalogue JSON, every
+        // file gone. Startup must see an *empty* catalogue (so the cold
+        // start arms and no UI action trusts dead paths).
+        let dir = tempfile::tempdir().unwrap();
+        let images = dir.path().join("images");
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&images).unwrap();
+        let gone = entry_on_disk(&images, "20260807", "Gone_ROW1");
+        let cat_path = state.join(catalogue::CATALOGUE_FILENAME);
+        Catalogue {
+            images: vec![gone.clone()],
+        }
+        .save(&cat_path)
+        .unwrap();
+        std::fs::remove_file(&gone.filename).unwrap();
+
+        let restored = restore_catalogue(&cat_path, &images, &state);
+
+        assert!(restored.images.is_empty());
+    }
+
+    #[test]
+    fn restore_catalogue_scrubs_tampered_entries_without_deleting_files() {
+        // A hand-edited catalogue.json pointing at a user file must never
+        // get that file deleted — startup drops the entry and persists
+        // the scrub, leaving the file alone.
+        let dir = tempfile::tempdir().unwrap();
+        let images = dir.path().join("images");
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&images).unwrap();
+        let victim = dir.path().join("important.pdf");
+        std::fs::write(&victim, b"precious").unwrap();
+        let kept = entry_on_disk(&images, "20260807", "Kept_ROW1");
+        let mut hostile = kept.clone();
+        hostile.urlbase = "/th?id=OHR.Evil_ROW2".to_owned();
+        hostile.fullstartdate = "202001010700".to_owned();
+        hostile.filename = victim.clone();
+        let cat_path = state.join(catalogue::CATALOGUE_FILENAME);
+        Catalogue {
+            images: vec![hostile, kept.clone()],
+        }
+        .save(&cat_path)
+        .unwrap();
+
+        let restored = restore_catalogue(&cat_path, &images, &state);
+
+        assert!(victim.is_file(), "tampered entry must not delete the file");
+        assert_eq!(restored.images, vec![kept]);
+        assert_eq!(Catalogue::load(&cat_path).unwrap(), restored);
     }
 
     /// One-image HPImageArchive response for the pipeline tests below.
