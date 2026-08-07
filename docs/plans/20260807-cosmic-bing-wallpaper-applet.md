@@ -323,11 +323,11 @@ struct AppletConfig {
 **Files:**
 - Modify: `src/app.rs` (split out `src/view.rs` if it grows past ~300 lines)
 
-- [ ] popup layout per Technical Details: thumbnail (`cosmic::widget::image` on the **cached 480×270 thumb**), title heading, copyright caption, "About this image" link row, control row (prev/next/newest/refresh icon buttons), dividers, status footer — using COSMIC applet idiom widgets (`padded_control`, `menu_button`, `divider` — exact names per cosmic-applets reference)
-- [ ] wire messages: Prev/Next/Newest → catalogue navigation + `wallpaper::apply` + update current; RefreshNow → trigger pipeline (debounced while pending); thumbnail click → `xdg-open <full image file>`; link → `xdg-open <copyrightlink>`
-- [ ] disabled states: prev/next at history ends, refresh while pending, everything except status when catalogue is empty ("No images yet — fetching…")
-- [ ] write tests for any new pure logic extracted (e.g. relative-time formatting for the footer); view code exempt
-- [ ] run tests - must pass before task 9
+- [x] popup layout per Technical Details: thumbnail (`cosmic::widget::image` on the **cached 480×270 thumb**), title heading, copyright caption, "About this image" link row, control row (prev/next/newest/refresh icon buttons), dividers, status footer — using COSMIC applet idiom widgets (`padded_control`, `menu_button`, `divider` — exact names per cosmic-applets reference) (view split into `src/view.rs`; missing thumbnail — rebuilt entries never fetched — renders an icon placeholder, the UI never decodes the full UHD file; note: `popup_container` caps popup width at 360 px, so the 480×270 thumb scales down to fit)
+- [x] wire messages: Prev/Next/Newest → catalogue navigation + `wallpaper::apply` + update current; RefreshNow → trigger pipeline (debounced while pending); thumbnail click → `xdg-open <full image file>`; link → `xdg-open <copyrightlink>` (one `ApplyImage(PathBuf)` message serves all three nav buttons; `Open(String)` spawns `xdg-open` with a reaper thread — no zombies; shuffle-timer reset on manual nav lands in Task 9 where the timer is born)
+- [x] disabled states: prev/next at history ends, refresh while pending, everything except status when catalogue is empty ("No images yet — fetching…") (via `on_press_maybe`; also: newest disabled when already applied; foreign current wallpaper → popup shows newest, prev enters history at its newest end, next disabled; empty catalogue shows refresh button + status only so an offline start is retriable by hand)
+- [x] write tests for any new pure logic extracted (e.g. relative-time formatting for the footer); view code exempt (`view.rs`: `displayed`/`prev_target`/`next_target`/`newest_target` incl. foreign-wallpaper + empty cases, `display_title` file-stem fallback for rebuilt entries, `format_updated` today/yesterday/older + month boundary)
+- [x] run tests - must pass before task 9 (`cargo test`: 76 passed; clippy clean; fmt clean; binary not smoke-run — cold-start would trigger a real fetch + apply)
 
 ### Task 9: Shuffle
 

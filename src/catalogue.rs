@@ -231,10 +231,13 @@ impl Catalogue {
         self.images.last()
     }
 
+    /// Whether `path` is one of the catalogue's downloaded files.
+    pub fn contains(&self, path: &Path) -> bool {
+        self.position(path).is_some()
+    }
+
     /// The image just older than `current` (the file currently applied);
     /// `None` at the oldest end or when `current` is not in the catalogue.
-    // dead_code: wired to the popup's navigation buttons in Task 8.
-    #[allow(dead_code)]
     pub fn prev(&self, current: &Path) -> Option<&ImageEntry> {
         let i = self.position(current)?;
         self.images.get(i.checked_sub(1)?)
@@ -242,8 +245,6 @@ impl Catalogue {
 
     /// The image just newer than `current`; `None` at the newest end or
     /// when `current` is not in the catalogue.
-    // dead_code: wired to the popup's navigation buttons in Task 8.
-    #[allow(dead_code)]
     pub fn next(&self, current: &Path) -> Option<&ImageEntry> {
         let i = self.position(current)?;
         self.images.get(i + 1)

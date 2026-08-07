@@ -7,6 +7,7 @@ mod catalogue;
 mod config;
 mod schedule;
 mod thumbs;
+mod view;
 mod wallpaper;
 
 fn main() -> cosmic::iced::Result {

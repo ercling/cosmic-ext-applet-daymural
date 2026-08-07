@@ -53,7 +53,7 @@ fn catalogue_path() -> PathBuf {
 
 #[derive(Default)]
 pub struct Window {
-    core: cosmic::app::Core,
+    pub(crate) core: cosmic::app::Core,
     popup: Option<window::Id>,
     /// Applet settings (shuffle, retention). Defaults when the config context
     /// is unavailable.
@@ -63,13 +63,13 @@ pub struct Window {
     /// defaults, changes just don't persist.
     config_context: Option<cosmic_config::Config>,
     /// All downloaded images (restored from disk at startup — no network).
-    catalogue: Catalogue,
+    pub(crate) catalogue: Catalogue,
     /// Our idea of the currently applied wallpaper file. Refreshed from
     /// cosmic-bg's config at startup and around every fetch; not watched
     /// (accepted v1 limitation).
-    current: Option<PathBuf>,
+    pub(crate) current: Option<PathBuf>,
     /// A fetch pipeline is running (debounces refresh triggers).
-    refresh_pending: bool,
+    pub(crate) refresh_pending: bool,
     /// Cold start: the catalogue was empty at startup and no fetch has
     /// succeeded yet — the first successful fetch auto-applies
     /// unconditionally.
@@ -93,6 +93,14 @@ pub enum Message {
     RefreshDue(u64),
     /// The fetch pipeline finished.
     RefreshFinished(Result<Catalogue, String>),
+    /// Apply this downloaded file as the wallpaper (prev/next/newest
+    /// buttons — browsing applies immediately).
+    ApplyImage(PathBuf),
+    /// The popup's refresh button (debounced while a fetch is pending).
+    RefreshNow,
+    /// Open a file or URL with the default handler (`xdg-open`): thumbnail
+    /// click → full image, "About this image" → copyright link.
+    Open(String),
 }
 
 impl Window {
@@ -146,17 +154,16 @@ impl Window {
         })
     }
 
-    /// Status footer text. (Restyled with relative time in Task 8; the
-    /// states themselves are fixed here.)
-    fn status_line(&self) -> String {
+    /// Status footer text.
+    pub(crate) fn status_line(&self) -> String {
         if self.refresh_pending {
             "Checking for new images…".to_owned()
         } else if self.last_error.is_some() {
             "Bing unreachable — retrying in 1 h".to_owned()
         } else if let Some(updated) = self.last_updated {
-            format!(
-                "Updated at {}",
-                updated.with_timezone(&chrono::Local).format("%H:%M")
+            crate::view::format_updated(
+                updated.with_timezone(&chrono::Local).naive_local(),
+                chrono::Local::now().naive_local(),
             )
         } else if self.catalogue.images.is_empty() {
             "No images yet — fetching…".to_owned()
@@ -312,6 +319,30 @@ impl cosmic::Application for Window {
                     return self.start_refresh();
                 }
             }
+            Message::RefreshNow => return self.start_refresh(),
+            Message::ApplyImage(path) => {
+                // Browsing is setting: prev/next/newest apply immediately.
+                // (Manual navigation also resets the shuffle timer — wired
+                // in Task 9 when the timer exists.)
+                match wallpaper::apply(&path) {
+                    Ok(()) => self.current = Some(path),
+                    Err(error) => {
+                        tracing::warn!("failed to apply {}: {error}", path.display());
+                    }
+                }
+            }
+            Message::Open(target) => {
+                // Detached viewer/browser; a thread reaps the child so no
+                // zombie lingers per click.
+                match std::process::Command::new("xdg-open").arg(&target).spawn() {
+                    Ok(mut child) => {
+                        std::thread::spawn(move || {
+                            let _ = child.wait();
+                        });
+                    }
+                    Err(error) => tracing::warn!("xdg-open {target} failed: {error}"),
+                }
+            }
             Message::RefreshFinished(result) => {
                 self.refresh_pending = false;
                 match result {
@@ -376,10 +407,7 @@ impl cosmic::Application for Window {
 
     fn view_window(&self, id: window::Id) -> Element<'_, Self::Message> {
         if matches!(self.popup, Some(popup_id) if popup_id == id) {
-            // Placeholder body until the full popup layout lands in Task 8;
-            // the status footer states are already real.
-            let content = widget::text::body(self.status_line()).center();
-            self.core.applet.popup_container(content).into()
+            crate::view::popup_view(self)
         } else {
             widget::text("").into()
         }
@@ -430,10 +458,11 @@ mod tests {
         window.last_error = Some("boom".to_owned());
         assert_eq!(window.status_line(), "Bing unreachable — retrying in 1 h");
 
-        // Success clears the error and records the time.
+        // Success clears the error and records the time (relative wording
+        // itself is covered by `view::format_updated`'s tests).
         window.last_error = None;
         window.last_updated = Some(Utc::now());
-        assert!(window.status_line().starts_with("Updated at "));
+        assert!(window.status_line().starts_with("Updated today at "));
     }
 
     #[test]
