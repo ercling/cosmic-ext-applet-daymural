@@ -236,6 +236,19 @@ impl Catalogue {
         self.position(path).is_some()
     }
 
+    /// The already-downloaded file for `urlbase`, if some entry holds one
+    /// that still exists on disk. The fetch pipeline consults this before
+    /// downloading: a rebuilt entry may cover the image at a *different*
+    /// resolution suffix (e.g. `_1920x1080` from the reference extension),
+    /// where the mere existence check on the UHD path would miss it and
+    /// re-download ~5 MB the merge then orphans.
+    pub fn existing_file(&self, urlbase: &str) -> Option<PathBuf> {
+        self.images
+            .iter()
+            .find(|e| e.urlbase == urlbase && e.filename.is_file())
+            .map(|e| e.filename.clone())
+    }
+
     /// The image just older than `current` (the file currently applied);
     /// `None` at the oldest end or when `current` is not in the catalogue.
     pub fn prev(&self, current: &Path) -> Option<&ImageEntry> {
@@ -443,6 +456,37 @@ mod tests {
         assert_eq!(e.fullstartdate, "202608070700");
         assert_eq!(e.filename, rebuilt_file);
         assert!(e.filename.is_file());
+    }
+
+    #[test]
+    fn existing_file_finds_rebuilt_files_at_any_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        // Folder written by the reference extension at 1920x1080 — the UHD
+        // path the pipeline would download to does not exist.
+        fs::write(dir.path().join("20260807-Foo_ROW1_1920x1080.jpg"), b"x").unwrap();
+        let cat = Catalogue::rebuild_from_folder(dir.path());
+
+        // The pipeline's pre-download check must find the existing file...
+        assert_eq!(
+            cat.existing_file(&urlbase("Foo_ROW1")),
+            Some(dir.path().join("20260807-Foo_ROW1_1920x1080.jpg"))
+        );
+        // ...and report nothing for images not on disk.
+        assert_eq!(cat.existing_file(&urlbase("Other_ROW2")), None);
+    }
+
+    #[test]
+    fn existing_file_ignores_entries_whose_file_vanished() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = entry_with_file(dir.path(), "20260807", "Foo_ROW1");
+        let cat = Catalogue {
+            images: vec![entry.clone()],
+        };
+        fs::remove_file(&entry.filename).unwrap();
+
+        // Vanished file → the pipeline should re-download, not trust the
+        // stale catalogue path.
+        assert_eq!(cat.existing_file(&urlbase("Foo_ROW1")), None);
     }
 
     #[test]

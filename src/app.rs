@@ -280,9 +280,15 @@ async fn run_refresh(
 
     let mut fetched = Vec::with_capacity(archive.images.len());
     for image in &archive.images {
-        let path = bing::download_image(&client, image, &download_dir)
-            .await
-            .map_err(|e| e.to_string())?;
+        // A rebuilt entry may already hold this image at a different
+        // resolution suffix — that file stays authoritative (no
+        // re-download); the merge below refills its metadata.
+        let path = match catalogue.existing_file(&image.urlbase) {
+            Some(existing) => existing,
+            None => bing::download_image(&client, image, &download_dir)
+                .await
+                .map_err(|e| e.to_string())?,
+        };
         // A failed thumbnail is not fatal: `ensure_thumbnail` regenerates
         // missing thumbs on the next refresh.
         if let Err(error) = thumbs::ensure_thumbnail(&path, &state) {

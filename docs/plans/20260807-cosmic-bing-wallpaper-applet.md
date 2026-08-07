@@ -364,11 +364,11 @@ struct AppletConfig {
 
 ### Task 12: Verify acceptance criteria
 
-- [ ] verify all Overview requirements implemented: daily fetch + auto-apply, prev/next/newest/refresh, shuffle with 4 intervals, retention 4 values, popup layout matches Technical Details, status footer shows success + error states
-- [ ] verify edge cases: cold start with empty folder fetches within seconds, corrupt catalogue rebuild (incl. non-UHD files) with no duplicate downloads afterwards, offline at startup (popup still works from catalogue), retention protects current image, non-Bing current wallpaper is not clobbered by a background refresh, per-output cosmic-bg config collapses to same-on-all on first apply (by design)
-- [ ] run full test suite: `cargo test`
-- [ ] `cargo clippy` — no warnings; `cargo fmt --check`
-- [ ] verify test coverage: every pure module (bing, thumbs, catalogue, config, wallpaper helpers, schedule) has success + error case tests
+- [x] verify all Overview requirements implemented: daily fetch + auto-apply, prev/next/newest/refresh, shuffle with 4 intervals, retention 4 values, popup layout matches Technical Details, status footer shows success + error states (all cross-checked against `app.rs`/`view.rs`/`schedule.rs`: intervals [1800, 3600, 21600, 86400], retention [3, 8, 30, 0], popup order thumbnail → header/caption → About link → controls → divider → shuffle rows → divider → retention row → footer; footer states "Updated today at HH:MM" / "Bing unreachable — retrying in 1 h" plus checking/empty/restored variants; live panel behavior itself is a Post-Completion manual check)
+- [x] verify edge cases: cold start with empty folder fetches within seconds, corrupt catalogue rebuild (incl. non-UHD files) with no duplicate downloads afterwards, offline at startup (popup still works from catalogue), retention protects current image, non-Bing current wallpaper is not clobbered by a background refresh, per-output cosmic-bg config collapses to same-on-all on first apply (by design) (⚠️ found + fixed a real gap: `run_refresh` only skipped downloads when the *UHD-named* file existed, so a catalogue rebuilt from non-UHD files (reference-extension folder) re-downloaded ~5 MB per image and orphaned it — added `Catalogue::existing_file(urlbase)` consulted before `download_image`, with tests (`existing_file_finds_rebuilt_files_at_any_resolution`, `existing_file_ignores_entries_whose_file_vanished`); every other edge case verified in code + covered by existing tests; live-session cases (real fetch, live apply, multi-monitor collapse) deferred to Post-Completion manual verification)
+- [x] run full test suite: `cargo test` (86 passed, 0 failed)
+- [x] `cargo clippy` — no warnings; `cargo fmt --check` (both clean, `--all-targets`)
+- [x] verify test coverage: every pure module (bing, thumbs, catalogue, config, wallpaper helpers, schedule) has success + error case tests (bing: fixture parse + malformed JSON/no-parens/reject paths; thumbs: generate/skip/stale + missing-source error; catalogue: roundtrip/merge/prune/nav + missing/corrupt load errors; config: roundtrip + corrupt-key fallback; wallpaper: updated_entry variants + is_ours rejections; schedule: refresh math + malformed-date backoff)
 
 ### Task 13: [Final] Update documentation
 
