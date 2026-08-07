@@ -1,0 +1,10 @@
+<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <g id="applet-bing-wallpaper">
+    <!-- Picture frame (rounded rect outline, evenodd cut-out) -->
+    <path fill-rule="evenodd" clip-rule="evenodd" d="M2.5 2.5H13.5C14.3284 2.5 15 3.17157 15 4V12C15 12.8284 14.3284 13.5 13.5 13.5H2.5C1.67157 13.5 1 12.8284 1 12V4C1 3.17157 1.67157 2.5 2.5 2.5ZM2.5 4V12H13.5V4H2.5Z" fill="#232323"/>
+    <!-- Sun -->
+    <circle cx="5.25" cy="6.25" r="1.25" fill="#232323"/>
+    <!-- Mountains -->
+    <path d="M3.75 11L7 6.9L9.1 9.4L10.6 7.7L12.4 11H3.75Z" fill="#232323"/>
+  </g>
+</svg>

@@ -1,0 +1,15 @@
+[Desktop Entry]
+Name=Bing Wallpaper
+Comment=Bing's image of the day as your COSMIC wallpaper
+Type=Application
+# Rewritten to the absolute install path by `just install` — cosmic-panel's
+# environment may not have the install bindir (e.g. ~/.local/bin) in PATH.
+Exec=/usr/bin/cosmic-bing-wallpaper
+Terminal=false
+Categories=COSMIC;
+Keywords=COSMIC;Applet;Bing;Wallpaper;Background;Image;
+Icon=io.github.ercling.CosmicBingWallpaper-symbolic
+StartupNotify=true
+NoDisplay=true
+X-CosmicApplet=true
+X-OverflowPriority=10

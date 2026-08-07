@@ -356,11 +356,11 @@ struct AppletConfig {
 **Files:**
 - Create: `data/io.github.ercling.CosmicBingWallpaper.desktop`, `data/icons/*.svg`, `justfile`, `README.md` (stub)
 
-- [ ] `.desktop` file modeled on a shipped applet (`/usr/share/applications/com.system76.CosmicAppletBattery.desktop`): `X-CosmicApplet=true`, `NoDisplay=true`, `Categories=COSMIC;`, `StartupNotify=true`, `Terminal=false`, `X-CosmicShrinkable`/`X-OverflowPriority` as appropriate, `Icon=io.github.ercling.CosmicBingWallpaper-symbolic`, `Exec=` as an **absolute path** (cosmic-panel's environment may not have `~/.local/bin` in PATH)
-- [ ] simple symbolic SVG icon (template style so it follows panel theming)
-- [ ] `justfile`: `build`, `install` (binary, desktop file, icon into proper hicolor/applications dirs), `uninstall`
-- [ ] tests: `cargo test` still green (no new logic; packaging only)
-- [ ] run tests - must pass before task 12
+- [x] `.desktop` file modeled on a shipped applet (`/usr/share/applications/com.system76.CosmicAppletBattery.desktop`): `X-CosmicApplet=true`, `NoDisplay=true`, `Categories=COSMIC;`, `StartupNotify=true`, `Terminal=false`, `X-CosmicShrinkable`/`X-OverflowPriority` as appropriate, `Icon=io.github.ercling.CosmicBingWallpaper-symbolic`, `Exec=` as an **absolute path** (cosmic-panel's environment may not have `~/.local/bin` in PATH) (`data/io.github.ercling.CosmicBingWallpaper.desktop`; passes `desktop-file-validate` (only the same `Categories=COSMIC;` hint the shipped applets get); `X-OverflowPriority=10` like battery, `X-CosmicShrinkable` omitted — fixed icon button; Exec is checked in with a placeholder absolute path and rewritten to the real install path by `just install`, since a static file can't know the prefix)
+- [x] simple symbolic SVG icon (template style so it follows panel theming) (`data/icons/io.github.ercling.CosmicBingWallpaper-symbolic.svg`: 16×16 picture-frame + sun + mountains, `fill="#232323"` paths exactly like the shipped `-symbolic` applet icons so the panel recolors it; xmllint-valid, raster-previewed; the in-app panel button keeps the stock `preferences-desktop-wallpaper-symbolic` so the binary renders correctly even when run uninstalled)
+- [x] `justfile`: `build`, `install` (binary, desktop file, icon into proper hicolor/applications dirs), `uninstall` (default prefix `~/.local` — no sudo needed, overridable via `just prefix=… rootdir=…`; exports the system `PKG_CONFIG_PATH` dirs so builds work despite linuxbrew's pkg-config; bonus `check` recipe = fmt+clippy+test; `install` sed-rewrites `Exec=` to the absolute bin path; dry-run + `--evaluate` verified, `just build` release build verified — `just install` itself deliberately not run, Post-Completion manual step)
+- [x] tests: `cargo test` still green (no new logic; packaging only) (84 passed)
+- [x] run tests - must pass before task 12 (`cargo test`: 84 passed; clippy clean; fmt clean)
 
 ### Task 12: Verify acceptance criteria
 
