@@ -4,6 +4,10 @@ mod app;
 mod bing;
 #[allow(dead_code)]
 mod catalogue;
+// dead_code: the derive-generated per-field setters are called from the
+// shuffle/retention UI (Tasks 9-10).
+#[allow(dead_code)]
+mod config;
 #[allow(dead_code)]
 mod thumbs;
 

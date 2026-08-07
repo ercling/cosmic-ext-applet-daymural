@@ -289,10 +289,10 @@ struct AppletConfig {
 - Create: `src/config.rs`
 - Modify: `src/app.rs`
 
-- [ ] `AppletConfig` (shuffle_enabled, shuffle_interval_secs, retention_days) with `CosmicConfigEntry` derive under app ID `io.github.ercling.CosmicBingWallpaper`, version 1, with defaults (false / 86400 / 8)
-- [ ] load at startup + write-on-change wiring in `app.rs`; missing/invalid config → defaults, never crash
-- [ ] write tests: default values; field roundtrip — either plain-serde level, or through cosmic-config with `XDG_CONFIG_HOME` pointed at a `TempDir` (must not read/write the real user config)
-- [ ] run tests - must pass before task 6
+- [x] `AppletConfig` (shuffle_enabled, shuffle_interval_secs, retention_days) with `CosmicConfigEntry` derive under app ID `io.github.ercling.CosmicBingWallpaper`, version 1, with defaults (false / 86400 / 8) (`src/config.rs`; derive also generates per-field `set_<field>` write-on-change setters)
+- [x] load at startup + write-on-change wiring in `app.rs`; missing/invalid config → defaults, never crash (`init` loads via `AppletConfig::context()`+`load` with default fallback; `watch_config` subscription → `Message::ConfigUpdated` keeps in-memory state in sync; `Window::set_config` persists only on change)
+- [x] write tests: default values; field roundtrip — either plain-serde level, or through cosmic-config with `XDG_CONFIG_HOME` pointed at a `TempDir` (must not read/write the real user config) (used `Config::with_custom_path` rooted in a `TempDir` — fully isolated without touching process env; also: empty-config → defaults, corrupt key falls back per-field, setter write-on-change)
+- [x] run tests - must pass before task 6 (`cargo test`: 47 passed; clippy clean; fmt clean; binary smoke-ran 5 s)
 
 ### Task 6: Wallpaper writer (cosmic-bg config)
 
