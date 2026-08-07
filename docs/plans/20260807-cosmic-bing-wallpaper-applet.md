@@ -264,11 +264,11 @@ struct AppletConfig {
 - Modify: `src/bing.rs`
 - Create: `src/thumbs.rs`
 
-- [ ] async `fetch_image_list(n)` using reqwest with a custom User-Agent; maps HTTP/parse failures into one error enum
-- [ ] async `download_image(entry, dir)` → writes to `~/Pictures/BingWallpaper/<filename>` (path via Task 2 builder); creates dir if missing; skips if file already exists; downloads to `.part` then renames (no torn files)
-- [ ] `thumbs.rs`: `thumbnail_path(image_path, state_dir)` + `ensure_thumbnail(...)` — decode via `image` crate, resize to 480×270, cache in state dir; regenerate if missing/stale; never let the UI decode the full 5 MB UHD file
-- [ ] write tests: skip-if-exists decision, `.part` → final rename behavior (tempfile), error enum display, `thumbnail_path` computation, `ensure_thumbnail` regenerates when missing (tiny in-test generated image, not a real UHD asset). Do not re-test Task 2's path builders.
-- [ ] run tests - must pass before task 4
+- [x] async `fetch_image_list(n)` using reqwest with a custom User-Agent; maps HTTP/parse failures into one error enum (`FetchError { Http, Status, Parse, Io }` with Display/Error/source; `http_client()` sets the UA + timeouts, fetch takes `&Client` for reuse)
+- [x] async `download_image(entry, dir)` → writes to `~/Pictures/BingWallpaper/<filename>` (path via Task 2 builder); creates dir if missing; skips if file already exists; downloads to `.part` then renames (no torn files) (dir passed by caller — hardcoded `~/Pictures/BingWallpaper` wiring lands with the Task 7 pipeline)
+- [x] `thumbs.rs`: `thumbnail_path(image_path, state_dir)` + `ensure_thumbnail(...)` — decode via `image` crate, resize to 480×270, cache in state dir; regenerate if missing/stale; never let the UI decode the full 5 MB UHD file (thumbs cached at `<state_dir>/thumbs/<same filename>`; stale = thumb mtime older than source; atomic `.part` write)
+- [x] write tests: skip-if-exists decision, `.part` → final rename behavior (tempfile), error enum display, `thumbnail_path` computation, `ensure_thumbnail` regenerates when missing (tiny in-test generated image, not a real UHD asset). Do not re-test Task 2's path builders. (also: fresh-thumb skip via sentinel content, stale-mtime regeneration, missing-source error, `api_url` shape)
+- [x] run tests - must pass before task 4 (`cargo test`: 24 passed; clippy clean; fmt clean)
 
 ### Task 4: Catalogue — persistence, merge, prune, rebuild
 

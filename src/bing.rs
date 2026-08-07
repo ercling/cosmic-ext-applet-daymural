@@ -5,10 +5,18 @@
 // (`utils.js` getImageTitle/toFilename, `extension.js:908-910` for the
 // full-width-paren copyright handling that `utils.js:207` misses).
 
+use std::fmt;
+use std::io;
+use std::path::{Path, PathBuf};
+
 use serde::Deserialize;
 
 /// Base URL images are fetched from (`https://www.bing.com<urlbase>_<res>.jpg`).
 pub const BING_BASE_URL: &str = "https://www.bing.com";
+
+/// User-Agent sent with every request (Bing serves generic UAs fine; this
+/// just identifies us honestly).
+pub const USER_AGENT: &str = concat!("cosmic-bing-wallpaper/", env!("CARGO_PKG_VERSION"));
 
 /// Prefix every Bing `urlbase` carries; stripped for filenames and
 /// re-added when rebuilding a catalogue from a folder scan.
@@ -41,6 +49,132 @@ pub struct BingImage {
 /// error, never a panic.
 pub fn parse_image_list(json: &str) -> Result<ImageArchive, serde_json::Error> {
     serde_json::from_str(json)
+}
+
+/// Everything that can go wrong talking to Bing: transport failures,
+/// non-2xx responses, unparseable bodies, and local filesystem errors
+/// while persisting a download.
+#[derive(Debug)]
+pub enum FetchError {
+    /// reqwest-level failure (DNS, TLS, timeout, invalid URL, …).
+    Http(reqwest::Error),
+    /// The server answered, but not with a success status.
+    Status(reqwest::StatusCode),
+    /// The body was not valid HPImageArchive JSON.
+    Parse(serde_json::Error),
+    /// Local I/O failure writing the downloaded file.
+    Io(io::Error),
+}
+
+impl fmt::Display for FetchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Http(e) => write!(f, "HTTP request failed: {e}"),
+            Self::Status(s) => write!(f, "Bing returned HTTP {s}"),
+            Self::Parse(e) => write!(f, "failed to parse Bing response: {e}"),
+            Self::Io(e) => write!(f, "I/O error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for FetchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Http(e) => Some(e),
+            Self::Status(_) => None,
+            Self::Parse(e) => Some(e),
+            Self::Io(e) => Some(e),
+        }
+    }
+}
+
+impl From<io::Error> for FetchError {
+    fn from(e: io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+/// HPImageArchive endpoint URL for the latest `n` images. Empty `mkt`
+/// means "auto" — must stay in sync with the checked-in fixture's URL.
+pub fn api_url(n: u8) -> String {
+    format!("{BING_BASE_URL}/HPImageArchive.aspx?format=js&idx=0&n={n}&mbl=1&mkt=")
+}
+
+/// Shared HTTP client with our User-Agent and sane timeouts. Build once
+/// and reuse (connection pooling).
+pub fn http_client() -> Result<reqwest::Client, FetchError> {
+    reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(FetchError::Http)
+}
+
+/// Fetch and parse the image-of-the-day list for the latest `n` images.
+pub async fn fetch_image_list(client: &reqwest::Client, n: u8) -> Result<ImageArchive, FetchError> {
+    let resp = client
+        .get(api_url(n))
+        .send()
+        .await
+        .map_err(FetchError::Http)?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(FetchError::Status(status));
+    }
+    let body = resp.text().await.map_err(FetchError::Http)?;
+    parse_image_list(&body).map_err(FetchError::Parse)
+}
+
+/// Where `image` lands on disk inside the download dir
+/// (`<dir>/<startdate>-<name>_UHD.jpg`).
+pub fn download_path(dir: &Path, image: &BingImage) -> PathBuf {
+    dir.join(image_filename(&image.startdate, &image.urlbase))
+}
+
+/// Download `image` at UHD into `dir` (created if missing). Skips the
+/// network entirely when the file already exists; otherwise writes to a
+/// `.part` sibling and renames, so a crashed download never leaves a
+/// torn file behind at the final path. Returns the final path.
+pub async fn download_image(
+    client: &reqwest::Client,
+    image: &BingImage,
+    dir: &Path,
+) -> Result<PathBuf, FetchError> {
+    let dest = download_path(dir, image);
+    if dest.exists() {
+        return Ok(dest);
+    }
+    std::fs::create_dir_all(dir)?;
+
+    let resp = client
+        .get(image_url(&image.urlbase))
+        .send()
+        .await
+        .map_err(FetchError::Http)?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(FetchError::Status(status));
+    }
+    let bytes = resp.bytes().await.map_err(FetchError::Http)?;
+    write_atomic(&dest, &bytes)?;
+    Ok(dest)
+}
+
+/// `<dest>.part` — the temporary path a download is written to before
+/// the atomic rename.
+fn part_path(dest: &Path) -> PathBuf {
+    let mut os = dest.as_os_str().to_owned();
+    os.push(".part");
+    PathBuf::from(os)
+}
+
+/// Write `bytes` to `<dest>.part`, then rename over `dest` (atomic on
+/// the same filesystem — no torn files).
+fn write_atomic(dest: &Path, bytes: &[u8]) -> io::Result<()> {
+    let part = part_path(dest);
+    std::fs::write(&part, bytes)?;
+    std::fs::rename(&part, dest)
 }
 
 /// Split Bing's `copyright` string into (display title, copyright notice).
@@ -288,6 +422,104 @@ mod tests {
         assert_eq!(parse_filename("20240101-_UHD.jpg"), None); // empty name
         assert_eq!(parse_filename("20240101-Foo_.jpg"), None); // empty resolution
         assert_eq!(parse_filename("短い-Foo_UHD.jpg"), None); // non-ASCII where digits belong
+    }
+
+    #[test]
+    fn api_url_matches_reference_query() {
+        assert_eq!(
+            api_url(8),
+            "https://www.bing.com/HPImageArchive.aspx?format=js&idx=0&n=8&mbl=1&mkt="
+        );
+        assert_eq!(
+            api_url(3),
+            "https://www.bing.com/HPImageArchive.aspx?format=js&idx=0&n=3&mbl=1&mkt="
+        );
+    }
+
+    fn fixture_image() -> BingImage {
+        parse_image_list(FIXTURE).unwrap().images[0].clone()
+    }
+
+    #[tokio::test]
+    async fn download_image_skips_when_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = fixture_image();
+        let dest = download_path(dir.path(), &image);
+        std::fs::write(&dest, b"pre-existing bytes").unwrap();
+
+        // No mock server: if the skip check failed, this would hit the real
+        // network and (with the sentinel content check below) fail the test.
+        let client = http_client().unwrap();
+        let got = download_image(&client, &image, dir.path()).await.unwrap();
+
+        assert_eq!(got, dest);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"pre-existing bytes");
+    }
+
+    #[test]
+    fn write_atomic_renames_part_to_final() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("20260807-Foo_UHD.jpg");
+
+        write_atomic(&dest, b"jpeg bytes").unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"jpeg bytes");
+        assert!(!part_path(&dest).exists(), ".part must not survive");
+        // Only the final file remains in the dir.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn write_atomic_replaces_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("f.jpg");
+        std::fs::write(&dest, b"old").unwrap();
+        write_atomic(&dest, b"new").unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+    }
+
+    #[test]
+    fn part_path_appends_suffix() {
+        assert_eq!(
+            part_path(Path::new("/x/20260807-Foo_UHD.jpg")),
+            Path::new("/x/20260807-Foo_UHD.jpg.part")
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_error_display_covers_all_variants() {
+        use std::error::Error as _;
+
+        let status = FetchError::Status(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            status.to_string(),
+            "Bing returned HTTP 500 Internal Server Error"
+        );
+        assert!(status.source().is_none());
+
+        let parse = FetchError::Parse(parse_image_list("not json").unwrap_err());
+        assert!(
+            parse
+                .to_string()
+                .starts_with("failed to parse Bing response:")
+        );
+        assert!(parse.source().is_some());
+
+        let io_err: FetchError = io::Error::new(io::ErrorKind::PermissionDenied, "denied").into();
+        assert_eq!(io_err.to_string(), "I/O error: denied");
+        assert!(io_err.source().is_some());
+
+        // Invalid URL yields a reqwest builder error without touching the network.
+        let http = FetchError::Http(
+            http_client()
+                .unwrap()
+                .get("not a url")
+                .send()
+                .await
+                .unwrap_err(),
+        );
+        assert!(http.to_string().starts_with("HTTP request failed:"));
+        assert!(http.source().is_some());
     }
 
     #[test]
