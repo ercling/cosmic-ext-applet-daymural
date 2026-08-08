@@ -1,3 +1,4 @@
+mod accent;
 mod app;
 mod bing;
 mod catalogue;
@@ -8,6 +9,7 @@ mod schedule;
 #[cfg(test)]
 mod testutil;
 mod thumbs;
+mod tooltip;
 mod view;
 mod wallpaper;
 

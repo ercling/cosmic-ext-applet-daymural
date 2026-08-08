@@ -282,19 +282,19 @@ Types live in `src/accent.rs`; all colours are `[u8; 3]` (keeps `Eq` on
 - Create: `src/accent.rs`
 - Modify: `src/main.rs` (register module)
 
-- [ ] create `src/accent.rs` with `dominant_hue(img: &RgbImage) -> Option<f32>`:
+- [x] create `src/accent.rs` with `dominant_hue(img: &RgbImage) -> Option<f32>`:
       Oklch conversion via re-exported `palette` crate, chroma-weighted
       36-bucket hue histogram, L-based dark/light pixel mask, circular mean
       over peak bucket ±1
-- [ ] grey cutoff on **mean chroma of unmasked pixels** (all-masked → `None`)
-- [ ] write tests on `RgbImage::from_fn` synthetic images: solid vibrant colour
+- [x] grey cutoff on **mean chroma of unmasked pixels** (all-masked → `None`)
+- [x] write tests on `RgbImage::from_fn` synthetic images: solid vibrant colour
       → its hue (±5°), vibrant object on grey ground → object hue
       (dominant-*vibrant*, not dominant-pixel), grey/near-grey image → `None`
-- [ ] write tests for edge cases: 1×1 image, pure black/white image (mask must
+- [x] write tests for edge cases: 1×1 image, pure black/white image (mask must
       not panic or divide by zero), hue wrap-around at 0°/360° — same grey
       threshold must behave identically for tiny and thumbnail-sized images
       (normalised cutoff)
-- [ ] run `just check` - must pass before task 2
+- [x] run `just check` - must pass before task 2
 
 ### Task 2: Tone band, transplant, gamut mapping, WCAG guard
 
