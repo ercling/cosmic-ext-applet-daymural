@@ -453,10 +453,50 @@ source, so without this the English label copy would be unguarded.
 - Create: `i18n/<locale>/cosmic_bing_wallpaper.ftl` × 72 (every locale from the Context list except `en`, which exists)
 - Modify: `src/localize.rs` (guard test lives in its `#[cfg(test)] mod tests` — the crate has **no lib target**, so a `tests/` integration test cannot reach `localize`)
 
-- [ ] generate machine translations of `i18n/en/cosmic_bing_wallpaper.ftl` for all 72 remaining locales (careful with Fluent syntax: selectors, `$time`/`$date` placeables preserved verbatim; RTL scripts ar/fa/he plain text)
-- [ ] write the locale guard test in `src/localize.rs`: (1) assert exactly 73 embedded locale dirs, each parsing as a `LanguageIdentifier`; (2) for every locale, load it and assert each message id present in `en` resolves without error; (3) per message id, compare the *set of `$variable` references* against `en` (simple `$ident` scan over the embedded FTL bytes is enough) — a dropped/renamed placeable resolves "successfully" but renders a broken string, the most common machine-translation failure
-- [ ] run the guard + `just check` — must pass before task 7
-- [ ] spot-check 2–3 locales you can read (e.g. uk, de) and fix obvious howlers
+- [x] generate machine translations of `i18n/en/cosmic_bing_wallpaper.ftl` for all 72 remaining locales (careful with Fluent syntax: selectors, `$time`/`$date` placeables preserved verbatim; RTL scripts ar/fa/he plain text)
+- [x] write the locale guard test in `src/localize.rs`: (1) assert exactly 73 embedded locale dirs, each parsing as a `LanguageIdentifier`; (2) for every locale, load it and assert each message id present in `en` resolves without error; (3) per message id, compare the *set of `$variable` references* against `en` (simple `$ident` scan over the embedded FTL bytes is enough) — a dropped/renamed placeable resolves "successfully" but renders a broken string, the most common machine-translation failure
+- [x] run the guard + `just check` — must pass before task 7 (139 tests pass, fmt + clippy clean; also green under `LANG=LC_ALL=uk_UA.UTF-8`)
+- [x] spot-check 2–3 locales you can read (e.g. uk, de) and fix obvious howlers — spot-checked uk, ru, be, de, fr, es(+es-419/es-MX), it, pl; fixes below
+
+➕ **Notes (2026-08-08)**
+
+- All 73 locale dirs now exist, each with the full 27-id inventory (the Task-5
+  note's "22 ids" undercounted — the `en` catalogue has always had 27).
+  Placeables (`{ $time }`, `{ $date }`) are byte-identical to `en` everywhere.
+- The guard is three tests in `src/localize.rs`:
+  `every_cosmic_locale_ships_a_catalogue` (73 dirs, each a valid
+  `LanguageIdentifier`, each file named for the fluent domain),
+  `every_locale_defines_and_renders_every_english_message`, and
+  `every_locale_preserves_the_english_placeables`.
+
+[decision] Message-id presence is checked with `with_message_iter(&locale, ..)`
+against a **per-locale loader**, not `has()`. `has()` answers from any loaded
+bundle including the `en` fallback, so it can never see a missing key; and
+`load_languages` does **not** return an error for malformed FTL — fluent logs
+the parse error and keeps a partial resource (`i18n-embed-0.16.0`
+`src/fluent.rs:566-574`). Since an unparsable entry is simply dropped from that
+partial resource, comparing the locale's *parsed* id set against `en`'s ids
+catches missing keys and broken syntax with the same assertion.
+
+[decision] Placeable comparison scans the raw embedded FTL text (per the plan)
+rather than pulling in `fluent-syntax` as a direct dependency; the catalogues
+are flat `id = value` lines and the scanner handles indented continuations and
+skips comments.
+
+Mutation-checked — each of the four failure modes fails exactly one guard and
+no other: renamed placeable (`$date` → `$datum`) → placeables test; deleted
+message → ids test; unbalanced `{` → ids test (the entry becomes junk);
+unexpected extra locale dir → dir-count test.
+
+[deviation] Spot-check fixes go slightly beyond "howlers": in the 10 locales
+above, `shuffle-every` became a neutral noun ("Інтервал", "Intervall",
+"Fréquence", "Frecuencia", "Frequenza", "Częstotliwość", …) because the English
+frame "Every" + "1 hour" is ungrammatical in inflecting languages ("Кожні 1
+година", "Alle 1 Stunde"), and a noun label reads correctly before *every*
+dropdown value. `retention-forever` was likewise softened where a bare adverb
+after "Keep images" read wrong (uk/ru/be/fr). The other 62 locales keep the
+literal frame — they are machine-generated and flagged as such for
+native-speaker review (README, Task 9).
 
 ### Task 7: Theme conformance with first-party applets
 
