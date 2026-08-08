@@ -273,55 +273,13 @@ mod tests {
         assert_eq!(loaded.retention_days, 30);
     }
 
-    #[test]
-    fn accent_setters_write_only_on_change() {
-        let dir = tempfile::tempdir().unwrap();
-        let ctx = test_context(&dir);
-
-        let mut config = AppletConfig::default();
-        config.write_entry(&ctx).expect("write entry");
-
-        // accent_enabled: change → written, same value → no-op.
-        assert!(config.set_accent_enabled(&ctx, true).expect("setter write"));
-        assert!(!config.set_accent_enabled(&ctx, true).expect("setter no-op"));
-
-        // accent_snapshot: change → written, same value → no-op.
-        let snapshot = Some(AccentSnapshot {
-            light: None,
-            dark: Some([9, 9, 9]),
-        });
-        assert!(
-            config
-                .set_accent_snapshot(&ctx, snapshot)
-                .expect("setter write")
-        );
-        assert!(
-            !config
-                .set_accent_snapshot(&ctx, snapshot)
-                .expect("setter no-op")
-        );
-
-        // accent_last_written: change → written, same value → no-op.
-        let pair = Some(AccentPair {
-            light: [1, 2, 3],
-            dark: [4, 5, 6],
-        });
-        assert!(
-            config
-                .set_accent_last_written(&ctx, pair)
-                .expect("setter write")
-        );
-        assert!(
-            !config
-                .set_accent_last_written(&ctx, pair)
-                .expect("setter no-op")
-        );
-
-        let reloaded = AppletConfig::load(&ctx);
-        assert!(reloaded.accent_enabled);
-        assert_eq!(reloaded.accent_snapshot, snapshot);
-        assert_eq!(reloaded.accent_last_written, pair);
-    }
+    // No per-setter tests for the generated accent setters: production
+    // persists whole entries via `write_entry` (`Window::set_config`), and
+    // the accent fields' round-trip is covered by
+    // `write_then_load_roundtrips_non_default_values` /
+    // `pre_accent_v1_entry_still_loads`; the derive's write-on-change
+    // mechanics are already exercised once by
+    // `generated_setter_writes_only_on_change`.
 
     #[test]
     fn normalize_leaves_accent_fields_alone() {

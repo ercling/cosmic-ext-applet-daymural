@@ -107,6 +107,11 @@ Bing's UHD images are roughly **5 MB each**. Expect about:
   the instant you change the wallpaper in COSMIC Settings. Between those reads
   its idea of "current" can be stale, but it still correctly refrains from
   clobbering your choice on background refreshes.
+- **Accent changes in COSMIC Settings are noticed at the next recompute, not
+  instantly.** With *Match accent to wallpaper* on, picking an accent yourself
+  turns the toggle off — but only when the applet next derives an accent: on
+  the next wallpaper apply (browse, shuffle, refresh) or at applet startup.
+  Until then your pick simply stands; nothing overwrites it in between.
 - **Per-output backgrounds collapse to same-on-all.** Applying a wallpaper sets
   `same-on-all = true` and writes the shared `all` entry — a per-display
   background setup is intentionally replaced on first apply.

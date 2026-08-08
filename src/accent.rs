@@ -380,12 +380,35 @@ impl ThemeHandles {
                 partial
             }
         };
-        builder.palette =
-            ConfigGet::get::<CosmicPalette>(cfg, "palette").unwrap_or_else(|_| match mode {
+        builder.palette = ConfigGet::get::<CosmicPalette>(cfg, "palette").unwrap_or_else(|error| {
+            // An absent key is the normal state (nothing pins the palette
+            // user-locally) and must stay silent; anything else — an
+            // unreadable file, corrupt RON — deserves the same trace as
+            // the `get_entry` errors above.
+            if palette_key_present(&error) {
+                tracing::warn!(
+                    ?mode,
+                    "invalid theme-builder palette (using default): {error}"
+                );
+            }
+            match mode {
                 Mode::Light => ThemeBuilder::light().palette,
                 Mode::Dark => ThemeBuilder::dark().palette,
-            });
+            }
+        });
         builder
+    }
+}
+
+/// Whether the failed `palette` probe found *something* on disk (as opposed
+/// to the key simply not existing anywhere). `NoConfigDirectory`/`NotFound`
+/// are the sandboxed/user-local absent cases; a `GetKey` wrapping io
+/// `NotFound` is the system-default lookup missing the file.
+fn palette_key_present(error: &cosmic_config::Error) -> bool {
+    match error {
+        cosmic_config::Error::NoConfigDirectory | cosmic_config::Error::NotFound => false,
+        cosmic_config::Error::GetKey(_, io) => io.kind() != std::io::ErrorKind::NotFound,
+        _ => true,
     }
 }
 
@@ -394,26 +417,79 @@ impl ThemeHandles {
 /// default (builder `accent` key unset).
 pub type BuilderAccents = (Option<[u8; 3]>, Option<[u8; 3]>);
 
-/// Each builder's current accent override, quantised into the 8-bit space the
-/// don't-clobber comparison happens in. `None` = palette default (key unset).
-pub fn read_current_accents(handles: &ThemeHandles) -> BuilderAccents {
+/// Both builders, freshly read `(light, dark)` — one read serving both the
+/// palettes (tone bands) and the current accents of a recompute, and reused
+/// by [`write_accents`] so the write does not parse the same files again.
+pub fn read_builders(handles: &ThemeHandles) -> (ThemeBuilder, ThemeBuilder) {
     (
-        handles.read_builder(Mode::Light).accent.map(quantize),
-        handles.read_builder(Mode::Dark).accent.map(quantize),
+        handles.read_builder(Mode::Light),
+        handles.read_builder(Mode::Dark),
     )
 }
 
-/// Write the computed accents to both modes. Failure leaves whatever half
-/// completed on disk consistent per mode (builder and theme are written
-/// together per mode); callers treat any `Err` as "log and change nothing
-/// else" per the plan's failure rule.
+/// The accent overrides of already-read builders, quantised into the 8-bit
+/// don't-clobber space.
+pub fn builder_accents(builders: &(ThemeBuilder, ThemeBuilder)) -> BuilderAccents {
+    (
+        builders.0.accent.map(quantize),
+        builders.1.accent.map(quantize),
+    )
+}
+
+/// Each builder's current accent override, quantised into the 8-bit space the
+/// don't-clobber comparison happens in. `None` = palette default (key unset).
+pub fn read_current_accents(handles: &ThemeHandles) -> BuilderAccents {
+    builder_accents(&read_builders(handles))
+}
+
+/// Write the computed accents to both modes, onto the builders the caller
+/// already read for this recompute (no re-read, no TOCTOU window between the
+/// plan's compare and the write).
+///
+/// On failure, whatever (possibly) landed is **rolled back** to the builders'
+/// original accents — the exact `Option<Srgb>` values read, per mode,
+/// best-effort. The rollback is not optional politeness: a half-write left on
+/// disk (light landed, dark failed — or a builder key landed without its
+/// theme) holds *our* colour, which the next recompute's don't-clobber guard
+/// cannot tell from the user intervening, so it would [`AccentAction::Disarm`]
+/// — clearing the snapshot **without restoring** — and the user's pre-feature
+/// accent would be unrecoverable. Callers still treat any `Err` as "log and
+/// change nothing else" per the plan's failure rule; a clean rollback means
+/// the guard holds and the next recompute simply retries.
 pub fn write_accents(
     handles: &ThemeHandles,
+    builders: (ThemeBuilder, ThemeBuilder),
     light: [u8; 3],
     dark: [u8; 3],
 ) -> Result<(), cosmic_config::Error> {
-    write_mode_accent(handles, Mode::Light, Some(unquantize(light)))?;
-    write_mode_accent(handles, Mode::Dark, Some(unquantize(dark)))
+    let previous = (builders.0.accent, builders.1.accent);
+    let (light_builder, dark_builder) = builders;
+    let rollback = |mode: Mode, accent: Option<Srgb>| {
+        if let Err(error) = write_mode_accent(handles, mode, accent) {
+            tracing::warn!(
+                ?mode,
+                "failed to roll back the accent after a write failure: {error}"
+            );
+        }
+    };
+    if let Err(error) =
+        write_builder_accent(handles, Mode::Light, light_builder, Some(unquantize(light)))
+    {
+        // Light may be half-written (builder key without theme); dark was
+        // never attempted — rolling it back too would only rewrite an
+        // untouched theme and fire change notifications for nothing.
+        rollback(Mode::Light, previous.0);
+        return Err(error);
+    }
+    if let Err(error) =
+        write_builder_accent(handles, Mode::Dark, dark_builder, Some(unquantize(dark)))
+    {
+        // Light landed fully; dark may be half-written. Both go back.
+        rollback(Mode::Light, previous.0);
+        rollback(Mode::Dark, previous.1);
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Restore a snapshot verbatim — including an inner `None`, which writes the
@@ -426,7 +502,18 @@ pub fn restore_accents(
     write_mode_accent(handles, Mode::Dark, snapshot.dark.map(unquantize))
 }
 
-/// One mode's write, per the recipe that supersedes notes §2:
+/// One mode's write from a self-contained fresh read — the restore path,
+/// which has no already-read builder on hand.
+fn write_mode_accent(
+    handles: &ThemeHandles,
+    mode: Mode,
+    accent: Option<Srgb>,
+) -> Result<(), cosmic_config::Error> {
+    write_builder_accent(handles, mode, handles.read_builder(mode), accent)
+}
+
+/// One mode's write onto an already-read builder, per the recipe that
+/// supersedes notes §2:
 ///
 /// 1. `set_accent` — the derive's generated **single-key setter**: only the
 ///    `accent` key lands on disk, nothing else gets pinned user-locally
@@ -437,12 +524,12 @@ pub fn restore_accents(
 /// 2. `build().write_entry` — the derived `Theme` *is* a full-entry write;
 ///    that matches upstream (cosmic-settings does the same) and both writes
 ///    are required: nothing on the system rebuilds the theme from the builder.
-fn write_mode_accent(
+fn write_builder_accent(
     handles: &ThemeHandles,
     mode: Mode,
+    mut builder: ThemeBuilder,
     accent: Option<Srgb>,
 ) -> Result<(), cosmic_config::Error> {
-    let mut builder = handles.read_builder(mode);
     builder.set_accent(handles.builder_cfg(mode), accent)?;
     builder.build().write_entry(handles.theme_cfg(mode))
 }
@@ -487,13 +574,32 @@ pub enum AccentAction {
 /// Don't-clobber: once `last_written` exists, both builders must still hold
 /// exactly those bytes (`[u8; 3]` compare — exact by the quantise-then-convert
 /// construction). Any difference, including a mode reset to palette default,
-/// means the user intervened → [`AccentAction::Disarm`]. With no
-/// `last_written` there is nothing to clobber (first write after enable).
+/// means the user intervened → [`AccentAction::Disarm`]. Before the first
+/// successful write (`last_written` still `None`) the enable-time snapshot
+/// stands in: the only accents legitimately on disk then are the snapshot's
+/// own, so a mismatch there is the user intervening in the enable→first-write
+/// gap (e.g. after a transient write failure) and disarms too — without it
+/// the guard would be inert until a write finally lands.
+///
+/// Steady state: when the computed pair equals `last_written`, [`AccentAction::Skip`]
+/// — the non-Disarm path just proved the builders hold exactly those bytes,
+/// so disk is already right, and a write would rewrite both derived themes
+/// key-for-key and fire change notifications into every running COSMIC app
+/// for no change at all (every startup reconciliation and same-hue apply
+/// lands here).
 ///
 /// Snapshot lifecycle: the plan never takes the snapshot itself — it flags
 /// `snapshot_now` when none is persisted, so the executor captures the user's
-/// accents before our first write. Re-enable clears the old snapshot first
-/// (enable always re-snapshots), which routes through the same flag.
+/// accents before our first write. Disable and disarm both clear the
+/// snapshot, so a re-enable re-snapshots through the same flag; a snapshot
+/// that *survives* into an enable (kept by a disable that could not restore)
+/// is restored to disk and kept by the toggler, never re-captured — the disk
+/// may still hold our own accents from the earlier run.
+///
+/// Single-instance assumption: two applet instances (or two machines syncing
+/// one config) each write and then read the *other's* accents as an external
+/// change, so the second instance disarms spuriously. Accepted — the applet
+/// is a panel applet, one per session.
 pub fn accent_plan(
     enabled: bool,
     snapshot: Option<AccentSnapshot>,
@@ -506,14 +612,23 @@ pub fn accent_plan(
     if !enabled {
         return AccentAction::Skip;
     }
-    if let Some(last) = last_written
-        && current != (Some(last.light), Some(last.dark))
-    {
-        return AccentAction::Disarm;
+    match (last_written, snapshot) {
+        (Some(last), _) if current != (Some(last.light), Some(last.dark)) => {
+            return AccentAction::Disarm;
+        }
+        (None, Some(snap)) if current != (snap.light, snap.dark) => {
+            return AccentAction::Disarm;
+        }
+        _ => {}
+    }
+    let light = quantize(accent_for(light_palette, hue));
+    let dark = quantize(accent_for(dark_palette, hue));
+    if last_written == Some(AccentPair { light, dark }) {
+        return AccentAction::Skip;
     }
     AccentAction::Write {
-        light: quantize(accent_for(light_palette, hue)),
-        dark: quantize(accent_for(dark_palette, hue)),
+        light,
+        dark,
         snapshot_now: snapshot.is_none(),
     }
 }
@@ -691,8 +806,20 @@ mod tests {
         assert_eq!(sample_stride(480, 270), 1, "the thumbnail is the budget");
         assert!(sample_stride(960, 540) > 1);
 
+        // The vibrant content deliberately avoids the origin: everything
+        // inside the top-left thumbnail-sized window is grey, so a sampler
+        // biased toward the start of the image (only the first rows, only a
+        // budget-sized prefix) answers None while a stride that covers the
+        // whole area answers the vibrant hue.
         let vibrant = [230, 120, 0];
-        let big = dominant_hue(&solid(960, 540, vibrant)).expect("stride-sampled image");
+        let img = RgbImage::from_fn(960, 540, |x, y| {
+            if x < 480 && y < 270 {
+                image::Rgb([128, 128, 128])
+            } else {
+                image::Rgb(vibrant)
+            }
+        });
+        let big = dominant_hue(&img).expect("the vibrant three quadrants must dominate");
         assert!(circ_diff(big, hue_of(vibrant)) <= 5.0);
     }
 
@@ -877,6 +1004,12 @@ mod tests {
 
     use cosmic::cosmic_theme::Component;
 
+    /// [`write_accents`] over a fresh read of both builders — the call shape
+    /// production uses, minus the recompute the builders were read for.
+    fn write(handles: &ThemeHandles, light: [u8; 3], dark: [u8; 3]) {
+        write_accents(handles, read_builders(handles), light, dark).expect("write accents");
+    }
+
     /// The derived theme's accent, read back from the theme config's own
     /// `accent` key (a `Component`), quantised to 8-bit. Reading the raw key
     /// rather than `Theme::get_entry` keeps the test off `Theme::default()`,
@@ -908,7 +1041,7 @@ mod tests {
         // powers of two — the case a lossy write path would corrupt.
         let light = [7, 133, 217];
         let dark = [250, 41, 90];
-        write_accents(&handles, light, dark).expect("write accents");
+        write(&handles, light, dark);
 
         // Builder accents read back to the exact same bytes…
         assert_eq!(
@@ -939,7 +1072,7 @@ mod tests {
             dark: Some([200, 100, 50]),
         };
         restore_accents(&handles, user).expect("seed the user's accents");
-        write_accents(&handles, [1, 2, 3], [4, 5, 6]).expect("our overwrite");
+        write(&handles, [1, 2, 3], [4, 5, 6]);
         assert_eq!(
             read_current_accents(&handles),
             (Some([1, 2, 3]), Some([4, 5, 6]))
@@ -956,7 +1089,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let handles = ThemeHandles::sandboxed(dir.path()).unwrap();
 
-        write_accents(&handles, [1, 2, 3], [4, 5, 6]).expect("our overwrite");
+        write(&handles, [1, 2, 3], [4, 5, 6]);
 
         // Inner `None` = "user had the palette default": the restore must
         // write that state back (unset the override), not skip the mode.
@@ -1011,7 +1144,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let handles = ThemeHandles::sandboxed(dir.path()).unwrap();
 
-        write_accents(&handles, [7, 133, 217], [250, 41, 90]).expect("write accents");
+        write(&handles, [7, 133, 217], [250, 41, 90]);
 
         // `set_accent` is a single-key write: pinning any other builder key
         // user-locally would cut the user off from future COSMIC default
@@ -1026,62 +1159,126 @@ mod tests {
         }
     }
 
-    // ---- pure apply/disarm decision ---------------------------------------
+    #[test]
+    fn read_builder_degrades_per_key_and_substitutes_a_corrupt_palette() {
+        let dir = tempfile::tempdir().unwrap();
+        let handles = ThemeHandles::sandboxed(dir.path()).unwrap();
 
-    /// The persisted feature state the real handler keeps in `AppletConfig`;
-    /// the sequence test maintains it by executing plan actions exactly per
-    /// [`AccentAction`]'s documented semantics.
-    #[derive(Default)]
-    struct FeatureState {
-        enabled: bool,
-        snapshot: Option<AccentSnapshot>,
-        last_written: Option<AccentPair>,
-    }
-
-    /// One recompute: fresh read → pure plan → execute, the loop `app.rs`
-    /// will run in Task 6.
-    fn run_plan(
-        handles: &ThemeHandles,
-        state: &mut FeatureState,
-        hue: Option<f32>,
-    ) -> AccentAction {
-        let current = read_current_accents(handles);
-        let action = accent_plan(
-            state.enabled,
-            state.snapshot,
-            state.last_written,
-            current,
-            light_palette(),
-            dark_palette(),
-            hue,
+        // Seed real key files, then corrupt the light accent key: `get_entry`
+        // returns `Err(partial)` and `read_builder` must keep the partial
+        // (accent degraded to its default) instead of bailing out.
+        write(&handles, [7, 133, 217], [250, 41, 90]);
+        let accent_key = find_key_file(dir.path(), LIGHT_THEME_BUILDER_ID, "accent");
+        std::fs::write(&accent_key, "not ron at all").unwrap();
+        let builder = handles.read_builder(Mode::Light);
+        assert_eq!(builder.accent, None, "corrupt accent degrades to default");
+        assert!(
+            matches!(builder.palette, CosmicPalette::Light(_)),
+            "the palette substitution still applies on the Err path"
         );
-        match action {
-            AccentAction::Write {
-                light,
-                dark,
-                snapshot_now,
-            } => {
-                if snapshot_now {
-                    // The current accents are still the user's — nothing of
-                    // ours has landed yet.
-                    state.snapshot = Some(AccentSnapshot {
-                        light: current.0,
-                        dark: current.1,
-                    });
-                }
-                write_accents(handles, light, dark).expect("write accents");
-                state.last_written = Some(AccentPair { light, dark });
-            }
-            AccentAction::Disarm => {
-                // No restore — the user's manual choice stands.
-                state.enabled = false;
-                state.snapshot = None;
-                state.last_written = None;
-            }
-            AccentAction::Skip => {}
-        }
-        action
+
+        // A present-but-corrupt `palette` key: the explicit probe fails and
+        // must substitute the mode's own default, not leak the dark one.
+        let palette_key = accent_key.with_file_name("palette");
+        std::fs::write(&palette_key, "garbage ( ron").unwrap();
+        let builder = handles.read_builder(Mode::Light);
+        assert!(matches!(builder.palette, CosmicPalette::Light(_)));
+        assert_eq!(builder.palette.as_ref(), light_palette());
     }
+
+    #[test]
+    fn write_accents_failure_rolls_back_the_landed_mode() {
+        // Light is written before dark; a dark-side failure reaches disk
+        // with the light mode fully written. That half-write must be rolled
+        // back — left in place it holds *our* colour, which the next
+        // recompute's don't-clobber guard cannot tell from the user
+        // intervening: it would Disarm and clear the snapshot without
+        // restoring, destroying the user's pre-feature accent.
+        let dir = tempfile::tempdir().unwrap();
+        let handles = ThemeHandles::sandboxed(dir.path()).unwrap();
+
+        let user_light = [10, 20, 30];
+        let user_dark = [40, 50, 60];
+        restore_accents(
+            &handles,
+            AccentSnapshot {
+                light: Some(user_light),
+                dark: Some(user_dark),
+            },
+        )
+        .expect("seed accents");
+        let dark_theme_before = theme_accent(&handles, Mode::Dark);
+
+        let dark_dirs = read_only_config_dirs(dir.path(), &[DARK_THEME_BUILDER_ID, DARK_THEME_ID]);
+        let result = write_accents(&handles, read_builders(&handles), [1, 2, 3], [4, 5, 6]);
+        restore_dir_permissions(&dark_dirs);
+        result.expect_err("the dark write must fail");
+
+        // The landed light mode was rolled back, builder and theme alike…
+        assert_eq!(
+            read_current_accents(&handles),
+            (Some(user_light), Some(user_dark)),
+            "both builders must hold the user's accents again"
+        );
+        assert_eq!(theme_accent(&handles, Mode::Light), user_light);
+        // …and dark is exactly as it was.
+        assert_eq!(theme_accent(&handles, Mode::Dark), dark_theme_before);
+    }
+
+    /// Locate the RON key file cosmic-config wrote for `key` under `id`'s
+    /// config root inside the TempDir.
+    fn find_key_file(root: &std::path::Path, id: &str, key: &str) -> std::path::PathBuf {
+        fn walk(dir: &std::path::Path, key: &str) -> Option<std::path::PathBuf> {
+            for entry in std::fs::read_dir(dir).ok()? {
+                let path = entry.ok()?.path();
+                if path.is_dir() {
+                    if let Some(found) = walk(&path, key) {
+                        return Some(found);
+                    }
+                } else if path.file_name().is_some_and(|name| name == key) {
+                    return Some(path);
+                }
+            }
+            None
+        }
+        walk(&root.join("cosmic").join(id), key).expect("key file written by cosmic-config")
+    }
+
+    /// Make every directory under the given config ids read-only so writes
+    /// into them fail; returns the affected directories for
+    /// [`restore_dir_permissions`] (TempDir cleanup needs them writable).
+    fn read_only_config_dirs(root: &std::path::Path, ids: &[&str]) -> Vec<std::path::PathBuf> {
+        use std::os::unix::fs::PermissionsExt as _;
+        fn dirs_under(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            out.push(dir.to_path_buf());
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs_under(&path, out);
+                }
+            }
+        }
+        let mut dirs = Vec::new();
+        for id in ids {
+            dirs_under(&root.join("cosmic").join(id), &mut dirs);
+        }
+        for dir in &dirs {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        dirs
+    }
+
+    fn restore_dir_permissions(dirs: &[std::path::PathBuf]) {
+        use std::os::unix::fs::PermissionsExt as _;
+        for dir in dirs {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    // ---- pure apply/disarm decision ---------------------------------------
 
     #[test]
     fn plan_is_skip_while_disabled() {
@@ -1131,9 +1328,10 @@ mod tests {
     }
 
     #[test]
-    fn steady_state_rewrites_without_resnapshotting() {
-        // Builders hold exactly what we last wrote → keep following the
-        // wallpaper; the enable-time snapshot must not be overwritten.
+    fn a_changed_hue_rewrites_without_resnapshotting() {
+        // Builders hold exactly what we last wrote and the wallpaper's hue
+        // moved → follow it; the enable-time snapshot must not be
+        // overwritten.
         let last = AccentPair {
             light: [7, 133, 217],
             dark: [250, 41, 90],
@@ -1160,6 +1358,66 @@ mod tests {
             ),
             "got {action:?}"
         );
+    }
+
+    #[test]
+    fn an_unchanged_computed_pair_skips_instead_of_rewriting() {
+        // Steady state — same wallpaper hue, builders exactly as we left
+        // them: a Write here would rewrite both derived themes key-for-key
+        // and notify every running COSMIC app on every startup
+        // reconciliation and same-hue apply. Disk is already right → Skip.
+        let hue = Some(200.0);
+        let last = AccentPair {
+            light: quantize(accent_for(light_palette(), hue)),
+            dark: quantize(accent_for(dark_palette(), hue)),
+        };
+        let action = accent_plan(
+            true,
+            Some(AccentSnapshot {
+                light: None,
+                dark: None,
+            }),
+            Some(last),
+            (Some(last.light), Some(last.dark)),
+            light_palette(),
+            dark_palette(),
+            hue,
+        );
+        assert_eq!(action, AccentAction::Skip);
+    }
+
+    #[test]
+    fn a_change_in_the_enable_to_first_write_gap_disarms() {
+        // `last_written` is still None (the first write failed, or never
+        // ran), but the builders no longer match the enable-time snapshot:
+        // the user intervened in that gap, and writing would clobber their
+        // pick — the snapshot stands in for `last_written` as the guard.
+        let snapshot = AccentSnapshot {
+            light: Some([10, 20, 30]),
+            dark: None,
+        };
+        let action = accent_plan(
+            true,
+            Some(snapshot),
+            None,
+            (Some([10, 20, 30]), Some([99, 88, 77])),
+            light_palette(),
+            dark_palette(),
+            Some(120.0),
+        );
+        assert_eq!(action, AccentAction::Disarm);
+
+        // While the builders still match the snapshot, the retry writes.
+        let action = accent_plan(
+            true,
+            Some(snapshot),
+            None,
+            (snapshot.light, snapshot.dark),
+            light_palette(),
+            dark_palette(),
+            Some(120.0),
+        );
+        assert!(matches!(action, AccentAction::Write { .. }), "{action:?}");
     }
 
     #[test]
@@ -1197,54 +1455,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn startup_reconciliation_catches_a_change_made_while_stopped() {
-        // The applet was down; `last_written` survived in config while the
-        // user changed one mode in Settings. The startup recompute does a
-        // fresh read against real files — the persisted bytes vs the RON
-        // round-trip must disagree exactly where the user intervened.
-        let dir = tempfile::tempdir().unwrap();
-        let handles = ThemeHandles::sandboxed(dir.path()).unwrap();
-
-        let mut state = FeatureState {
-            enabled: true,
-            ..FeatureState::default()
-        };
-        assert!(matches!(
-            run_plan(&handles, &mut state, Some(200.0)),
-            AccentAction::Write { .. }
-        ));
-        let persisted = state.last_written;
-
-        // "Restart": only config state survives; the user meanwhile picked a
-        // new dark accent.
-        restore_accents(
-            &handles,
-            AccentSnapshot {
-                light: Some(state.last_written.unwrap().light),
-                dark: Some([12, 34, 56]),
-            },
-        )
-        .expect("user's Settings change");
-
-        let mut state = FeatureState {
-            enabled: true,
-            snapshot: state.snapshot,
-            last_written: persisted,
-        };
-        assert_eq!(
-            run_plan(&handles, &mut state, Some(200.0)),
-            AccentAction::Disarm
-        );
-        // Disarm cleared the feature state but left the user's accents alone.
-        assert!(!state.enabled);
-        assert_eq!(state.snapshot, None);
-        assert_eq!(state.last_written, None);
-        assert_eq!(
-            read_current_accents(&handles),
-            (Some(persisted.unwrap().light), Some([12, 34, 56]))
-        );
-    }
+    // The end-to-end sequences (startup reconciliation after a change made
+    // while stopped; re-enable re-snapshots so a later disable restores the
+    // later accents) are exercised against the *real* executor —
+    // `Window::update` in `app.rs`'s tests — rather than a test-local
+    // re-implementation of the action semantics that could drift.
 
     #[test]
     fn grey_hue_still_writes_the_warm_greys() {
@@ -1266,71 +1481,6 @@ mod tests {
                 dark: quantize(dark_palette().accent_warm_grey.color),
                 snapshot_now: true,
             }
-        );
-    }
-
-    #[test]
-    fn re_enable_re_snapshots_so_disable_restores_the_later_accents() {
-        // enable → manual change → disarm → re-enable → disable must end on
-        // the accents from *re-enable time*, not the pre-feature originals —
-        // the re-snapshot rule from the Solution Overview.
-        let dir = tempfile::tempdir().unwrap();
-        let handles = ThemeHandles::sandboxed(dir.path()).unwrap();
-        let mut state = FeatureState::default();
-
-        // Pre-feature: the user's original accents.
-        let original = AccentSnapshot {
-            light: Some([10, 20, 30]),
-            dark: Some([40, 50, 60]),
-        };
-        restore_accents(&handles, original).expect("seed originals");
-
-        // Enable (the caller clears any stale snapshot — enable always
-        // re-snapshots) and first recompute.
-        state.enabled = true;
-        state.snapshot = None;
-        assert!(matches!(
-            run_plan(&handles, &mut state, Some(200.0)),
-            AccentAction::Write {
-                snapshot_now: true,
-                ..
-            }
-        ));
-        assert_eq!(state.snapshot, Some(original));
-
-        // The user picks new accents in Settings…
-        let manual = AccentSnapshot {
-            light: Some([90, 90, 0]),
-            dark: Some([0, 90, 90]),
-        };
-        restore_accents(&handles, manual).expect("user's Settings change");
-
-        // …and the next recompute disarms without restoring.
-        assert_eq!(
-            run_plan(&handles, &mut state, Some(200.0)),
-            AccentAction::Disarm
-        );
-        assert!(!state.enabled);
-        assert_eq!(read_current_accents(&handles), (manual.light, manual.dark));
-
-        // Re-enable: the snapshot is re-taken from *now* — the manual accents.
-        state.enabled = true;
-        state.snapshot = None;
-        assert!(matches!(
-            run_plan(&handles, &mut state, Some(30.0)),
-            AccentAction::Write {
-                snapshot_now: true,
-                ..
-            }
-        ));
-        assert_eq!(state.snapshot, Some(manual));
-
-        // Disable restores what re-enable captured, not the originals.
-        restore_accents(&handles, state.snapshot.unwrap()).expect("disable restore");
-        assert_eq!(read_current_accents(&handles), (manual.light, manual.dark));
-        assert_ne!(
-            read_current_accents(&handles),
-            (original.light, original.dark)
         );
     }
 

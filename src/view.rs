@@ -263,11 +263,15 @@ pub fn popup_view(window: &Window) -> Element<'_, Message> {
             .push(divider())
             .push(padded_control(retention_row(window)));
     } else {
-        // Empty catalogue: everything except the status footer is gone;
-        // refresh stays reachable so an offline start can be retried by
-        // hand once the network is back.
+        // Empty catalogue: the image-bound controls are gone; refresh stays
+        // reachable so an offline start can be retried by hand once the
+        // network is back, and the accent toggler stays reachable so a
+        // modified theme can still be turned off (its restore needs no
+        // images — only the snapshot).
         content = content
             .push(padded_control(refresh_button(window)).align_x(Alignment::Center))
+            .push(divider())
+            .push(padded_control(accent_toggler(window)))
             .push(divider());
     }
 

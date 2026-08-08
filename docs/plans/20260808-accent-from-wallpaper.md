@@ -149,8 +149,14 @@ we drop: full-image decode (we use the 480×270 thumbnail), the subprocess
   hue + light-palette tone, dark builder gets hue + dark-palette tone; a
   light/dark mode flip then needs no work from us.
 - **Off by default; reversible; snapshot lifecycle** (plan review #11 resolved):
-  - **Enable** (toggle on): snapshot the *live* accents now — always, even if a
-    stale snapshot exists (re-enable re-snapshots) — then compute and write.
+  - **Enable** (toggle on): snapshot the *live* accents now, then compute and
+    write. ➕ *(review re-check)* "always, even over a stale snapshot" was
+    wrong: disable and disarm clear the snapshot, so a normal re-enable does
+    re-snapshot — but a snapshot that *survives* into an enable is the kept
+    record of a disable that couldn't restore, while the disk may still hold
+    **our** accents; re-capturing would clobber the only record of the user's
+    pre-feature accents. Enable restores that snapshot (the deferred restore)
+    and keeps it, refusing to arm if the restore fails.
   - **Disable** (toggle off): restore the snapshot verbatim (including `None` =
     palette default), then clear snapshot + last-written.
   - **Disarm** (external accent change detected): flip the toggle off via the
@@ -164,7 +170,14 @@ we drop: full-image decode (we use the 480×270 thumbnail), the subprocess
   store the same `[u8; 3]` in config.
 - **Failure behaviour** (notes §9.5): missing/failed thumbnail, decode error,
   or unwritable theme config — every failure path leaves the user's accent
-  exactly as it was; log via `tracing`, no UI error state.
+  exactly as it was; log via `tracing`, no UI error state. ➕ *(review
+  re-check)* "leaves the accent as it was" needs active help on a *partial*
+  `write_accents` failure (light lands before dark; a builder key can land
+  without its theme): the half-write holds our colour, which the don't-clobber
+  guard cannot tell from user intervention — the next recompute would Disarm
+  and destroy the snapshot without restoring. `write_accents` therefore rolls
+  back whatever (possibly) landed to the accents the plan compared, per mode,
+  best-effort, before returning the error.
 
 ## Technical Details
 
@@ -391,7 +404,9 @@ Types live in `src/accent.rs`; all colours are `[u8; 3]` (keeps `Eq` on
       from `hue` needs each builder's own tone band — still pure; a
       `BuilderAccents` type alias names the `(light, dark)` current pair
 - [x] snapshot lifecycle per Solution Overview: enable-time snapshot is taken
-      by the caller (always re-snapshot on enable); `Disarm` means clear
+      by the caller (re-snapshot on a normal enable; ➕ *review re-check*: a
+      snapshot surviving into an enable is restored and kept, never
+      re-captured — see Solution Overview); `Disarm` means clear
       snapshot + last-written, **no restore**; plan never writes when disabled
       (the plan itself never captures the snapshot: `Write.snapshot_now` flags
       "no snapshot persisted — capture the user's accents before writing")
@@ -426,7 +441,9 @@ Types live in `src/accent.rs`; all colours are `[u8; 3]` (keeps `Eq` on
       persist snapshot/last-written via config setters; `Disarm` flips
       `accent_enabled` off through the setter so the UI row follows and clears
       snapshot + last-written without restoring)
-- [x] `Message::SetAccentEnabled(bool)`: on → snapshot live accents (always),
+- [x] `Message::SetAccentEnabled(bool)`: on → snapshot live accents (➕
+      *review re-check*: unless one survives from a disable that couldn't
+      restore — that one is restored and kept, see Solution Overview),
       then immediate compute for the current wallpaper; off →
       `restore_accents(snapshot)`, clear snapshot + last-written
       ➕ enable also clears any stale `accent_last_written` (nothing of this
@@ -475,12 +492,10 @@ Types live in `src/accent.rs`; all colours are `[u8; 3]` (keeps `Eq` on
 - [x] verify failure paths leave the accent untouched (grep the handler for an
       early-return on every `Err`)
 - [x] run full test suite: `just check`
-- [x] smoke-test on the live desktop: `just install`, toggle on → accent
-      follows wallpaper across browse/shuffle/refresh; change accent in
-      Settings → applet disarms (toggle drops, chosen accent stays); toggle
-      off → snapshot accent returns; light/dark flip shows per-mode tones;
-      restart applet with feature on → startup reconciliation runs
-      (skipped - live-desktop smoke test is for the human, not automatable)
+- [ ] smoke-test on the live desktop — **not done**: needs a human at the
+      desktop (`just install` + live config changes are outside the automated
+      run's constraints); the checklist itself is preserved under
+      Post-Completion below
 - [x] confirm no new dependencies were added to `Cargo.toml`
 
 ### Task 9: [Final] Update documentation
@@ -509,6 +524,11 @@ Types live in `src/accent.rs`; all colours are `[u8; 3]` (keeps `Eq` on
 *Items requiring manual intervention or external systems - no checkboxes, informational only*
 
 **Manual verification:**
+- Live-desktop smoke test (deferred from Task 8): `just install`, toggle on →
+  accent follows wallpaper across browse/shuffle/refresh; change accent in
+  Settings → applet disarms at the next recompute (toggle drops, chosen accent
+  stays); toggle off → snapshot accent returns; light/dark flip shows per-mode
+  tones; restart applet with feature on → startup reconciliation runs.
 - Extended live usage across several daily Bing images: do the derived accents
   *feel* right (vibrancy, not washed out) for photographic wallpapers with
   dusk/dawn palettes? Tune the chroma threshold / tone band only with evidence.

@@ -224,9 +224,6 @@ pub enum Message {
     /// The accent-from-wallpaper toggler. On: snapshot the live accents,
     /// then compute for the current wallpaper. Off: restore the snapshot
     /// verbatim and clear the persisted feature state.
-    // TODO(Task 7): constructed by the popup's toggler row once it exists;
-    // until then only the tests exercise it.
-    #[allow(dead_code)]
     SetAccentEnabled(bool),
     /// The async accent extraction finished. `source` is the staleness
     /// guard (same hazard class as the generation-counter timers): a result
@@ -623,31 +620,30 @@ impl Window {
         let Some(handles) = &self.accent_handles else {
             return;
         };
-        let light = handles.read_builder(accent::Mode::Light);
-        let dark = handles.read_builder(accent::Mode::Dark);
-        let current = (
-            light.accent.map(accent::quantize),
-            dark.accent.map(accent::quantize),
-        );
+        let builders = accent::read_builders(handles);
         let action = accent::accent_plan(
             self.config.accent_enabled,
             self.config.accent_snapshot,
             self.config.accent_last_written,
-            current,
-            light.palette.as_ref(),
-            dark.palette.as_ref(),
+            accent::builder_accents(&builders),
+            builders.0.palette.as_ref(),
+            builders.1.palette.as_ref(),
             hue,
         );
-        self.execute_accent_action(action, current);
+        self.execute_accent_action(action, builders);
     }
 
     /// Execute a pure [`accent::AccentAction`] against the theme configs and
-    /// the persisted feature state. Every failure path logs and leaves the
-    /// user's accent exactly as it was.
+    /// the persisted feature state, writing onto the same `builders` the plan
+    /// just compared. Every failure path logs and leaves the user's accent
+    /// exactly as it was.
     fn execute_accent_action(
         &mut self,
         action: accent::AccentAction,
-        current: accent::BuilderAccents,
+        builders: (
+            cosmic::cosmic_theme::ThemeBuilder,
+            cosmic::cosmic_theme::ThemeBuilder,
+        ),
     ) {
         match action {
             accent::AccentAction::Write {
@@ -655,6 +651,14 @@ impl Window {
                 dark,
                 snapshot_now,
             } => {
+                // Checked before anything is persisted: a missing handle
+                // must not leave a half-done state (snapshot stored, no
+                // write). Nothing below touches the handles, so the later
+                // `expect` cannot fire.
+                if self.accent_handles.is_none() {
+                    return;
+                }
+                let current = accent::builder_accents(&builders);
                 if snapshot_now {
                     // The current accents are still the user's — nothing of
                     // ours has landed yet — so capture them *before* writing.
@@ -665,10 +669,19 @@ impl Window {
                     });
                     self.set_config(config);
                 }
-                let Some(handles) = &self.accent_handles else {
-                    return;
-                };
-                if let Err(error) = accent::write_accents(handles, light, dark) {
+                let handles = self
+                    .accent_handles
+                    .as_ref()
+                    .expect("checked above; set_config leaves the handles alone");
+                if let Err(error) = accent::write_accents(handles, builders, light, dark) {
+                    // `write_accents` rolled any half-write back to the
+                    // accents the plan just compared, so the next recompute's
+                    // don't-clobber guard still holds and retries instead of
+                    // disarming over our own leftovers. `accent_last_written`
+                    // stays as it was (`None` before a first successful
+                    // write): the snapshot then stands in for it in
+                    // `accent_plan`'s guard, so a pick the user makes after
+                    // this failure still disarms.
                     tracing::warn!("failed to write accent colours: {error}");
                     return;
                 }
@@ -692,11 +705,15 @@ impl Window {
         }
     }
 
-    /// The accent toggler. Enable: snapshot the *live* accents now — always,
-    /// even over a stale snapshot (re-enable re-snapshots) — then compute for
-    /// the current wallpaper. Disable: restore the snapshot verbatim
-    /// (including the `None` = palette-default state), then clear snapshot +
-    /// last-written.
+    /// The accent toggler. Enable: snapshot the *live* accents (they are
+    /// still the user's — disable and disarm both clear the snapshot, so a
+    /// normal re-enable re-snapshots), **unless** a snapshot survived from a
+    /// disable that could not restore — that one is the only record of the
+    /// user's pre-feature accents while the disk may still hold *ours*, so
+    /// it is restored now (the deferred restore) and kept, never re-captured.
+    /// Then compute for the current wallpaper. Disable: restore the snapshot
+    /// verbatim (including the `None` = palette-default state), then clear
+    /// snapshot + last-written.
     fn set_accent_enabled(&mut self, enabled: bool) -> app::Task<Message> {
         if enabled == self.config.accent_enabled {
             // The toggler only fires on a flip; an echo must not re-snapshot
@@ -710,25 +727,79 @@ impl Window {
                 tracing::warn!("cannot enable accent-from-wallpaper: theme configs unavailable");
                 return Task::none();
             };
-            let (light, dark) = accent::read_current_accents(handles);
+            if self.config_context.is_none() {
+                // Memory-only feature state cannot survive a restart: the
+                // theme would stay modified while the snapshot needed to
+                // undo it dies with the process. Refuse, like above.
+                tracing::warn!(
+                    "cannot enable accent-from-wallpaper: applet config is not persistable"
+                );
+                return Task::none();
+            }
             let mut config = self.config.clone();
+            match config.accent_snapshot {
+                // A snapshot surviving a disabled period is the kept record
+                // of a disable that could not restore (theme configs were
+                // unavailable then): the on-disk accents may still be *ours*
+                // from that earlier run, so re-capturing them would clobber
+                // the only record of the user's pre-feature accents — and a
+                // later disable would "restore" our own colours. Honour the
+                // deferred restore instead, and refuse to arm when it fails:
+                // the disk/snapshot mismatch would read as user intervention
+                // to the next recompute's guard, which disarms and destroys
+                // the snapshot without restoring.
+                Some(snapshot) => {
+                    if let Err(error) = accent::restore_accents(handles, snapshot) {
+                        tracing::warn!(
+                            "cannot enable accent-from-wallpaper: \
+                             deferred snapshot restore failed: {error}"
+                        );
+                        return Task::none();
+                    }
+                }
+                // The normal enable: the live accents are the user's —
+                // capture them so disable can put them back.
+                None => {
+                    let (light, dark) = accent::read_current_accents(handles);
+                    config.accent_snapshot = Some(accent::AccentSnapshot { light, dark });
+                }
+            }
             config.accent_enabled = true;
-            config.accent_snapshot = Some(accent::AccentSnapshot { light, dark });
             // Nothing of ours is on disk yet as far as this enablement is
             // concerned; a stale pair would trip the don't-clobber compare.
             config.accent_last_written = None;
             self.set_config(config);
-            return match self.current.clone() {
-                Some(current) => self.start_accent_compute(current),
-                None => Task::none(),
-            };
+            // `self.current` can be stale against an external Settings change
+            // (the documented v1 limitation — cosmic-bg is re-read around
+            // fetches/prunes, not watched); the next apply recomputes from
+            // the then-current wallpaper.
+            return self.accent_compute_for_current();
         }
-        if let (Some(handles), Some(snapshot)) = (&self.accent_handles, self.config.accent_snapshot)
-            && let Err(error) = accent::restore_accents(handles, snapshot)
-        {
-            // The accents stay ours on disk; the cleared state below still
-            // ends the feature (nothing would ever retry the restore).
-            tracing::warn!("failed to restore accent snapshot: {error}");
+        match (&self.accent_handles, self.config.accent_snapshot) {
+            (Some(handles), Some(snapshot)) => {
+                if let Err(error) = accent::restore_accents(handles, snapshot) {
+                    // The accents stay ours on disk; the cleared state below
+                    // still ends the feature (nothing would ever retry the
+                    // restore).
+                    tracing::warn!("failed to restore accent snapshot: {error}");
+                }
+            }
+            (None, Some(_)) => {
+                // Theme handles gone (config enabled on disk while the theme
+                // configs failed to open this run): the snapshot cannot be
+                // restored now — keep it instead of silently discarding the
+                // only record of the user's pre-feature accents.
+                tracing::warn!(
+                    "cannot restore accent snapshot: theme configs unavailable (snapshot kept)"
+                );
+                let mut config = self.config.clone();
+                config.accent_enabled = false;
+                config.accent_last_written = None;
+                self.set_config(config);
+                return Task::none();
+            }
+            // Nothing was ever snapshotted; nothing to restore.
+            (_, None) => {}
         }
         let mut config = self.config.clone();
         config.accent_enabled = false;
@@ -736,6 +807,16 @@ impl Window {
         config.accent_last_written = None;
         self.set_config(config);
         Task::none()
+    }
+
+    /// The accent recompute for the tracked current wallpaper, or nothing
+    /// when none is tracked. (Gating on the setting and the handles happens
+    /// inside [`Window::start_accent_compute`].)
+    fn accent_compute_for_current(&self) -> app::Task<Message> {
+        match self.current.clone() {
+            Some(current) => self.start_accent_compute(current),
+            None => Task::none(),
+        }
     }
 }
 
@@ -1239,10 +1320,7 @@ impl cosmic::Application for Window {
         // the accent may have changed when the applet was down. The same
         // extraction task catches both: an external accent change disarms,
         // anything else re-applies. Gated inside on `accent_enabled`.
-        let accent = match window.current.clone() {
-            Some(current) => window.start_accent_compute(current),
-            None => Task::none(),
-        };
+        let accent = window.accent_compute_for_current();
         (window, Task::batch([timer, shuffle, thumbnails, accent]))
     }
 
@@ -1288,11 +1366,25 @@ impl cosmic::Application for Window {
                 // arrive raw — normalize like `AppletConfig::load` does,
                 // so a hand-edited retention outside the dropdown's
                 // choices never drives prune/fetch.
-                let config = config.normalize();
+                let mut config = config.normalize();
                 let shuffle_changed = config.shuffle_enabled != self.config.shuffle_enabled
                     || config.shuffle_interval_secs != self.config.shuffle_interval_secs;
                 let retention_reduced =
                     schedule::retention_reduced(self.config.retention_days, config.retention_days);
+                // An external flip of `accent_enabled` must run the same
+                // lifecycle as the popup toggler — snapshot + compute on
+                // enable, restore + clear on disable — not silently adopt
+                // the flag (which would orphan the snapshot on disable and
+                // never snapshot on enable). Adopt everything *except* the
+                // accent fields, then route the flip through the toggle
+                // path, which persists the resulting accent state itself.
+                let accent_flip = (config.accent_enabled != self.config.accent_enabled)
+                    .then_some(config.accent_enabled);
+                if accent_flip.is_some() {
+                    config.accent_enabled = self.config.accent_enabled;
+                    config.accent_snapshot = self.config.accent_snapshot;
+                    config.accent_last_written = self.config.accent_last_written;
+                }
                 self.config = config;
                 let mut tasks = Vec::new();
                 if retention_reduced {
@@ -1300,6 +1392,9 @@ impl cosmic::Application for Window {
                 }
                 if shuffle_changed {
                     tasks.push(self.sync_shuffle(true));
+                }
+                if let Some(enabled) = accent_flip {
+                    tasks.push(self.set_accent_enabled(enabled));
                 }
                 if !tasks.is_empty() {
                     return Task::batch(tasks);
@@ -1418,7 +1513,15 @@ impl cosmic::Application for Window {
             Message::RefreshFinished(result) => return self.finish_refresh(result),
             // Returning to the message loop re-renders the popup, so a
             // preview generated while it was open shows up by itself.
-            Message::ThumbnailsReady => self.finish_thumbnail_pass(state_dir()),
+            Message::ThumbnailsReady => {
+                self.finish_thumbnail_pass(state_dir());
+                // The startup (or enable-time) accent compute may have found
+                // a cold cache and dropped its answer; the pass that just
+                // ended is what writes those thumbnails, so this is the
+                // moment a retry can succeed. Free when disabled or already
+                // answered (a cached decode plus the steady-state Skip).
+                return self.accent_compute_for_current();
+            }
         }
         Task::none()
     }
@@ -2913,14 +3016,84 @@ mod tests {
         (*DARK_PALETTE).as_ref()
     }
 
-    /// A window with the accent feature on and sandboxed theme handles.
+    /// A window with the accent feature on, sandboxed theme handles, and a
+    /// real (TempDir-rooted) applet-config context — enabling refuses a
+    /// memory-only config, and "persisted" assertions can mean on-disk.
     fn accent_window(dir: &tempfile::TempDir) -> Window {
+        use cosmic_config::CosmicConfigEntry as _;
+
         let mut window = Window {
             accent_handles: Some(accent::ThemeHandles::sandboxed(dir.path()).unwrap()),
+            config_context: Some(
+                cosmic_config::Config::with_custom_path(
+                    APP_ID,
+                    AppletConfig::VERSION,
+                    dir.path().join("applet-config"),
+                )
+                .unwrap(),
+            ),
             ..Window::default()
         };
         window.config.accent_enabled = true;
         window
+    }
+
+    /// The applet config as persisted in `window`'s TempDir-rooted context.
+    fn persisted_config(window: &Window) -> AppletConfig {
+        AppletConfig::load(window.config_context.as_ref().unwrap())
+    }
+
+    /// Make every directory under the sandboxed theme-config roots for the
+    /// given config ids read-only so accent writes into them fail; returns
+    /// the directories for [`restore_dir_permissions`] (TempDir cleanup
+    /// needs them writable).
+    fn read_only_config_dirs(dir: &tempfile::TempDir, ids: &[&str]) -> Vec<PathBuf> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fn dirs_under(dir: &Path, out: &mut Vec<PathBuf>) {
+            out.push(dir.to_path_buf());
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs_under(&path, out);
+                }
+            }
+        }
+        let mut dirs = Vec::new();
+        for id in ids {
+            dirs_under(&dir.path().join("cosmic").join(id), &mut dirs);
+        }
+        for dir in &dirs {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        dirs
+    }
+
+    /// All four theme configs (light/dark × builder/theme) read-only — the
+    /// all-or-nothing failure case.
+    fn read_only_theme_dirs(dir: &tempfile::TempDir) -> Vec<PathBuf> {
+        use cosmic::cosmic_theme::{
+            DARK_THEME_BUILDER_ID, DARK_THEME_ID, LIGHT_THEME_BUILDER_ID, LIGHT_THEME_ID,
+        };
+        read_only_config_dirs(
+            dir,
+            &[
+                LIGHT_THEME_BUILDER_ID,
+                DARK_THEME_BUILDER_ID,
+                LIGHT_THEME_ID,
+                DARK_THEME_ID,
+            ],
+        )
+    }
+
+    fn restore_dir_permissions(dirs: &[PathBuf]) {
+        use std::os::unix::fs::PermissionsExt as _;
+        for dir in dirs {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
 
     fn current_accents(window: &Window) -> accent::BuilderAccents {
@@ -2965,6 +3138,8 @@ mod tests {
                 dark: None,
             })
         );
+        // "Persisted" means on disk, not just the in-memory struct.
+        assert_eq!(persisted_config(&window), window.config);
     }
 
     #[test]
@@ -3001,8 +3176,10 @@ mod tests {
             light: [1, 2, 3],
             dark: [4, 5, 6],
         };
+        let handles = window.accent_handles.as_ref().unwrap();
         accent::write_accents(
-            window.accent_handles.as_ref().unwrap(),
+            handles,
+            accent::read_builders(handles),
             ours.light,
             ours.dark,
         )
@@ -3031,25 +3208,18 @@ mod tests {
         assert_eq!(window.config.accent_snapshot, None);
         assert_eq!(window.config.accent_last_written, None);
         assert_eq!(current_accents(&window), (picked.light, picked.dark));
+        // The disarm survives a restart: the cleared state is on disk.
+        assert_eq!(persisted_config(&window), window.config);
+        assert!(!persisted_config(&window).accent_enabled);
     }
 
     #[test]
     fn accent_toggle_snapshots_on_enable_and_restores_on_disable() {
         use cosmic::Application as _;
-        use cosmic_config::CosmicConfigEntry as _;
 
         let dir = tempfile::tempdir().unwrap();
         let mut window = accent_window(&dir);
         window.config.accent_enabled = false;
-        // A real (TempDir-rooted) config context, so "persisted state" below
-        // means the on-disk entry, not just the in-memory struct.
-        let ctx = cosmic_config::Config::with_custom_path(
-            APP_ID,
-            AppletConfig::VERSION,
-            dir.path().join("applet-config"),
-        )
-        .unwrap();
-        window.config_context = Some(ctx.clone());
 
         // The user's pre-feature accents: an explicit light one, dark on the
         // palette default — the mixed case a restore must reproduce exactly.
@@ -3086,7 +3256,7 @@ mod tests {
         assert_eq!(window.config.accent_snapshot, None);
         assert_eq!(window.config.accent_last_written, None);
         assert_eq!(current_accents(&window), (user.light, user.dark));
-        assert_eq!(AppletConfig::load(&ctx), window.config);
+        assert_eq!(persisted_config(&window), window.config);
     }
 
     #[test]
@@ -3104,6 +3274,399 @@ mod tests {
         assert_eq!(window.config.accent_snapshot, None);
     }
 
+    #[test]
+    fn enabling_without_a_config_context_refuses() {
+        use cosmic::Application as _;
+
+        // Theme handles exist, but the applet config cannot be persisted:
+        // the feature state would be memory-only while the written accents
+        // outlive the process — reversibility breaks on restart, so refuse.
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = accent_window(&dir);
+        window.config.accent_enabled = false;
+        window.config_context = None;
+
+        drop(window.update(Message::SetAccentEnabled(true)));
+
+        assert!(!window.config.accent_enabled);
+        assert_eq!(window.config.accent_snapshot, None);
+    }
+
+    #[test]
+    fn an_echoed_enable_does_not_resnapshot() {
+        use cosmic::Application as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = accent_window(&dir);
+        window.config.accent_enabled = false;
+
+        // The user's pre-feature accents, then enable + a landed write.
+        let user = AccentSnapshot {
+            light: Some([10, 20, 30]),
+            dark: Some([40, 50, 60]),
+        };
+        accent::restore_accents(window.accent_handles.as_ref().unwrap(), user).unwrap();
+        drop(window.update(Message::SetAccentEnabled(true)));
+        assert_eq!(window.config.accent_snapshot, Some(user));
+        let source = PathBuf::from("/imgs/20260808-Foo_ROW1_UHD.jpg");
+        window.current = Some(source.clone());
+        drop(window.update(Message::AccentComputed {
+            source,
+            hue: Some(200.0),
+        }));
+        assert_ne!(current_accents(&window), (user.light, user.dark));
+
+        // A repeated SetAccentEnabled(true) — an echo, not a flip — must not
+        // re-snapshot: the builders now hold *our* accents, and capturing
+        // them as the user's would make disable restore our own colours.
+        drop(window.update(Message::SetAccentEnabled(true)));
+        assert_eq!(window.config.accent_snapshot, Some(user));
+
+        // Disable still restores the true pre-feature accents.
+        drop(window.update(Message::SetAccentEnabled(false)));
+        assert_eq!(current_accents(&window), (user.light, user.dark));
+    }
+
+    #[test]
+    fn a_failed_accent_write_leaves_the_feature_armed_for_a_retry() {
+        use cosmic::Application as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = accent_window(&dir);
+        let source = PathBuf::from("/imgs/20260808-Foo_ROW1_UHD.jpg");
+        window.current = Some(source.clone());
+
+        let locked = read_only_theme_dirs(&dir);
+        drop(window.update(Message::AccentComputed {
+            source,
+            hue: Some(200.0),
+        }));
+        restore_dir_permissions(&locked);
+
+        // The write failed: nothing recorded as written (so the next
+        // recompute retries instead of skipping), the enable-time snapshot
+        // is retained, the feature stays enabled, and the theme configs are
+        // exactly as they were.
+        assert_eq!(window.config.accent_last_written, None);
+        assert_eq!(
+            window.config.accent_snapshot,
+            Some(AccentSnapshot {
+                light: None,
+                dark: None,
+            })
+        );
+        assert!(window.config.accent_enabled);
+        assert_eq!(current_accents(&window), (None, None));
+        assert_eq!(persisted_config(&window), window.config);
+    }
+
+    #[test]
+    fn a_partial_accent_write_rolls_back_and_stays_armed() {
+        use cosmic::Application as _;
+        use cosmic::cosmic_theme::{DARK_THEME_BUILDER_ID, DARK_THEME_ID};
+
+        // Light is written before dark: locking only the dark configs leaves
+        // the reachable half-way state — light landed, dark failed. The
+        // rollback must put the light mode back; a half-write left in place
+        // would read as user intervention to the next recompute's
+        // don't-clobber guard, which disarms and clears the snapshot without
+        // restoring — permanently destroying the user's pre-feature accent.
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = accent_window(&dir);
+        window.config.accent_enabled = false;
+
+        let user = AccentSnapshot {
+            light: Some([10, 20, 30]),
+            dark: Some([40, 50, 60]),
+        };
+        accent::restore_accents(window.accent_handles.as_ref().unwrap(), user).unwrap();
+        drop(window.update(Message::SetAccentEnabled(true)));
+
+        let source = PathBuf::from("/imgs/20260808-Foo_ROW1_UHD.jpg");
+        window.current = Some(source.clone());
+        let locked = read_only_config_dirs(&dir, &[DARK_THEME_BUILDER_ID, DARK_THEME_ID]);
+        drop(window.update(Message::AccentComputed {
+            source: source.clone(),
+            hue: Some(200.0),
+        }));
+        restore_dir_permissions(&locked);
+
+        // The feature stays enabled and armed for a retry, snapshot kept…
+        assert!(window.config.accent_enabled, "must not have disarmed");
+        assert_eq!(window.config.accent_snapshot, Some(user));
+        assert_eq!(window.config.accent_last_written, None);
+        assert_eq!(persisted_config(&window), window.config);
+        // …and the half-landed light accent was rolled back to the user's.
+        assert_eq!(current_accents(&window), (user.light, user.dark));
+
+        // "Armed" is real: the same recompute now lands on both modes.
+        drop(window.update(Message::AccentComputed {
+            source,
+            hue: Some(200.0),
+        }));
+        assert!(window.config.accent_enabled);
+        assert_eq!(
+            window.config.accent_last_written,
+            Some(expected_pair(Some(200.0)))
+        );
+        assert_eq!(window.config.accent_snapshot, Some(user));
+    }
+
+    #[test]
+    fn a_failed_disable_time_restore_still_clears_the_state() {
+        use cosmic::Application as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = accent_window(&dir);
+        window.config.accent_enabled = false;
+
+        // Enable over explicit user accents, land a write.
+        let user = AccentSnapshot {
+            light: Some([10, 20, 30]),
+            dark: Some([40, 50, 60]),
+        };
+        accent::restore_accents(window.accent_handles.as_ref().unwrap(), user).unwrap();
+        drop(window.update(Message::SetAccentEnabled(true)));
+        let source = PathBuf::from("/imgs/20260808-Foo_ROW1_UHD.jpg");
+        window.current = Some(source.clone());
+        drop(window.update(Message::AccentComputed {
+            source,
+            hue: Some(200.0),
+        }));
+        let ours = current_accents(&window);
+        assert_ne!(ours, (user.light, user.dark));
+
+        // Disable while the theme configs are unwritable: the restore fails,
+        // but the feature still ends — cleared state, off — because nothing
+        // would ever retry the restore. The accents stay ours on disk.
+        let locked = read_only_theme_dirs(&dir);
+        drop(window.update(Message::SetAccentEnabled(false)));
+        restore_dir_permissions(&locked);
+
+        assert!(!window.config.accent_enabled);
+        assert_eq!(window.config.accent_snapshot, None);
+        assert_eq!(window.config.accent_last_written, None);
+        assert_eq!(current_accents(&window), ours);
+    }
+
+    #[test]
+    fn disabling_without_theme_handles_keeps_the_snapshot() {
+        use cosmic::Application as _;
+
+        // The config says enabled (from a previous run) but the theme
+        // configs failed to open this run: disabling cannot restore, so it
+        // must keep the snapshot — the only record of the user's pre-feature
+        // accents — rather than silently discarding it.
+        let mut window = Window::default();
+        window.config.accent_enabled = true;
+        let user = AccentSnapshot {
+            light: Some([10, 20, 30]),
+            dark: None,
+        };
+        window.config.accent_snapshot = Some(user);
+        window.config.accent_last_written = Some(AccentPair {
+            light: [1, 2, 3],
+            dark: [4, 5, 6],
+        });
+        assert!(window.accent_handles.is_none());
+
+        drop(window.update(Message::SetAccentEnabled(false)));
+
+        assert!(!window.config.accent_enabled);
+        assert_eq!(window.config.accent_snapshot, Some(user), "snapshot kept");
+        assert_eq!(window.config.accent_last_written, None);
+    }
+
+    #[test]
+    fn enable_after_a_kept_snapshot_restores_it_instead_of_resnapshotting() {
+        use cosmic::Application as _;
+
+        // Run A: the feature wrote accents. Run B: the theme configs failed
+        // to open, so disabling kept the snapshot (deferred restore) while
+        // *our* accents stayed on disk. Run C (healthy): enable must not
+        // re-capture the on-disk accents — they are ours from run A, and
+        // snapshotting them would clobber the only record of the user's
+        // pre-feature accents, making a later disable "restore" our own
+        // colours. It honours the deferred restore and keeps the snapshot.
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = accent_window(&dir);
+        window.config.accent_enabled = false;
+        let source = PathBuf::from("/imgs/20260808-Foo_ROW1_UHD.jpg");
+        window.current = Some(source.clone());
+
+        let user = AccentSnapshot {
+            light: Some([10, 20, 30]),
+            dark: Some([40, 50, 60]),
+        };
+        accent::restore_accents(window.accent_handles.as_ref().unwrap(), user).unwrap();
+
+        // Run A: enable + a landed write.
+        drop(window.update(Message::SetAccentEnabled(true)));
+        drop(window.update(Message::AccentComputed {
+            source: source.clone(),
+            hue: Some(200.0),
+        }));
+        let ours = current_accents(&window);
+        assert_ne!(ours, (user.light, user.dark));
+
+        // Run B: theme handles unavailable; disable keeps the snapshot.
+        window.accent_handles = None;
+        drop(window.update(Message::SetAccentEnabled(false)));
+        assert_eq!(window.config.accent_snapshot, Some(user), "snapshot kept");
+
+        // Run C: the theme configs open again; our accents are still on disk.
+        window.accent_handles = Some(accent::ThemeHandles::sandboxed(dir.path()).unwrap());
+        assert_eq!(current_accents(&window), ours);
+
+        drop(window.update(Message::SetAccentEnabled(true)));
+        // The kept snapshot survives (not clobbered by our on-disk accents)…
+        assert_eq!(window.config.accent_snapshot, Some(user));
+        assert_eq!(window.config.accent_last_written, None);
+        // …and the deferred restore reconciled the disk, so the next
+        // recompute's guard sees the snapshot, not a foreign accent.
+        assert_eq!(current_accents(&window), (user.light, user.dark));
+
+        // The feature works — a compute lands without disarming…
+        drop(window.update(Message::AccentComputed {
+            source,
+            hue: Some(30.0),
+        }));
+        assert!(window.config.accent_enabled, "must not have disarmed");
+        assert_ne!(current_accents(&window), (user.light, user.dark));
+
+        // …and disable restores the true pre-feature accents, not run A's.
+        drop(window.update(Message::SetAccentEnabled(false)));
+        assert_eq!(current_accents(&window), (user.light, user.dark));
+        assert_eq!(window.config.accent_snapshot, None);
+    }
+
+    #[test]
+    fn enable_with_a_kept_snapshot_refuses_when_the_restore_fails() {
+        use cosmic::Application as _;
+
+        // A kept snapshot means the disk may still hold our accents from an
+        // earlier run; enabling without reconciling would let the next
+        // recompute's guard disarm and destroy the snapshot. So when the
+        // deferred restore fails, the enable must refuse — off, snapshot
+        // kept, nothing armed.
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = accent_window(&dir);
+        window.config.accent_enabled = false;
+        let user = AccentSnapshot {
+            light: Some([10, 20, 30]),
+            dark: None,
+        };
+        window.config.accent_snapshot = Some(user);
+
+        let locked = read_only_theme_dirs(&dir);
+        drop(window.update(Message::SetAccentEnabled(true)));
+        restore_dir_permissions(&locked);
+
+        assert!(!window.config.accent_enabled);
+        assert_eq!(window.config.accent_snapshot, Some(user), "snapshot kept");
+        assert_eq!(window.config.accent_last_written, None);
+    }
+
+    #[test]
+    fn config_updated_accent_flips_run_the_toggle_lifecycle() {
+        use cosmic::Application as _;
+
+        // External edits of `accent_enabled` (RON file, another tool) arrive
+        // via ConfigUpdated and must behave exactly like the popup toggler —
+        // not silently adopt the flag.
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = accent_window(&dir);
+        window.config.accent_enabled = false;
+
+        let user = AccentSnapshot {
+            light: Some([10, 20, 30]),
+            dark: Some([40, 50, 60]),
+        };
+        accent::restore_accents(window.accent_handles.as_ref().unwrap(), user).unwrap();
+
+        // External enable: snapshot taken from the live accents.
+        let mut external = window.config.clone();
+        external.accent_enabled = true;
+        drop(window.update(Message::ConfigUpdated(external)));
+        assert!(window.config.accent_enabled);
+        assert_eq!(window.config.accent_snapshot, Some(user));
+        assert_eq!(window.config.accent_last_written, None);
+
+        // A write lands.
+        let source = PathBuf::from("/imgs/20260808-Foo_ROW1_UHD.jpg");
+        window.current = Some(source.clone());
+        drop(window.update(Message::AccentComputed {
+            source,
+            hue: Some(200.0),
+        }));
+        assert_ne!(current_accents(&window), (user.light, user.dark));
+
+        // External disable: the snapshot is restored and the state cleared,
+        // exactly like the toggler's off path.
+        let mut external = window.config.clone();
+        external.accent_enabled = false;
+        drop(window.update(Message::ConfigUpdated(external)));
+        assert!(!window.config.accent_enabled);
+        assert_eq!(window.config.accent_snapshot, None);
+        assert_eq!(window.config.accent_last_written, None);
+        assert_eq!(current_accents(&window), (user.light, user.dark));
+    }
+
+    #[test]
+    fn re_enable_re_snapshots_so_disable_restores_the_later_accents() {
+        use cosmic::Application as _;
+
+        // enable → manual change → disarm → re-enable → disable must end on
+        // the accents from *re-enable time*, not the pre-feature originals —
+        // the re-snapshot rule, driven through the real executor.
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = accent_window(&dir);
+        window.config.accent_enabled = false;
+        let source = PathBuf::from("/imgs/20260808-Foo_ROW1_UHD.jpg");
+        window.current = Some(source.clone());
+
+        let original = AccentSnapshot {
+            light: Some([10, 20, 30]),
+            dark: Some([40, 50, 60]),
+        };
+        accent::restore_accents(window.accent_handles.as_ref().unwrap(), original).unwrap();
+
+        // Enable + first write.
+        drop(window.update(Message::SetAccentEnabled(true)));
+        assert_eq!(window.config.accent_snapshot, Some(original));
+        drop(window.update(Message::AccentComputed {
+            source: source.clone(),
+            hue: Some(200.0),
+        }));
+
+        // The user picks new accents in Settings; the next recompute disarms
+        // without restoring.
+        let manual = AccentSnapshot {
+            light: Some([90, 90, 0]),
+            dark: Some([0, 90, 90]),
+        };
+        accent::restore_accents(window.accent_handles.as_ref().unwrap(), manual).unwrap();
+        drop(window.update(Message::AccentComputed {
+            source: source.clone(),
+            hue: Some(200.0),
+        }));
+        assert!(!window.config.accent_enabled);
+        assert_eq!(current_accents(&window), (manual.light, manual.dark));
+
+        // Re-enable snapshots *now* — the manual accents — and a write lands.
+        drop(window.update(Message::SetAccentEnabled(true)));
+        assert_eq!(window.config.accent_snapshot, Some(manual));
+        drop(window.update(Message::AccentComputed {
+            source,
+            hue: Some(30.0),
+        }));
+
+        // Disable restores what re-enable captured, not the originals.
+        drop(window.update(Message::SetAccentEnabled(false)));
+        assert_eq!(current_accents(&window), (manual.light, manual.dark));
+        assert_ne!(current_accents(&window), (original.light, original.dark));
+    }
+
     #[tokio::test]
     async fn accent_extraction_reads_only_the_cached_thumbnail() {
         let dir = tempfile::tempdir().unwrap();
@@ -3115,6 +3678,22 @@ mod tests {
         // No thumbnail cached: nothing to act on (and no `ensure_thumbnail`
         // in disguise — there is no source file to decode either).
         assert_eq!(extract_accent_hue(&source, &state).await, None);
+
+        // The discriminating case for the never-`ensure_thumbnail` rule: a
+        // perfectly decodable source whose thumbnail is simply not cached
+        // yet. A regression to `ensure_thumbnail` would generate the
+        // thumbnail and answer `Some`; the contract is `None`, cache
+        // untouched.
+        let fresh = images.join("20260806-Fresh_ROW1_UHD.jpg");
+        image::RgbImage::from_pixel(64, 36, image::Rgb([40, 180, 60]))
+            .save(&fresh)
+            .unwrap();
+        assert_eq!(extract_accent_hue(&fresh, &state).await, None);
+        assert!(
+            !thumbs::is_cached(&fresh, &state),
+            "extraction must not have generated the thumbnail"
+        );
+        assert!(!thumbs::thumbnail_path(&fresh, &state).unwrap().exists());
 
         // A recorded decode failure: still nothing to act on, for free.
         std::fs::write(&source, b"not actually a jpeg").unwrap();
@@ -3146,6 +3725,17 @@ mod tests {
             diff.min(360.0 - diff) <= 10.0,
             "hue {hue} too far from the source colour's {reference}"
         );
+
+        // A cache slot that *says* cached while the thumbnail bytes are
+        // ruined (sidecar stamps the source, not the thumb): the decode
+        // fails and the answer is the outer `None` — a failure, not grey.
+        let thumb = thumbs::thumbnail_path(&source, &state).unwrap();
+        std::fs::write(&thumb, b"ruined bytes").unwrap();
+        assert!(
+            thumbs::is_cached(&source, &state),
+            "the slot must still read as cached for this to hit the decode branch"
+        );
+        assert_eq!(extract_accent_hue(&source, &state).await, None);
 
         // An effectively grey wallpaper is a real answer (`Some(None)`), not
         // a failure — the plan writes the palette's warm grey for it.

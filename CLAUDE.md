@@ -81,7 +81,9 @@ the pinned rev before coding against remembered names.
   the catalogue at `RefreshFinished`, so an unconditional sweep deletes what
   the in-flight pass just wrote. Every pass ends in a sweep of its own.
 - `src/view.rs` — popup UI (thumbnail, title/copyright, About link, prev/next/
-  newest/refresh controls, shuffle + retention rows, status footer) plus the pure
+  newest/refresh controls, shuffle + accent + retention rows, status footer —
+  the accent toggler also renders in the empty-catalogue branch, so a modified
+  theme can be switched off with no images) plus the pure
   display helpers (`displayed`/`prev_target`/`next_target`/`newest_target`,
   `format_updated`, dropdown index↔value mappings) which *are* unit-tested; iced
   view code itself is exempt from tests.
@@ -164,16 +166,38 @@ the pinned rev before coding against remembered names.
   - **Don't-clobber / disarm**: before each write, current builder accents are
     compared to `accent_last_written` in exact `[u8; 3]` space (we quantise,
     write the `u8/255` f32 via `set_accent` — exact-f32 RON round-trip — and
-    persist the same array); any mismatch means the user intervened →
+    persist the same array); before the first successful write the enable-time
+    snapshot stands in for `last_written` (so a user pick after a transient
+    write failure still counts); any mismatch means the user intervened →
     **Disarm**: flip the toggle off through the config setter, clear snapshot
-    + last-written, **no restore** — the user's manual choice stands.
-  - **Snapshot lifecycle**: enable always re-snapshots the *live* accents
-    (even over a stale snapshot) and clears any stale last-written; disable
-    restores the snapshot verbatim — including `None` = palette default — then
-    clears both.
+    + last-written, **no restore** — the user's manual choice stands. When the
+    computed pair *equals* `last_written` the plan returns **Skip** — disk is
+    provably right, and rewriting would fire theme-change notifications into
+    every COSMIC app on each startup reconciliation / same-hue apply. A failed
+    `write_accents` **rolls back** whatever (possibly) landed to the accents
+    the plan compared, per mode, best-effort — a half-write left on disk
+    (light lands before dark; a builder key can land without its theme) is
+    *our* colour, which the guard cannot tell from user intervention: it would
+    Disarm and destroy the snapshot without restoring.
+  - **Snapshot lifecycle**: enable snapshots the *live* accents (disable and
+    disarm clear the snapshot, so a normal re-enable re-snapshots) and clears
+    any stale last-written — **unless** a snapshot survived a disable that
+    couldn't restore: that one is the only record of the user's pre-feature
+    accents while the disk may still hold ours, so enable restores it (the
+    deferred restore) and keeps it, refusing to arm if that restore fails.
+    Disable restores the snapshot verbatim — including `None` = palette
+    default — then clears both. Enable *refuses* without theme handles or a
+    persistable applet config (memory-only state breaks restart
+    reversibility); disable without handles keeps the snapshot (it cannot
+    restore, so it must not destroy the only way back). External
+    `accent_enabled` flips arriving via `ConfigUpdated` route through the same
+    toggle path, never adopt the flag silently.
   - Recompute runs on every successful apply (`app.rs`'s `on_apply_success`,
-    all three runtime paths) *and* as a startup reconciliation from `init`
-    (startup does not pass through `on_apply_success`). Extraction is async
+    all three runtime paths), as a startup reconciliation from `init`
+    (startup does not pass through `on_apply_success`), and again at
+    `ThumbnailsReady` — the startup compute can land before its thumbnail is
+    cached, and the pass ending is what makes a retry able to succeed (the
+    steady-state Skip makes the repeat free). Extraction is async
     with the source path as staleness guard, decodes only `thumbs::is_cached`
     slots (never `ensure_thumbnail` here — a `Failed` slot would re-decode the
     full UHD file on every apply), and every failure path (missing/failed
