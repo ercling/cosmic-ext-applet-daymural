@@ -19,12 +19,17 @@
 // then nothing outside the tests calls into this module.
 #![allow(dead_code)]
 
-use cosmic::cosmic_theme::CosmicPaletteInner;
+use cosmic::cosmic_config::{self, Config, ConfigGet, CosmicConfigEntry};
 use cosmic::cosmic_theme::palette::{
     IntoColor, IsWithinBounds, Oklch, Srgb, color_difference::Wcag21RelativeContrast,
     convert::IntoColorUnclamped,
 };
+use cosmic::cosmic_theme::{
+    CosmicPalette, CosmicPaletteInner, DARK_THEME_BUILDER_ID, DARK_THEME_ID,
+    LIGHT_THEME_BUILDER_ID, LIGHT_THEME_ID, Theme, ThemeBuilder,
+};
 use image::RgbImage;
+use serde::{Deserialize, Serialize};
 
 /// Hue histogram resolution: 36 buckets of 10°.
 const HUE_BUCKETS: usize = 36;
@@ -242,6 +247,203 @@ fn srgb_at_tone(l: f32, chroma: f32, hue: f32) -> Srgb {
         }
     }
     best
+}
+
+// ---- persisted colour types -------------------------------------------------
+//
+// All colours that `config.rs` persists (and that the don't-clobber rule
+// compares) live in 8-bit `[u8; 3]` space: it keeps `Eq` on `AppletConfig`
+// and makes every comparison exact — no float epsilon anywhere. The bridge to
+// the f32 `Srgb` cosmic-theme wants is quantise-then-convert: the f32 we write
+// is exactly `u8 / 255`, so a later read-back re-quantises to the same bytes.
+
+/// One accent per mode, as last written by us — persisted so the
+/// don't-clobber comparison survives applet restarts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccentPair {
+    pub light: [u8; 3],
+    pub dark: [u8; 3],
+}
+
+/// The user's accents captured at enable time, restored verbatim on disable.
+/// An inner `None` means "the user had the palette default" (builder `accent`
+/// key unset) — restoring must write that `None` back, not skip the mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccentSnapshot {
+    pub light: Option<[u8; 3]>,
+    pub dark: Option<[u8; 3]>,
+}
+
+/// Quantise a computed accent into the persisted/compared 8-bit space.
+pub fn quantize(srgb: Srgb) -> [u8; 3] {
+    let q = srgb.into_format::<u8>();
+    [q.red, q.green, q.blue]
+}
+
+/// The exact f32 colour written for a persisted 8-bit one: each channel is
+/// precisely `u8 / 255`, so `quantize(unquantize(x)) == x` by construction —
+/// that identity is what makes the don't-clobber comparison exact.
+pub fn unquantize(rgb: [u8; 3]) -> Srgb {
+    Srgb::new(
+        f32::from(rgb[0]) / 255.0,
+        f32::from(rgb[1]) / 255.0,
+        f32::from(rgb[2]) / 255.0,
+    )
+}
+
+// ---- theme writer -----------------------------------------------------------
+
+/// The two theme modes COSMIC keeps side by side; both are written on every
+/// accent change so a light/dark flip needs no work from us.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Light,
+    Dark,
+}
+
+/// The four cosmic-config handles the accent writer touches (light/dark ×
+/// builder/theme). Built once against the real per-user configs in
+/// production; tests root all four in a `TempDir`.
+#[derive(Debug)]
+pub struct ThemeHandles {
+    light_builder: Config,
+    dark_builder: Config,
+    light_theme: Config,
+    dark_theme: Config,
+}
+
+impl ThemeHandles {
+    /// Handles on the user's real COSMIC theme configs.
+    pub fn system() -> Result<Self, cosmic_config::Error> {
+        Ok(Self {
+            light_builder: Config::new(LIGHT_THEME_BUILDER_ID, ThemeBuilder::VERSION)?,
+            dark_builder: Config::new(DARK_THEME_BUILDER_ID, ThemeBuilder::VERSION)?,
+            light_theme: Config::new(LIGHT_THEME_ID, Theme::VERSION)?,
+            dark_theme: Config::new(DARK_THEME_ID, Theme::VERSION)?,
+        })
+    }
+
+    /// Handles rooted in `root` via `Config::with_custom_path` — tests never
+    /// touch the real user config. Note the different read path: a custom
+    /// path has `system_path: None`, so absent keys yield `NoConfigDirectory`
+    /// rather than a `/usr/share/cosmic` default.
+    #[cfg(test)]
+    pub fn sandboxed(root: &std::path::Path) -> Result<Self, cosmic_config::Error> {
+        let root = root.to_path_buf();
+        Ok(Self {
+            light_builder: Config::with_custom_path(
+                LIGHT_THEME_BUILDER_ID,
+                ThemeBuilder::VERSION,
+                root.clone(),
+            )?,
+            dark_builder: Config::with_custom_path(
+                DARK_THEME_BUILDER_ID,
+                ThemeBuilder::VERSION,
+                root.clone(),
+            )?,
+            light_theme: Config::with_custom_path(LIGHT_THEME_ID, Theme::VERSION, root.clone())?,
+            dark_theme: Config::with_custom_path(DARK_THEME_ID, Theme::VERSION, root)?,
+        })
+    }
+
+    fn builder_cfg(&self, mode: Mode) -> &Config {
+        match mode {
+            Mode::Light => &self.light_builder,
+            Mode::Dark => &self.dark_builder,
+        }
+    }
+
+    fn theme_cfg(&self, mode: Mode) -> &Config {
+        match mode {
+            Mode::Light => &self.light_theme,
+            Mode::Dark => &self.dark_theme,
+        }
+    }
+
+    /// Read `mode`'s `ThemeBuilder`, accepting the partial on `Err` (per-key
+    /// degradation, like `AppletConfig::load`) — then **re-probe the `palette`
+    /// key directly** and substitute the mode's own default on failure.
+    ///
+    /// The probe is not optional: `get_entry` starts from `Self::default()` —
+    /// the **dark** palette — and silently skips `NoConfigDirectory` errors,
+    /// so a light builder whose `palette` key is absent (the normal state:
+    /// nothing pins it user-locally) comes back with the dark palette on the
+    /// *Ok* path. Trusting it would give light mode dark-tuned tones and, on
+    /// our theme write, flip the light theme dark wholesale.
+    pub fn read_builder(&self, mode: Mode) -> ThemeBuilder {
+        let cfg = self.builder_cfg(mode);
+        let mut builder = match ThemeBuilder::get_entry(cfg) {
+            Ok(builder) => builder,
+            Err((errors, partial)) => {
+                for error in errors.iter().filter(|error| error.is_err()) {
+                    tracing::warn!(
+                        ?mode,
+                        "invalid theme-builder entry (using default): {error}"
+                    );
+                }
+                partial
+            }
+        };
+        builder.palette =
+            ConfigGet::get::<CosmicPalette>(cfg, "palette").unwrap_or_else(|_| match mode {
+                Mode::Light => ThemeBuilder::light().palette,
+                Mode::Dark => ThemeBuilder::dark().palette,
+            });
+        builder
+    }
+}
+
+/// Each builder's current accent override, quantised into the 8-bit space the
+/// don't-clobber comparison happens in. `None` = palette default (key unset).
+pub fn read_current_accents(handles: &ThemeHandles) -> (Option<[u8; 3]>, Option<[u8; 3]>) {
+    (
+        handles.read_builder(Mode::Light).accent.map(quantize),
+        handles.read_builder(Mode::Dark).accent.map(quantize),
+    )
+}
+
+/// Write the computed accents to both modes. Failure leaves whatever half
+/// completed on disk consistent per mode (builder and theme are written
+/// together per mode); callers treat any `Err` as "log and change nothing
+/// else" per the plan's failure rule.
+pub fn write_accents(
+    handles: &ThemeHandles,
+    light: [u8; 3],
+    dark: [u8; 3],
+) -> Result<(), cosmic_config::Error> {
+    write_mode_accent(handles, Mode::Light, Some(unquantize(light)))?;
+    write_mode_accent(handles, Mode::Dark, Some(unquantize(dark)))
+}
+
+/// Restore a snapshot verbatim — including an inner `None`, which writes the
+/// "palette default" state back (builder accent unset) rather than skipping.
+pub fn restore_accents(
+    handles: &ThemeHandles,
+    snapshot: AccentSnapshot,
+) -> Result<(), cosmic_config::Error> {
+    write_mode_accent(handles, Mode::Light, snapshot.light.map(unquantize))?;
+    write_mode_accent(handles, Mode::Dark, snapshot.dark.map(unquantize))
+}
+
+/// One mode's write, per the recipe that supersedes notes §2:
+///
+/// 1. `set_accent` — the derive's generated **single-key setter**: only the
+///    `accent` key lands on disk, nothing else gets pinned user-locally
+///    (`write_entry` on the builder would materialise *every* key and cut the
+///    user off from future COSMIC default changes). The setter serialises the
+///    bare `Option<Srgb>` — exact-f32 RON, so our quantise-then-convert value
+///    round-trips bit-exactly.
+/// 2. `build().write_entry` — the derived `Theme` *is* a full-entry write;
+///    that matches upstream (cosmic-settings does the same) and both writes
+///    are required: nothing on the system rebuilds the theme from the builder.
+fn write_mode_accent(
+    handles: &ThemeHandles,
+    mode: Mode,
+    accent: Option<Srgb>,
+) -> Result<(), cosmic_config::Error> {
+    let mut builder = handles.read_builder(mode);
+    builder.set_accent(handles.builder_cfg(mode), accent)?;
+    builder.build().write_entry(handles.theme_cfg(mode))
 }
 
 #[cfg(test)]
@@ -597,5 +799,180 @@ mod tests {
                 "h={hue}: mid-luminance tone must fall back to warm grey"
             );
         }
+    }
+
+    // ---- theme writer + persisted colour types ----------------------------
+
+    use cosmic::cosmic_theme::Component;
+
+    /// The derived theme's accent, read back from the theme config's own
+    /// `accent` key (a `Component`), quantised to 8-bit. Reading the raw key
+    /// rather than `Theme::get_entry` keeps the test off `Theme::default()`,
+    /// which probes the real user's theme-mode config.
+    fn theme_accent(handles: &ThemeHandles, mode: Mode) -> [u8; 3] {
+        let component: Component = ConfigGet::get(handles.theme_cfg(mode), "accent")
+            .expect("derived theme must have an accent component on disk");
+        let base = component.base.into_format::<u8, u8>();
+        assert_eq!(base.alpha, 255, "accent must be opaque");
+        [base.red, base.green, base.blue]
+    }
+
+    #[test]
+    fn quantize_unquantize_is_exact_for_every_channel_value() {
+        // The don't-clobber comparison is exact only if the f32 we write
+        // re-quantises to the same bytes — for every possible channel value.
+        for v in 0..=255u8 {
+            let rgb = [v, 255 - v, v.wrapping_mul(37)];
+            assert_eq!(quantize(unquantize(rgb)), rgb, "{rgb:?}");
+        }
+    }
+
+    #[test]
+    fn write_accents_roundtrips_exactly_through_the_ron_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let handles = ThemeHandles::sandboxed(dir.path()).unwrap();
+
+        // Channel values whose /255 quotients are not exactly representable
+        // powers of two — the case a lossy write path would corrupt.
+        let light = [7, 133, 217];
+        let dark = [250, 41, 90];
+        write_accents(&handles, light, dark).expect("write accents");
+
+        // Builder accents read back to the exact same bytes…
+        assert_eq!(
+            read_current_accents(&handles),
+            (Some(light), Some(dark)),
+            "builder accent must round-trip exactly"
+        );
+        // …and each derived theme was rebuilt with that accent as its base.
+        assert_eq!(theme_accent(&handles, Mode::Light), light);
+        assert_eq!(theme_accent(&handles, Mode::Dark), dark);
+        // The derived themes keep their modes (regression guard against the
+        // dark-default palette leak flipping the light theme dark).
+        let light_is_dark: bool =
+            ConfigGet::get(handles.theme_cfg(Mode::Light), "is_dark").unwrap();
+        let dark_is_dark: bool = ConfigGet::get(handles.theme_cfg(Mode::Dark), "is_dark").unwrap();
+        assert!(!light_is_dark);
+        assert!(dark_is_dark);
+    }
+
+    #[test]
+    fn restore_accents_restores_some_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let handles = ThemeHandles::sandboxed(dir.path()).unwrap();
+
+        // The user had explicit accents; we overwrote them; disable restores.
+        let user = AccentSnapshot {
+            light: Some([10, 20, 30]),
+            dark: Some([200, 100, 50]),
+        };
+        restore_accents(&handles, user).expect("seed the user's accents");
+        write_accents(&handles, [1, 2, 3], [4, 5, 6]).expect("our overwrite");
+        assert_eq!(
+            read_current_accents(&handles),
+            (Some([1, 2, 3]), Some([4, 5, 6]))
+        );
+
+        restore_accents(&handles, user).expect("restore");
+        assert_eq!(read_current_accents(&handles), (user.light, user.dark));
+        assert_eq!(theme_accent(&handles, Mode::Light), [10, 20, 30]);
+        assert_eq!(theme_accent(&handles, Mode::Dark), [200, 100, 50]);
+    }
+
+    #[test]
+    fn restore_accents_restores_the_palette_default_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let handles = ThemeHandles::sandboxed(dir.path()).unwrap();
+
+        write_accents(&handles, [1, 2, 3], [4, 5, 6]).expect("our overwrite");
+
+        // Inner `None` = "user had the palette default": the restore must
+        // write that state back (unset the override), not skip the mode.
+        let snapshot = AccentSnapshot {
+            light: None,
+            dark: None,
+        };
+        restore_accents(&handles, snapshot).expect("restore to default");
+        assert_eq!(read_current_accents(&handles), (None, None));
+
+        // The rebuilt themes fall back to each palette's own default accent
+        // (`accent_blue` — theme.rs's build() None branch).
+        assert_eq!(
+            theme_accent(&handles, Mode::Light),
+            quantize(light_palette().accent_blue.color)
+        );
+        assert_eq!(
+            theme_accent(&handles, Mode::Dark),
+            quantize(dark_palette().accent_blue.color)
+        );
+    }
+
+    #[test]
+    fn light_builder_with_absent_palette_key_gets_the_light_palette() {
+        // The dark-default-leak regression test: `get_entry` starts from
+        // `Self::default()` (the DARK palette) and silently skips absent
+        // keys, so without the explicit probe a light builder read would
+        // come back dark on the Ok path.
+        let dir = tempfile::tempdir().unwrap();
+        let handles = ThemeHandles::sandboxed(dir.path()).unwrap();
+
+        let builder = handles.read_builder(Mode::Light);
+        assert!(
+            matches!(builder.palette, CosmicPalette::Light(_)),
+            "light builder must carry the Light palette variant"
+        );
+        assert_eq!(builder.palette.as_ref(), light_palette());
+
+        // …and the built theme is a light theme through and through.
+        let theme = builder.build();
+        assert!(!theme.is_dark);
+        assert_eq!(&theme.palette, light_palette());
+
+        // The dark builder keeps its own mode too.
+        let builder = handles.read_builder(Mode::Dark);
+        assert!(matches!(builder.palette, CosmicPalette::Dark(_)));
+        assert_eq!(builder.palette.as_ref(), dark_palette());
+    }
+
+    #[test]
+    fn builder_write_touches_only_the_accent_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let handles = ThemeHandles::sandboxed(dir.path()).unwrap();
+
+        write_accents(&handles, [7, 133, 217], [250, 41, 90]).expect("write accents");
+
+        // `set_accent` is a single-key write: pinning any other builder key
+        // user-locally would cut the user off from future COSMIC default
+        // changes (a full `write_entry` materialises every key).
+        for id in [LIGHT_THEME_BUILDER_ID, DARK_THEME_BUILDER_ID] {
+            let keys = key_files_under(&dir.path().join("cosmic").join(id));
+            assert_eq!(
+                keys,
+                vec!["accent".to_string()],
+                "{id}: builder must contain only the accent key"
+            );
+        }
+    }
+
+    /// Every key *file* under a config root (recursively), sorted by name —
+    /// the version directories themselves don't count.
+    fn key_files_under(root: &std::path::Path) -> Vec<String> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else {
+                    out.push(path.file_name().unwrap().to_string_lossy().into_owned());
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, &mut out);
+        out.sort();
+        out
     }
 }

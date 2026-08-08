@@ -335,28 +335,28 @@ Types live in `src/accent.rs`; all colours are `[u8; 3]` (keeps `Eq` on
 **Files:**
 - Modify: `src/accent.rs`
 
-- [ ] define the persisted types `AccentPair` / `AccentSnapshot` (`[u8; 3]`
+- [x] define the persisted types `AccentPair` / `AccentSnapshot` (`[u8; 3]`
       colours, serde + `Eq`), plus `[u8; 3]` ↔ `Srgb` conversion helpers
       (quantise-then-convert so the written f32 is exactly `u8/255`)
-- [ ] `ThemeHandles` struct bundling the four `Config`s (light/dark ×
+- [x] `ThemeHandles` struct bundling the four `Config`s (light/dark ×
       builder/theme), with a `::system()` constructor and a test constructor
       rooting all four in a `TempDir` via `Config::with_custom_path`
-- [ ] `read_builder(mode)` per the Theme-write recipe: `get_entry` accepting
+- [x] `read_builder(mode)` per the Theme-write recipe: `get_entry` accepting
       the partial, then **probe the `palette` key directly and substitute the
       mode default on failure** (never `ThemeBuilder::default()`);
       `read_current_accents(&ThemeHandles) -> (Option<[u8; 3]>, Option<[u8; 3]>)`
-- [ ] `write_accents(&ThemeHandles, light, dark)` — **`set_accent` single-key
+- [x] `write_accents(&ThemeHandles, light, dark)` — **`set_accent` single-key
       write** on each builder + `.build().write_entry` on each derived theme;
       `restore_accents(&ThemeHandles, snapshot)` writing `Option<Srgb>` back
       verbatim (including `None`) the same way
-- [ ] write tests in a `TempDir`: write → read-back of builder accent and
+- [x] write tests in a `TempDir`: write → read-back of builder accent and
       derived theme accent (exact `[u8; 3]` round-trip through the RON file);
       restore of `Some` and of `None`; light handle with absent palette key
       **builds a light-palette theme** (assert the palette variant and inner —
       this is the dark-default-leak regression test); builder file contains
       **only** the `accent` key after our write (no pinning of `active_hint`,
       `window_hint`, `palette`, …)
-- [ ] run `just check` - must pass before task 4
+- [x] run `just check` - must pass before task 4
 
 ### Task 4: `AppletConfig` fields for enable, snapshot, last-written
 
