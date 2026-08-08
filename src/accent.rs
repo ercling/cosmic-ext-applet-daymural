@@ -81,12 +81,7 @@ pub fn dominant_hue(img: &RgbImage) -> Option<f32> {
     for y in (0..height).step_by(stride) {
         for x in (0..width).step_by(stride) {
             let p = img.get_pixel(x, y);
-            let ok: Oklch = Srgb::new(
-                f32::from(p[0]) / 255.0,
-                f32::from(p[1]) / 255.0,
-                f32::from(p[2]) / 255.0,
-            )
-            .into_color();
+            let ok: Oklch = unquantize([p[0], p[1], p[2]]).into_color();
 
             if ok.l < NEAR_BLACK_L || ok.l > NEAR_WHITE_L {
                 continue;
@@ -417,10 +412,16 @@ fn palette_key_present(error: &cosmic_config::Error) -> bool {
 /// default (builder `accent` key unset).
 pub type BuilderAccents = (Option<[u8; 3]>, Option<[u8; 3]>);
 
+/// The two theme builders as one `(light, dark)` pair — the unit every
+/// recompute reads once ([`read_builders`]) and threads through the plan
+/// ([`accent_plan`]) and the write ([`write_accents`]). Each builder carries
+/// both inputs a mode needs: its palette (tone band) and its current accent.
+pub type Builders = (ThemeBuilder, ThemeBuilder);
+
 /// Both builders, freshly read `(light, dark)` — one read serving both the
 /// palettes (tone bands) and the current accents of a recompute, and reused
 /// by [`write_accents`] so the write does not parse the same files again.
-pub fn read_builders(handles: &ThemeHandles) -> (ThemeBuilder, ThemeBuilder) {
+pub fn read_builders(handles: &ThemeHandles) -> Builders {
     (
         handles.read_builder(Mode::Light),
         handles.read_builder(Mode::Dark),
@@ -429,7 +430,7 @@ pub fn read_builders(handles: &ThemeHandles) -> (ThemeBuilder, ThemeBuilder) {
 
 /// The accent overrides of already-read builders, quantised into the 8-bit
 /// don't-clobber space.
-pub fn builder_accents(builders: &(ThemeBuilder, ThemeBuilder)) -> BuilderAccents {
+pub fn builder_accents(builders: &Builders) -> BuilderAccents {
     (
         builders.0.accent.map(quantize),
         builders.1.accent.map(quantize),
@@ -458,7 +459,7 @@ pub fn read_current_accents(handles: &ThemeHandles) -> BuilderAccents {
 /// the guard holds and the next recompute simply retries.
 pub fn write_accents(
     handles: &ThemeHandles,
-    builders: (ThemeBuilder, ThemeBuilder),
+    builders: Builders,
     light: [u8; 3],
     dark: [u8; 3],
 ) -> Result<(), cosmic_config::Error> {
@@ -574,11 +575,13 @@ pub enum AccentAction {
 /// startup reconciliation alike).
 ///
 /// - `snapshot` / `last_written`: the persisted `AppletConfig` state.
-/// - `current`: each builder's accent override right now, freshly read
-///   ([`read_current_accents`]) — `(light, dark)`, `None` = palette default.
-/// - `light_palette` / `dark_palette`: each builder's own palette (probed by
+/// - `builders`: the freshly read `(light, dark)` pair ([`read_builders`]).
+///   Each builder carries both per-mode inputs — its accent override right
+///   now (`None` = palette default) and its own palette (probed by
 ///   [`ThemeHandles::read_builder`]), so a user-customised palette keeps its
-///   tone band.
+///   tone band. Taking the pair keeps the modes attached to their palettes;
+///   two loose `&CosmicPaletteInner` arguments could be swapped without a
+///   compile error, silently inverting the per-mode tones.
 /// - `hue`: the wallpaper's dominant hue; `None` (an effectively grey image)
 ///   still writes — the palette's warm grey, per [`accent_for`].
 ///
@@ -622,14 +625,13 @@ pub fn accent_plan(
     enabled: bool,
     snapshot: Option<AccentSnapshot>,
     last_written: Option<AccentPair>,
-    current: BuilderAccents,
-    light_palette: &CosmicPaletteInner,
-    dark_palette: &CosmicPaletteInner,
+    builders: &Builders,
     hue: Option<f32>,
 ) -> AccentAction {
     if !enabled {
         return AccentAction::Skip;
     }
+    let current = builder_accents(builders);
     match (last_written, snapshot) {
         (Some(last), _) if current != (Some(last.light), Some(last.dark)) => {
             return AccentAction::Disarm {
@@ -643,8 +645,8 @@ pub fn accent_plan(
         }
         _ => {}
     }
-    let light = quantize(accent_for(light_palette, hue));
-    let dark = quantize(accent_for(dark_palette, hue));
+    let light = quantize(accent_for(builders.0.palette.as_ref(), hue));
+    let dark = quantize(accent_for(builders.1.palette.as_ref(), hue));
     if last_written == Some(AccentPair { light, dark }) {
         return AccentAction::Skip;
     }
@@ -668,12 +670,7 @@ mod tests {
     /// conversion the extractor uses — tests assert against this rather than
     /// hardcoded hue numbers.
     fn hue_of(rgb: [u8; 3]) -> f32 {
-        let ok: Oklch = Srgb::new(
-            f32::from(rgb[0]) / 255.0,
-            f32::from(rgb[1]) / 255.0,
-            f32::from(rgb[2]) / 255.0,
-        )
-        .into_color();
+        let ok: Oklch = unquantize(rgb).into_color();
         ok.hue.into_positive_degrees()
     }
 
@@ -847,16 +844,8 @@ mod tests {
 
     // ---- transplant + gamut mapping + WCAG guard --------------------------
 
+    use crate::testutil::{dark_palette, light_palette};
     use cosmic::cosmic_theme::palette::Srgba;
-    use cosmic::cosmic_theme::{DARK_PALETTE, LIGHT_PALETTE};
-
-    fn dark_palette() -> &'static CosmicPaletteInner {
-        (*DARK_PALETTE).as_ref()
-    }
-
-    fn light_palette() -> &'static CosmicPaletteInner {
-        (*LIGHT_PALETTE).as_ref()
-    }
 
     /// A palette whose 8 chromatic accents all sit at the given Oklch tone
     /// (hues spread around the wheel) and whose warm grey is a recognisable
@@ -1190,7 +1179,10 @@ mod tests {
         // returns `Err(partial)` and `read_builder` must keep the partial
         // (accent degraded to its default) instead of bailing out.
         write(&handles, [7, 133, 217], [250, 41, 90]);
-        let accent_key = find_key_file(dir.path(), LIGHT_THEME_BUILDER_ID, "accent");
+        let accent_key = crate::testutil::find_key_file(
+            &dir.path().join("cosmic").join(LIGHT_THEME_BUILDER_ID),
+            "accent",
+        );
         std::fs::write(&accent_key, "not ron at all").unwrap();
         let builder = handles.read_builder(Mode::Light);
         assert_eq!(builder.accent, None, "corrupt accent degrades to default");
@@ -1231,9 +1223,12 @@ mod tests {
         .expect("seed accents");
         let dark_theme_before = theme_accent(&handles, Mode::Dark);
 
-        let dark_dirs = read_only_config_dirs(dir.path(), &[DARK_THEME_BUILDER_ID, DARK_THEME_ID]);
+        let dark_dirs = crate::testutil::read_only_trees(&[
+            dir.path().join("cosmic").join(DARK_THEME_BUILDER_ID),
+            dir.path().join("cosmic").join(DARK_THEME_ID),
+        ]);
         let result = write_accents(&handles, read_builders(&handles), [1, 2, 3], [4, 5, 6]);
-        restore_dir_permissions(&dark_dirs);
+        crate::testutil::restore_dir_permissions(&dark_dirs);
         result.expect_err("the dark write must fail");
 
         // The landed light mode was rolled back, builder and theme alike…
@@ -1247,60 +1242,17 @@ mod tests {
         assert_eq!(theme_accent(&handles, Mode::Dark), dark_theme_before);
     }
 
-    /// Locate the RON key file cosmic-config wrote for `key` under `id`'s
-    /// config root inside the TempDir.
-    fn find_key_file(root: &std::path::Path, id: &str, key: &str) -> std::path::PathBuf {
-        fn walk(dir: &std::path::Path, key: &str) -> Option<std::path::PathBuf> {
-            for entry in std::fs::read_dir(dir).ok()? {
-                let path = entry.ok()?.path();
-                if path.is_dir() {
-                    if let Some(found) = walk(&path, key) {
-                        return Some(found);
-                    }
-                } else if path.file_name().is_some_and(|name| name == key) {
-                    return Some(path);
-                }
-            }
-            None
-        }
-        walk(&root.join("cosmic").join(id), key).expect("key file written by cosmic-config")
-    }
-
-    /// Make every directory under the given config ids read-only so writes
-    /// into them fail; returns the affected directories for
-    /// [`restore_dir_permissions`] (TempDir cleanup needs them writable).
-    fn read_only_config_dirs(root: &std::path::Path, ids: &[&str]) -> Vec<std::path::PathBuf> {
-        use std::os::unix::fs::PermissionsExt as _;
-        fn dirs_under(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            out.push(dir.to_path_buf());
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                return;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    dirs_under(&path, out);
-                }
-            }
-        }
-        let mut dirs = Vec::new();
-        for id in ids {
-            dirs_under(&root.join("cosmic").join(id), &mut dirs);
-        }
-        for dir in &dirs {
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-        }
-        dirs
-    }
-
-    fn restore_dir_permissions(dirs: &[std::path::PathBuf]) {
-        use std::os::unix::fs::PermissionsExt as _;
-        for dir in dirs {
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-    }
-
     // ---- pure apply/disarm decision ---------------------------------------
+
+    /// A `(light, dark)` builder pair carrying the stock palettes and the
+    /// given accent overrides — the plan-test analogue of [`read_builders`].
+    fn builders_with(current: BuilderAccents) -> Builders {
+        let mut light = ThemeBuilder::light();
+        light.accent = current.0.map(unquantize);
+        let mut dark = ThemeBuilder::dark();
+        dark.accent = current.1.map(unquantize);
+        (light, dark)
+    }
 
     #[test]
     fn plan_is_skip_while_disabled() {
@@ -1316,9 +1268,7 @@ mod tests {
                 light: [9, 9, 9],
                 dark: [8, 8, 8],
             }),
-            (Some([1, 1, 1]), None),
-            light_palette(),
-            dark_palette(),
+            &builders_with((Some([1, 1, 1]), None)),
             Some(120.0),
         );
         assert_eq!(action, AccentAction::Skip);
@@ -1334,9 +1284,7 @@ mod tests {
             true,
             None,
             None,
-            (Some([10, 20, 30]), None),
-            light_palette(),
-            dark_palette(),
+            &builders_with((Some([10, 20, 30]), None)),
             hue,
         );
         assert_eq!(
@@ -1365,9 +1313,7 @@ mod tests {
                 dark: None,
             }),
             Some(last),
-            (Some(last.light), Some(last.dark)),
-            light_palette(),
-            dark_palette(),
+            &builders_with((Some(last.light), Some(last.dark))),
             Some(30.0),
         );
         assert!(
@@ -1400,9 +1346,7 @@ mod tests {
                 dark: None,
             }),
             Some(last),
-            (Some(last.light), Some(last.dark)),
-            light_palette(),
-            dark_palette(),
+            &builders_with((Some(last.light), Some(last.dark))),
             hue,
         );
         assert_eq!(action, AccentAction::Skip);
@@ -1426,9 +1370,7 @@ mod tests {
             true,
             Some(snapshot),
             None,
-            (Some([10, 20, 30]), Some([99, 88, 77])),
-            light_palette(),
-            dark_palette(),
+            &builders_with((Some([10, 20, 30]), Some([99, 88, 77]))),
             Some(120.0),
         );
         assert_eq!(
@@ -1443,9 +1385,7 @@ mod tests {
             true,
             Some(snapshot),
             None,
-            (snapshot.light, snapshot.dark),
-            light_palette(),
-            dark_palette(),
+            &builders_with((snapshot.light, snapshot.dark)),
             Some(120.0),
         );
         assert!(matches!(action, AccentAction::Write { .. }), "{action:?}");
@@ -1475,9 +1415,7 @@ mod tests {
                     true,
                     snapshot,
                     Some(last),
-                    current,
-                    light_palette(),
-                    dark_palette(),
+                    &builders_with(current),
                     Some(120.0),
                 ),
                 // A recorded write proves the mismatch is genuinely the
@@ -1500,15 +1438,7 @@ mod tests {
     fn grey_hue_still_writes_the_warm_greys() {
         // An effectively grey wallpaper is not a failure: the accent follows
         // it to each palette's own warm grey.
-        let action = accent_plan(
-            true,
-            None,
-            None,
-            (None, None),
-            light_palette(),
-            dark_palette(),
-            None,
-        );
+        let action = accent_plan(true, None, None, &builders_with((None, None)), None);
         assert_eq!(
             action,
             AccentAction::Write {

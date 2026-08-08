@@ -107,6 +107,7 @@ impl AppletConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::find_key_file;
 
     /// A cosmic-config context rooted in a TempDir — never touches the real
     /// user config.
@@ -308,23 +309,5 @@ mod tests {
         assert_eq!(normalized.accent_enabled, config.accent_enabled);
         assert_eq!(normalized.accent_snapshot, config.accent_snapshot);
         assert_eq!(normalized.accent_last_written, config.accent_last_written);
-    }
-
-    /// Locate the per-field RON file cosmic-config wrote inside the TempDir.
-    fn find_key_file(root: &std::path::Path, key: &str) -> std::path::PathBuf {
-        fn walk(dir: &std::path::Path, key: &str) -> Option<std::path::PathBuf> {
-            for entry in std::fs::read_dir(dir).ok()? {
-                let path = entry.ok()?.path();
-                if path.is_dir() {
-                    if let Some(found) = walk(&path, key) {
-                        return Some(found);
-                    }
-                } else if path.file_name().is_some_and(|name| name == key) {
-                    return Some(path);
-                }
-            }
-            None
-        }
-        walk(root, key).expect("key file written by cosmic-config")
     }
 }

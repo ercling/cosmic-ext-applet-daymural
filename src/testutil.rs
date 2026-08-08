@@ -1,9 +1,14 @@
 // Test-only helpers: a minimal loopback HTTP mock server so the network
 // branches of `bing.rs`/`app.rs` run hermetically (nothing ever reaches
-// the real Bing), plus an in-memory tiny-JPEG factory.
+// the real Bing), an in-memory tiny-JPEG factory, the stock-palette
+// accessors, and the cosmic-config filesystem walkers (key-file lookup and
+// read-only failure injection) shared by the accent/app/config test modules.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::path::{Path, PathBuf};
+
+use cosmic::cosmic_theme::{CosmicPaletteInner, DARK_PALETTE, LIGHT_PALETTE};
 
 /// How the mock frames a response body.
 #[derive(Clone, Copy)]
@@ -72,6 +77,72 @@ pub fn spawn_mock_framed(
         }
     });
     base
+}
+
+/// The stock COSMIC light palette (what an untouched light builder carries).
+pub fn light_palette() -> &'static CosmicPaletteInner {
+    (*LIGHT_PALETTE).as_ref()
+}
+
+/// The stock COSMIC dark palette (what an untouched dark builder carries).
+pub fn dark_palette() -> &'static CosmicPaletteInner {
+    (*DARK_PALETTE).as_ref()
+}
+
+/// Locate the per-key RON file cosmic-config wrote for `key` somewhere under
+/// `root` (tests neither know nor care about the version subdirectory).
+pub fn find_key_file(root: &Path, key: &str) -> PathBuf {
+    fn walk(dir: &Path, key: &str) -> Option<PathBuf> {
+        for entry in std::fs::read_dir(dir).ok()? {
+            let path = entry.ok()?.path();
+            if path.is_dir() {
+                if let Some(found) = walk(&path, key) {
+                    return Some(found);
+                }
+            } else if path.file_name().is_some_and(|name| name == key) {
+                return Some(path);
+            }
+        }
+        None
+    }
+    walk(root, key).expect("key file written by cosmic-config")
+}
+
+/// Make every directory under `roots` read-only so writes into them fail —
+/// the shared failure injection for "the config write did not land" branches.
+/// Returns all affected directories for [`restore_dir_permissions`] (TempDir
+/// cleanup needs them writable again).
+pub fn read_only_trees(roots: &[PathBuf]) -> Vec<PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fn dirs_under(dir: &Path, out: &mut Vec<PathBuf>) {
+        out.push(dir.to_path_buf());
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs_under(&path, out);
+            }
+        }
+    }
+    let mut dirs = Vec::new();
+    for root in roots {
+        dirs_under(root, &mut dirs);
+    }
+    for dir in &dirs {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    }
+    dirs
+}
+
+/// Undo [`read_only_trees`].
+pub fn restore_dir_permissions(dirs: &[PathBuf]) {
+    use std::os::unix::fs::PermissionsExt as _;
+    for dir in dirs {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 }
 
 /// A real, decodable JPEG of the given size, in memory (for mock download
