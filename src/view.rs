@@ -4,6 +4,7 @@
 // which entry is shown, which navigation targets exist, how the footer
 // timestamp reads — are extracted below and tested.
 
+use std::borrow::Cow;
 use std::path::Path;
 
 use chrono::NaiveDateTime;
@@ -16,6 +17,7 @@ use cosmic::{
 
 use crate::app::{self, Message, RefreshError, Window};
 use crate::catalogue::{Catalogue, ImageEntry};
+use crate::fl;
 use crate::thumbs;
 
 /// Height of the placeholder box shown when a thumbnail is missing
@@ -24,23 +26,44 @@ use crate::thumbs;
 const PLACEHOLDER_HEIGHT: f32 = 160.0;
 
 /// Shuffle interval choices, index-aligned with
-/// [`SHUFFLE_INTERVAL_LABELS`].
+/// [`shuffle_interval_labels`].
 const SHUFFLE_INTERVAL_SECS: [u32; 4] = [1_800, 3_600, 21_600, 86_400];
 
-/// Dropdown labels for the shuffle intervals.
-const SHUFFLE_INTERVAL_LABELS: &[&str] = &["30 minutes", "1 hour", "6 hours", "Daily"];
+/// Dropdown labels for the shuffle intervals, index-aligned with
+/// [`SHUFFLE_INTERVAL_SECS`].
+///
+/// Built per call rather than cached in a `LazyLock`: a static would freeze
+/// the labels in whatever language was loaded when it was first touched,
+/// which is the wrong one if that happens before `localize::localize()`.
+fn shuffle_interval_labels() -> Vec<String> {
+    vec![
+        fl!("interval-30-minutes"),
+        fl!("interval-1-hour"),
+        fl!("interval-6-hours"),
+        fl!("interval-daily"),
+    ]
+}
 
 /// Dropdown index of the default shuffle interval (daily) — the fallback
 /// for hand-edited config values that match no choice.
 const SHUFFLE_DEFAULT_INDEX: usize = SHUFFLE_INTERVAL_SECS.len() - 1;
 
 /// Retention choices in days (0 = keep forever), index-aligned with
-/// [`RETENTION_LABELS`]. Shared with `AppletConfig::normalize` so a loaded
+/// [`retention_labels`]. Shared with `AppletConfig::normalize` so a loaded
 /// value the dropdown cannot display never drives prune/fetch behavior.
 const RETENTION_DAYS: [u16; 4] = crate::config::RETENTION_CHOICES;
 
-/// Dropdown labels for the retention choices.
-const RETENTION_LABELS: &[&str] = &["3 days", "8 days", "30 days", "Forever"];
+/// Dropdown labels for the retention choices, index-aligned with
+/// [`RETENTION_DAYS`] (see [`shuffle_interval_labels`] on why this is a
+/// function).
+fn retention_labels() -> Vec<String> {
+    vec![
+        fl!("retention-3-days"),
+        fl!("retention-8-days"),
+        fl!("retention-30-days"),
+        fl!("retention-forever"),
+    ]
+}
 
 /// Dropdown index of the default retention (8 days) — the fallback for
 /// hand-edited config values that match no choice.
@@ -118,20 +141,23 @@ pub fn display_title(entry: &ImageEntry) -> String {
         .filename
         .file_stem()
         .and_then(|s| s.to_str())
-        .unwrap_or("Bing wallpaper")
-        .to_owned()
+        .map(str::to_owned)
+        .unwrap_or_else(|| fl!("bing-wallpaper"))
 }
 
 /// Footer timestamp: "Updated today at 09:12" / "… yesterday at …" /
 /// "Updated Aug 5 at 09:12". Both instants are local wall-clock time.
 pub fn format_updated(updated: NaiveDateTime, now: NaiveDateTime) -> String {
-    let time = updated.format("%H:%M");
+    let time = updated.format("%H:%M").to_string();
     if updated.date() == now.date() {
-        format!("Updated today at {time}")
+        fl!("status-updated-today", time = time)
     } else if now.date().pred_opt() == Some(updated.date()) {
-        format!("Updated yesterday at {time}")
+        fl!("status-updated-yesterday", time = time)
     } else {
-        format!("Updated {} at {time}", updated.format("%b %-d"))
+        // Only the sentence frame is localized; the date itself stays English
+        // month abbreviations (locale-aware dates would mean pulling in ICU).
+        let date = updated.format("%b %-d").to_string();
+        fl!("status-updated-on", date = date, time = time)
     }
 }
 
@@ -183,11 +209,11 @@ pub fn icon_opacity(enabled: bool) -> f32 {
 /// Status footer text.
 pub fn status_line(window: &Window) -> String {
     if window.refresh_pending {
-        "Checking for new images…".to_owned()
+        fl!("status-checking")
     } else if let Some(error) = &window.last_error {
         match error {
-            RefreshError::Network(_) => "Bing unreachable — retrying in 1 h".to_owned(),
-            RefreshError::Disk(_) => "Disk error — retrying in 1 h".to_owned(),
+            RefreshError::Network(_) => fl!("status-network-error"),
+            RefreshError::Disk(_) => fl!("status-disk-error"),
         }
     } else if let Some(updated) = window.last_updated {
         format_updated(
@@ -195,11 +221,11 @@ pub fn status_line(window: &Window) -> String {
             chrono::Local::now().naive_local(),
         )
     } else if window.catalogue.images.is_empty() {
-        "No images yet — fetching…".to_owned()
+        fl!("status-no-images")
     } else {
         // Restored from the catalogue; no fetch has completed yet this
         // session.
-        "Up to date".to_owned()
+        fl!("status-up-to-date")
     }
 }
 
@@ -219,7 +245,7 @@ pub fn popup_view(window: &Window) -> Element<'_, Message> {
             .push(padded_control(header(entry)));
         if !entry.copyrightlink.is_empty() {
             content = content.push(
-                menu_button(widget::text::body("About this image"))
+                menu_button(widget::text::body(fl!("about-this-image")))
                     .on_press(Message::OpenUrl(entry.copyrightlink.clone())),
             );
         }
@@ -266,7 +292,7 @@ fn thumbnail<'a>(window: &'a Window, entry: &'a ImageEntry) -> Element<'a, Messa
     let button = widget::button::custom_image_button(inner, None)
         .class(cosmic::theme::Button::Image)
         .on_press(Message::OpenFile(entry.filename.clone()));
-    popup_tooltip(window, button, "Open image in viewer")
+    popup_tooltip(window, button, fl!("tooltip-open-image"))
 }
 
 /// Title heading + dimmed copyright caption.
@@ -292,19 +318,19 @@ fn controls(window: &Window) -> Element<'_, Message> {
         .push(nav_button(
             window,
             "go-previous-symbolic",
-            "Previous wallpaper",
+            fl!("tooltip-previous"),
             apply(prev_target(catalogue, current)),
         ))
         .push(nav_button(
             window,
             "go-next-symbolic",
-            "Next wallpaper",
+            fl!("tooltip-next"),
             apply(next_target(catalogue, current)),
         ))
         .push(nav_button(
             window,
             "go-last-symbolic",
-            "Skip to newest",
+            fl!("tooltip-newest"),
             apply(newest_target(catalogue, current)),
         ))
         .push(refresh_button(window))
@@ -318,7 +344,7 @@ fn shuffle_toggler(window: &Window) -> Element<'_, Message> {
         .on_toggle(Message::SetShuffleEnabled)
         .text_size(14)
         .width(Length::Fill)
-        .label("Shuffle".to_owned())
+        .label(fl!("shuffle"))
         .into()
 }
 
@@ -328,9 +354,9 @@ fn shuffle_toggler(window: &Window) -> Element<'_, Message> {
 /// applet popup's bounds.
 fn interval_row(window: &Window) -> Element<'_, Message> {
     widget::Row::new()
-        .push(widget::text::body("Every").width(Length::Fill))
+        .push(widget::text::body(fl!("shuffle-every")).width(Length::Fill))
         .push(widget::dropdown::popup_dropdown(
-            SHUFFLE_INTERVAL_LABELS,
+            shuffle_interval_labels(),
             Some(shuffle_interval_index(window.config.shuffle_interval_secs)),
             Message::SetShuffleInterval,
             window.popup.unwrap_or(Id::NONE),
@@ -345,9 +371,9 @@ fn interval_row(window: &Window) -> Element<'_, Message> {
 /// the shuffle interval (the menu opens as its own wayland popup).
 fn retention_row(window: &Window) -> Element<'_, Message> {
     widget::Row::new()
-        .push(widget::text::body("Keep images").width(Length::Fill))
+        .push(widget::text::body(fl!("keep-images")).width(Length::Fill))
         .push(widget::dropdown::popup_dropdown(
-            RETENTION_LABELS,
+            retention_labels(),
             Some(retention_index(window.config.retention_days)),
             Message::SetRetention,
             window.popup.unwrap_or(Id::NONE),
@@ -363,7 +389,7 @@ fn refresh_button(window: &Window) -> Element<'_, Message> {
     nav_button(
         window,
         "view-refresh-symbolic",
-        "Check for new images now",
+        fl!("tooltip-refresh"),
         (!window.refresh_pending).then_some(Message::RefreshNow),
     )
 }
@@ -378,7 +404,7 @@ fn refresh_button(window: &Window) -> Element<'_, Message> {
 fn nav_button<'a>(
     window: &Window,
     icon: &'static str,
-    tooltip: &'static str,
+    tooltip: impl Into<Cow<'static, str>>,
     on_press: Option<Message>,
 ) -> Element<'a, Message> {
     let space = cosmic::theme::spacing();
@@ -408,7 +434,7 @@ fn nav_button<'a>(
 fn popup_tooltip<'a>(
     window: &Window,
     content: impl Into<Element<'a, Message>>,
-    tooltip: &'static str,
+    tooltip: impl Into<Cow<'static, str>>,
 ) -> Element<'a, Message> {
     window
         .core
@@ -530,7 +556,13 @@ mod tests {
     fn shuffle_interval_mapping_roundtrips() {
         // The plan's exact choices, in dropdown order.
         assert_eq!(SHUFFLE_INTERVAL_SECS, [1_800, 3_600, 21_600, 86_400]);
-        assert_eq!(SHUFFLE_INTERVAL_LABELS.len(), SHUFFLE_INTERVAL_SECS.len());
+        // Labels come from the FTL now; pin the English copy so a botched
+        // catalogue edit fails here rather than in the panel.
+        assert_eq!(
+            shuffle_interval_labels(),
+            ["30 minutes", "1 hour", "6 hours", "Daily"]
+        );
+        assert_eq!(shuffle_interval_labels().len(), SHUFFLE_INTERVAL_SECS.len());
         for (index, &secs) in SHUFFLE_INTERVAL_SECS.iter().enumerate() {
             assert_eq!(shuffle_interval_index(secs), index);
             assert_eq!(shuffle_interval_secs(index), secs);
@@ -550,7 +582,11 @@ mod tests {
     fn retention_mapping_roundtrips() {
         // The plan's exact choices, in dropdown order (0 = forever).
         assert_eq!(RETENTION_DAYS, [3, 8, 30, 0]);
-        assert_eq!(RETENTION_LABELS.len(), RETENTION_DAYS.len());
+        assert_eq!(
+            retention_labels(),
+            ["3 days", "8 days", "30 days", "Forever"]
+        );
+        assert_eq!(retention_labels().len(), RETENTION_DAYS.len());
         for (index, &days) in RETENTION_DAYS.iter().enumerate() {
             assert_eq!(retention_index(days), index);
             assert_eq!(retention_days(index), days);

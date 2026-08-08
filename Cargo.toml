@@ -36,6 +36,14 @@ chrono = { version = "0.4", default-features = false, features = [
     "std",
 ] }
 dirs = "6"
+# Fluent i18n. Versions/features mirror libcosmic's own (Cargo.toml:130) so
+# the whole dependency graph resolves to a single copy of each crate.
+i18n-embed = { version = "0.16", features = [
+    "fluent-system",
+    "desktop-requester",
+] }
+i18n-embed-fl = "0.10"
+rust-embed = "8"
 # Only what the applet itself touches: `time::sleep` for the one-shot
 # timers, plus `rt` + `macros` for the `#[tokio::test]` harness. Everything
 # else tokio-ish (reqwest I/O, libcosmic's executor) enables its own

@@ -9,6 +9,7 @@ mod catalogue;
 #[allow(dead_code)]
 mod config;
 mod fsutil;
+mod localize;
 mod schedule;
 #[cfg(test)]
 mod testutil;
@@ -22,6 +23,11 @@ fn main() -> cosmic::iced::Result {
         .init();
 
     tracing::info!("starting {} {}", app::APP_ID, env!("CARGO_PKG_VERSION"));
+
+    // Must happen before the first `fl!` in the view: it layers the desktop's
+    // languages onto the `en` fallback (see `localize.rs` for why nothing
+    // else in the crate calls it).
+    localize::localize();
 
     app::run()
 }

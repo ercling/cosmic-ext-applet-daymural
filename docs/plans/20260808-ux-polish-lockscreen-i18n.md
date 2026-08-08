@@ -398,12 +398,54 @@ without churning the test.
 - Create: `i18n/en/cosmic_bing_wallpaper.ftl`
 - Modify: `src/main.rs`, `src/view.rs`, `src/app.rs` (any user-facing strings there)
 
-- [ ] add deps `i18n-embed` (0.16, `fluent-system` + `desktop-requester` features), `i18n-embed-fl` (0.10), `rust-embed` (8) — versions matching libcosmic's own
-- [ ] create `i18n.toml` (fallback `en`, assets_dir `i18n`) and `src/localize.rs` following cosmic-greeter's pattern (`RustEmbed` on `i18n/`, `FluentLanguageLoader` in a `OnceLock`, `fl!` macro, `localize()` called at startup in `main.rs`)
-- [ ] write `i18n/en/cosmic_bing_wallpaper.ftl` covering the full string inventory (popup strings, status lines, dropdown labels, `display_title` fallback, Task-3 tooltips; `format_updated` frames take `$time`/`$date` args)
-- [ ] convert `view.rs` (and any `app.rs` strings) to `fl!`; label arrays become `fn ..._labels() -> Vec<String>` accessors (see Technical Details); keep index↔value mapping functions unchanged
-- [ ] add the test helper that pins the loader to `en` exactly once (`OnceLock` + `load_fallback_language` — never `DesktopLanguageRequester` in tests, with a comment saying why); **keep the literal-English assertions** in `status_line_*`, `format_updated_*`, `display_title_*` and the label-length invariants — they now also guard the English FTL copy
-- [ ] run `just check` — must pass before task 6 (note: `i18n-embed-fl` already fails the *compile* for any `fl!` id missing from `en`, so no separate test is needed for that)
+- [x] add deps `i18n-embed` (0.16, `fluent-system` + `desktop-requester` features), `i18n-embed-fl` (0.10), `rust-embed` (8) — versions matching libcosmic's own
+- [x] create `i18n.toml` (fallback `en`, assets_dir `i18n`) and `src/localize.rs` following cosmic-greeter's pattern (`RustEmbed` on `i18n/`, `FluentLanguageLoader` in a `OnceLock`, `fl!` macro, `localize()` called at startup in `main.rs`)
+- [x] write `i18n/en/cosmic_bing_wallpaper.ftl` covering the full string inventory (popup strings, status lines, dropdown labels, `display_title` fallback, Task-3 tooltips; `format_updated` frames take `$time`/`$date` args) — 22 ids
+- [x] convert `view.rs` (and any `app.rs` strings) to `fl!`; label arrays become `fn ..._labels() -> Vec<String>` accessors (see Technical Details); keep index↔value mapping functions unchanged
+- [x] add the test helper that pins the loader to `en` exactly once (`OnceLock` + `load_fallback_language` — never `DesktopLanguageRequester` in tests, with a comment saying why); **keep the literal-English assertions** in `status_line_*`, `format_updated_*`, `display_title_*` and the label-length invariants — they now also guard the English FTL copy
+- [x] run `just check` — must pass before task 6 (note: `i18n-embed-fl` already fails the *compile* for any `fl!` id missing from `en`, so no separate test is needed for that) — 136 tests pass, fmt + clippy clean
+
+➕ **Notes (2026-08-08)**
+
+- FTL ids and their call sites: `panel-tooltip` (`app.rs`), `about-this-image`,
+  `bing-wallpaper`, `tooltip-{previous,next,newest,refresh,open-image}`,
+  `shuffle`, `shuffle-every`, `keep-images`,
+  `interval-{30-minutes,1-hour,6-hours,daily}`,
+  `retention-{3-days,8-days,30-days,forever}`,
+  `status-{checking,network-error,disk-error,no-images,up-to-date}`,
+  `status-updated-{today,yesterday,on}` (the last three carry
+  `$time` / `$date`).
+- `PANEL_TOOLTIP` (a `const`) became `fn panel_tooltip() -> String` — a const
+  cannot hold a value that must be read *after* `localize()` runs.
+  `nav_button`/`popup_tooltip` take `impl Into<Cow<'static, str>>` instead of
+  `&'static str` (`applet_tooltip`'s own bound), so owned strings pass through.
+
+[decision] The loader calls `set_use_isolating(false)`. Fluent wraps every
+placeable in bidi isolate marks (U+2068/U+2069) by default, which would make
+`format_updated` return `"Updated \u{2068}09:12\u{2069}"` — invisible in a
+terminal but present in the string, breaking both the plan's mandated
+literal-English assertions and iced's text measurement. cosmic-greeter and
+cosmic-settings disable it for the same reason. Guarded by
+`placeables_are_substituted_without_bidi_isolates`.
+
+[decision] The `en` pin is structural rather than a separate test helper: the
+plan asked for "`OnceLock` + `load_fallback_language` called exactly once",
+which is precisely what the `LazyLock<FluentLanguageLoader>` initializer does.
+The crate's `fl!` deliberately does **not** call `localize()` (libcosmic's copy
+does), so `localize()` — the only `DesktopLanguageRequester` caller — is
+reachable from `main` alone and can never run in a test binary. Asserted
+directly by `loader_is_pinned_to_english`; verified by running the suite under
+`LANG=LC_ALL=uk_UA.UTF-8` (136 passed).
+
+[decision] The wrapper macro forwards args as `$($args:tt)*` rather than
+libcosmic's `$($args:expr),*` — `time = value` only survives re-emission into
+`i18n_embed_fl::fl!` reliably as raw token trees.
+
+[deviation] Two extra assertions beyond the plan's list: the dropdown label
+arrays now pin their English *contents* (`shuffle_interval_mapping_roundtrips`,
+`retention_mapping_roundtrips`), not just their lengths. Moving them out of
+`&'static str` consts removed the only place those strings were visible in
+source, so without this the English label copy would be unguarded.
 
 ### Task 6: Translations for the 72 remaining COSMIC locales
 

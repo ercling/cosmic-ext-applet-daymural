@@ -23,6 +23,7 @@ use cosmic::{
 
 use crate::catalogue::{self, Catalogue, ImageEntry};
 use crate::config::AppletConfig;
+use crate::fl;
 use crate::{bing, schedule, thumbs, view, wallpaper};
 
 /// One name everywhere: cosmic-config app ID, state dir, desktop entry.
@@ -31,8 +32,11 @@ pub const APP_ID: &str = "io.github.ercling.CosmicBingWallpaper";
 /// Symbolic icon shown in the panel.
 const PANEL_ICON: &str = "preferences-desktop-wallpaper-symbolic";
 
-/// Hover tooltip on the panel button.
-const PANEL_TOOLTIP: &str = "Bing Wallpaper of the Day";
+/// Hover tooltip on the panel button. A function, not a const: the text is
+/// localized and must be read after `localize::localize()` has run.
+fn panel_tooltip() -> String {
+    fl!("panel-tooltip")
+}
 
 pub fn run() -> cosmic::iced::Result {
     cosmic::applet::run::<Window>(())
@@ -837,7 +841,7 @@ impl cosmic::Application for Window {
             .applet
             .applet_tooltip::<Message>(
                 button,
-                PANEL_TOOLTIP,
+                panel_tooltip(),
                 self.popup.is_some(),
                 Message::Surface,
                 None,
@@ -877,8 +881,8 @@ mod tests {
     #[test]
     fn panel_tooltip_names_the_applet() {
         // Guards the English copy of the one string the panel shows on
-        // hover (it joins the translated inventory in task 5).
-        assert_eq!(PANEL_TOOLTIP, "Bing Wallpaper of the Day");
+        // hover (the test loader is pinned to `en` — see `localize.rs`).
+        assert_eq!(panel_tooltip(), "Bing Wallpaper of the Day");
     }
 
     #[test]
