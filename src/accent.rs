@@ -3,9 +3,9 @@
 //
 // This module owns the whole colour domain: extraction of the dominant
 // *vibrant* hue from the cached 480×270 thumbnail, the hue transplant onto
-// COSMIC's own palette tones (with gamut mapping and a WCAG guard), and — in
-// later tasks — the theme writer with snapshot/restore and the pure
-// apply/disarm decision.
+// COSMIC's own palette tones (with gamut mapping and a WCAG guard), the theme
+// writer with snapshot/restore, and the pure apply/disarm decision
+// (`accent_plan`) that `app.rs` executes.
 //
 // Extraction is a chroma-weighted hue histogram in Oklch, the shape borrowed
 // from the GNOME extension's dominant-with-grey-fallback rule
@@ -393,9 +393,14 @@ impl ThemeHandles {
     }
 }
 
+/// The two builders' current accent overrides `(light, dark)`, quantised into
+/// the 8-bit space the don't-clobber comparison happens in. `None` = palette
+/// default (builder `accent` key unset).
+pub type BuilderAccents = (Option<[u8; 3]>, Option<[u8; 3]>);
+
 /// Each builder's current accent override, quantised into the 8-bit space the
 /// don't-clobber comparison happens in. `None` = palette default (key unset).
-pub fn read_current_accents(handles: &ThemeHandles) -> (Option<[u8; 3]>, Option<[u8; 3]>) {
+pub fn read_current_accents(handles: &ThemeHandles) -> BuilderAccents {
     (
         handles.read_builder(Mode::Light).accent.map(quantize),
         handles.read_builder(Mode::Dark).accent.map(quantize),
@@ -444,6 +449,77 @@ fn write_mode_accent(
     let mut builder = handles.read_builder(mode);
     builder.set_accent(handles.builder_cfg(mode), accent)?;
     builder.build().write_entry(handles.theme_cfg(mode))
+}
+
+// ---- pure apply/disarm decision ---------------------------------------------
+
+/// What the `AccentComputed` handler should do — the tested analogue of
+/// `refresh_success_plan` / `wallpaper::classify`. The handler executes it
+/// against live state:
+///
+/// - [`AccentAction::Write`]: write both accents ([`write_accents`]) and
+///   persist `last_written`; when `snapshot_now` is set, first capture the
+///   *current* builder accents as the snapshot (they are still the user's —
+///   nothing of ours has landed yet).
+/// - [`AccentAction::Disarm`]: the user (or Settings) changed the accent —
+///   flip `accent_enabled` off through the setter and clear snapshot +
+///   last-written **without restoring**; the user's manual choice stands.
+/// - [`AccentAction::Skip`]: change nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccentAction {
+    Write {
+        light: [u8; 3],
+        dark: [u8; 3],
+        snapshot_now: bool,
+    },
+    Disarm,
+    Skip,
+}
+
+/// The pure decision behind every accent recompute (apply paths and the
+/// startup reconciliation alike).
+///
+/// - `snapshot` / `last_written`: the persisted `AppletConfig` state.
+/// - `current`: each builder's accent override right now, freshly read
+///   ([`read_current_accents`]) — `(light, dark)`, `None` = palette default.
+/// - `light_palette` / `dark_palette`: each builder's own palette (probed by
+///   [`ThemeHandles::read_builder`]), so a user-customised palette keeps its
+///   tone band.
+/// - `hue`: the wallpaper's dominant hue; `None` (an effectively grey image)
+///   still writes — the palette's warm grey, per [`accent_for`].
+///
+/// Don't-clobber: once `last_written` exists, both builders must still hold
+/// exactly those bytes (`[u8; 3]` compare — exact by the quantise-then-convert
+/// construction). Any difference, including a mode reset to palette default,
+/// means the user intervened → [`AccentAction::Disarm`]. With no
+/// `last_written` there is nothing to clobber (first write after enable).
+///
+/// Snapshot lifecycle: the plan never takes the snapshot itself — it flags
+/// `snapshot_now` when none is persisted, so the executor captures the user's
+/// accents before our first write. Re-enable clears the old snapshot first
+/// (enable always re-snapshots), which routes through the same flag.
+pub fn accent_plan(
+    enabled: bool,
+    snapshot: Option<AccentSnapshot>,
+    last_written: Option<AccentPair>,
+    current: BuilderAccents,
+    light_palette: &CosmicPaletteInner,
+    dark_palette: &CosmicPaletteInner,
+    hue: Option<f32>,
+) -> AccentAction {
+    if !enabled {
+        return AccentAction::Skip;
+    }
+    if let Some(last) = last_written
+        && current != (Some(last.light), Some(last.dark))
+    {
+        return AccentAction::Disarm;
+    }
+    AccentAction::Write {
+        light: quantize(accent_for(light_palette, hue)),
+        dark: quantize(accent_for(dark_palette, hue)),
+        snapshot_now: snapshot.is_none(),
+    }
 }
 
 #[cfg(test)]
@@ -952,6 +1028,314 @@ mod tests {
                 "{id}: builder must contain only the accent key"
             );
         }
+    }
+
+    // ---- pure apply/disarm decision ---------------------------------------
+
+    /// The persisted feature state the real handler keeps in `AppletConfig`;
+    /// the sequence test maintains it by executing plan actions exactly per
+    /// [`AccentAction`]'s documented semantics.
+    #[derive(Default)]
+    struct FeatureState {
+        enabled: bool,
+        snapshot: Option<AccentSnapshot>,
+        last_written: Option<AccentPair>,
+    }
+
+    /// One recompute: fresh read → pure plan → execute, the loop `app.rs`
+    /// will run in Task 6.
+    fn run_plan(
+        handles: &ThemeHandles,
+        state: &mut FeatureState,
+        hue: Option<f32>,
+    ) -> AccentAction {
+        let current = read_current_accents(handles);
+        let action = accent_plan(
+            state.enabled,
+            state.snapshot,
+            state.last_written,
+            current,
+            light_palette(),
+            dark_palette(),
+            hue,
+        );
+        match action {
+            AccentAction::Write {
+                light,
+                dark,
+                snapshot_now,
+            } => {
+                if snapshot_now {
+                    // The current accents are still the user's — nothing of
+                    // ours has landed yet.
+                    state.snapshot = Some(AccentSnapshot {
+                        light: current.0,
+                        dark: current.1,
+                    });
+                }
+                write_accents(handles, light, dark).expect("write accents");
+                state.last_written = Some(AccentPair { light, dark });
+            }
+            AccentAction::Disarm => {
+                // No restore — the user's manual choice stands.
+                state.enabled = false;
+                state.snapshot = None;
+                state.last_written = None;
+            }
+            AccentAction::Skip => {}
+        }
+        action
+    }
+
+    #[test]
+    fn plan_is_skip_while_disabled() {
+        // Disabled means change nothing — even with (stale) persisted state
+        // and a live hue on hand, the plan must never write.
+        let action = accent_plan(
+            false,
+            Some(AccentSnapshot {
+                light: None,
+                dark: Some([1, 2, 3]),
+            }),
+            Some(AccentPair {
+                light: [9, 9, 9],
+                dark: [8, 8, 8],
+            }),
+            (Some([1, 1, 1]), None),
+            light_palette(),
+            dark_palette(),
+            Some(120.0),
+        );
+        assert_eq!(action, AccentAction::Skip);
+    }
+
+    #[test]
+    fn first_write_after_enable_carries_snapshot_now() {
+        // No last_written yet → nothing to clobber; no snapshot yet → the
+        // executor must capture the user's accents before writing. The
+        // colours are exactly the transplant's own answer for each palette.
+        let hue = Some(200.0);
+        let action = accent_plan(
+            true,
+            None,
+            None,
+            (Some([10, 20, 30]), None),
+            light_palette(),
+            dark_palette(),
+            hue,
+        );
+        assert_eq!(
+            action,
+            AccentAction::Write {
+                light: quantize(accent_for(light_palette(), hue)),
+                dark: quantize(accent_for(dark_palette(), hue)),
+                snapshot_now: true,
+            }
+        );
+    }
+
+    #[test]
+    fn steady_state_rewrites_without_resnapshotting() {
+        // Builders hold exactly what we last wrote → keep following the
+        // wallpaper; the enable-time snapshot must not be overwritten.
+        let last = AccentPair {
+            light: [7, 133, 217],
+            dark: [250, 41, 90],
+        };
+        let action = accent_plan(
+            true,
+            Some(AccentSnapshot {
+                light: None,
+                dark: None,
+            }),
+            Some(last),
+            (Some(last.light), Some(last.dark)),
+            light_palette(),
+            dark_palette(),
+            Some(30.0),
+        );
+        assert!(
+            matches!(
+                action,
+                AccentAction::Write {
+                    snapshot_now: false,
+                    ..
+                }
+            ),
+            "got {action:?}"
+        );
+    }
+
+    #[test]
+    fn any_externally_changed_builder_accent_disarms() {
+        let last = AccentPair {
+            light: [7, 133, 217],
+            dark: [250, 41, 90],
+        };
+        let snapshot = Some(AccentSnapshot {
+            light: None,
+            dark: None,
+        });
+        let cases: [BuilderAccents; 4] = [
+            // One channel one step off — the compare is exact, not fuzzy.
+            (Some([8, 133, 217]), Some(last.dark)),
+            (Some(last.light), Some([0, 0, 0])),
+            // A mode reset to palette default (accent key unset) counts too.
+            (None, Some(last.dark)),
+            (None, None),
+        ];
+        for current in cases {
+            assert_eq!(
+                accent_plan(
+                    true,
+                    snapshot,
+                    Some(last),
+                    current,
+                    light_palette(),
+                    dark_palette(),
+                    Some(120.0),
+                ),
+                AccentAction::Disarm,
+                "{current:?} differs from last_written and must disarm"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_reconciliation_catches_a_change_made_while_stopped() {
+        // The applet was down; `last_written` survived in config while the
+        // user changed one mode in Settings. The startup recompute does a
+        // fresh read against real files — the persisted bytes vs the RON
+        // round-trip must disagree exactly where the user intervened.
+        let dir = tempfile::tempdir().unwrap();
+        let handles = ThemeHandles::sandboxed(dir.path()).unwrap();
+
+        let mut state = FeatureState {
+            enabled: true,
+            ..FeatureState::default()
+        };
+        assert!(matches!(
+            run_plan(&handles, &mut state, Some(200.0)),
+            AccentAction::Write { .. }
+        ));
+        let persisted = state.last_written;
+
+        // "Restart": only config state survives; the user meanwhile picked a
+        // new dark accent.
+        restore_accents(
+            &handles,
+            AccentSnapshot {
+                light: Some(state.last_written.unwrap().light),
+                dark: Some([12, 34, 56]),
+            },
+        )
+        .expect("user's Settings change");
+
+        let mut state = FeatureState {
+            enabled: true,
+            snapshot: state.snapshot,
+            last_written: persisted,
+        };
+        assert_eq!(
+            run_plan(&handles, &mut state, Some(200.0)),
+            AccentAction::Disarm
+        );
+        // Disarm cleared the feature state but left the user's accents alone.
+        assert!(!state.enabled);
+        assert_eq!(state.snapshot, None);
+        assert_eq!(state.last_written, None);
+        assert_eq!(
+            read_current_accents(&handles),
+            (Some(persisted.unwrap().light), Some([12, 34, 56]))
+        );
+    }
+
+    #[test]
+    fn grey_hue_still_writes_the_warm_greys() {
+        // An effectively grey wallpaper is not a failure: the accent follows
+        // it to each palette's own warm grey.
+        let action = accent_plan(
+            true,
+            None,
+            None,
+            (None, None),
+            light_palette(),
+            dark_palette(),
+            None,
+        );
+        assert_eq!(
+            action,
+            AccentAction::Write {
+                light: quantize(light_palette().accent_warm_grey.color),
+                dark: quantize(dark_palette().accent_warm_grey.color),
+                snapshot_now: true,
+            }
+        );
+    }
+
+    #[test]
+    fn re_enable_re_snapshots_so_disable_restores_the_later_accents() {
+        // enable → manual change → disarm → re-enable → disable must end on
+        // the accents from *re-enable time*, not the pre-feature originals —
+        // the re-snapshot rule from the Solution Overview.
+        let dir = tempfile::tempdir().unwrap();
+        let handles = ThemeHandles::sandboxed(dir.path()).unwrap();
+        let mut state = FeatureState::default();
+
+        // Pre-feature: the user's original accents.
+        let original = AccentSnapshot {
+            light: Some([10, 20, 30]),
+            dark: Some([40, 50, 60]),
+        };
+        restore_accents(&handles, original).expect("seed originals");
+
+        // Enable (the caller clears any stale snapshot — enable always
+        // re-snapshots) and first recompute.
+        state.enabled = true;
+        state.snapshot = None;
+        assert!(matches!(
+            run_plan(&handles, &mut state, Some(200.0)),
+            AccentAction::Write {
+                snapshot_now: true,
+                ..
+            }
+        ));
+        assert_eq!(state.snapshot, Some(original));
+
+        // The user picks new accents in Settings…
+        let manual = AccentSnapshot {
+            light: Some([90, 90, 0]),
+            dark: Some([0, 90, 90]),
+        };
+        restore_accents(&handles, manual).expect("user's Settings change");
+
+        // …and the next recompute disarms without restoring.
+        assert_eq!(
+            run_plan(&handles, &mut state, Some(200.0)),
+            AccentAction::Disarm
+        );
+        assert!(!state.enabled);
+        assert_eq!(read_current_accents(&handles), (manual.light, manual.dark));
+
+        // Re-enable: the snapshot is re-taken from *now* — the manual accents.
+        state.enabled = true;
+        state.snapshot = None;
+        assert!(matches!(
+            run_plan(&handles, &mut state, Some(30.0)),
+            AccentAction::Write {
+                snapshot_now: true,
+                ..
+            }
+        ));
+        assert_eq!(state.snapshot, Some(manual));
+
+        // Disable restores what re-enable captured, not the originals.
+        restore_accents(&handles, state.snapshot.unwrap()).expect("disable restore");
+        assert_eq!(read_current_accents(&handles), (manual.light, manual.dark));
+        assert_ne!(
+            read_current_accents(&handles),
+            (original.light, original.dark)
+        );
     }
 
     /// Every key *file* under a config root (recursively), sorted by name —

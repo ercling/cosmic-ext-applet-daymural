@@ -381,22 +381,29 @@ Types live in `src/accent.rs`; all colours are `[u8; 3]` (keeps `Eq` on
 **Files:**
 - Modify: `src/accent.rs`
 
-- [ ] define `AccentAction { Write { light, dark, snapshot_now }, Disarm, Skip }`
+- [x] define `AccentAction { Write { light, dark, snapshot_now }, Disarm, Skip }`
       and `accent_plan(enabled, snapshot, last_written, current_builders, hue)`
       — don't-clobber: any current builder accent differing (exact `[u8; 3]`
       compare) from `last_written` means the user intervened → `Disarm`
-- [ ] snapshot lifecycle per Solution Overview: enable-time snapshot is taken
+      ➕ the sketched signature also gained the two palette refs
+      (`light_palette`/`dark_palette`, from `read_builder`): `Write` carries
+      concrete `[u8; 3]` colours the executor just writes, and computing them
+      from `hue` needs each builder's own tone band — still pure; a
+      `BuilderAccents` type alias names the `(light, dark)` current pair
+- [x] snapshot lifecycle per Solution Overview: enable-time snapshot is taken
       by the caller (always re-snapshot on enable); `Disarm` means clear
       snapshot + last-written, **no restore**; plan never writes when disabled
-- [ ] write tests: disabled → `Skip`; first write after enable carries
+      (the plan itself never captures the snapshot: `Write.snapshot_now` flags
+      "no snapshot persisted — capture the user's accents before writing")
+- [x] write tests: disabled → `Skip`; first write after enable carries
       `snapshot_now`; steady state rewrites; user-changed-accent-in-Settings →
       `Disarm`; user change while applet was stopped (persisted `last_written`
       vs fresh read at startup reconciliation) → `Disarm`
-- [ ] write tests: grey hue (`None`) still writes (warm grey); the
+- [x] write tests: grey hue (`None`) still writes (warm grey); the
       enable→manual-change→disarm→re-enable→disable sequence ends with the
       accents from *re-enable time* restored (not the original pre-feature
       ones) — the re-snapshot rule
-- [ ] run `just check` - must pass before task 6
+- [x] run `just check` - must pass before task 6
 
 ### Task 6: Wire into the app message loop
 
