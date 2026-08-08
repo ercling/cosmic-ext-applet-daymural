@@ -3,9 +3,14 @@
 // The `CosmicConfigEntry` derive stores each field as its own RON file under
 // `$XDG_CONFIG_HOME/cosmic/<APP_ID>/v1/<field>` and generates per-field
 // `set_<field>(&mut self, &Config, value) -> Result<bool>` setters that write
-// to disk only when the value actually changed. The applet itself persists
-// whole configs via `write_entry` (`Window::set_config`), so the generated
-// setters are exercised only by the tests below.
+// to disk only when the value actually changed. The applet persists whole
+// configs via `write_entry` (`Window::set_config`, which merely warns on
+// failure) — except for the accent state machine's critical persists
+// (snapshot / last-written / the enable toggle in `app.rs`), which go through
+// the generated setters precisely because those return the error: a silently
+// lost accent persist is how a snapshot gets destroyed on the next startup.
+// Note the setters mutate the field *before* writing, so a caller that must
+// stay consistent on failure has to roll the field back itself.
 
 use cosmic::cosmic_config::{
     self, Config, CosmicConfigEntry, cosmic_config_derive::CosmicConfigEntry,
@@ -273,11 +278,12 @@ mod tests {
         assert_eq!(loaded.retention_days, 30);
     }
 
-    // No per-setter tests for the generated accent setters: production
-    // persists whole entries via `write_entry` (`Window::set_config`), and
-    // the accent fields' round-trip is covered by
+    // No per-setter tests for the generated accent setters here: their
+    // production call sites (the accent state machine's checked persists in
+    // `app.rs`) are exercised by that module's failure-injection tests, the
+    // accent fields' round-trip is covered by
     // `write_then_load_roundtrips_non_default_values` /
-    // `pre_accent_v1_entry_still_loads`; the derive's write-on-change
+    // `pre_accent_v1_entry_still_loads`, and the derive's write-on-change
     // mechanics are already exercised once by
     // `generated_setter_writes_only_on_change`.
 

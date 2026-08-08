@@ -168,30 +168,53 @@ the pinned rev before coding against remembered names.
     write the `u8/255` f32 via `set_accent` — exact-f32 RON round-trip — and
     persist the same array); before the first successful write the enable-time
     snapshot stands in for `last_written` (so a user pick after a transient
-    write failure still counts); any mismatch means the user intervened →
-    **Disarm**: flip the toggle off through the config setter, clear snapshot
-    + last-written, **no restore** — the user's manual choice stands. When the
-    computed pair *equals* `last_written` the plan returns **Skip** — disk is
-    provably right, and rewriting would fire theme-change notifications into
-    every COSMIC app on each startup reconciliation / same-hue apply. A failed
-    `write_accents` **rolls back** whatever (possibly) landed to the accents
-    the plan compared, per mode, best-effort — a half-write left on disk
-    (light lands before dark; a builder key can land without its theme) is
-    *our* colour, which the guard cannot tell from user intervention: it would
-    Disarm and destroy the snapshot without restoring.
+    write failure still counts); any mismatch → **Disarm**: flip the toggle
+    off through the config setter, clear last-written, **no restore** — a
+    manual choice stands. Whether the snapshot survives the disarm depends on
+    what the mismatch can be: after a *recorded* write it is genuinely the
+    user (`keep_snapshot: false` — their pick supersedes the record), but in
+    the enable→first-write gap (`last_written` still `None`) it is
+    indistinguishable from our own **unrecorded** write (crash / failed
+    persist between theme write and record), so the gap disarm keeps the
+    snapshot (`keep_snapshot: true`) for the next enable's deferred restore —
+    the least-lossy rule. When the computed pair *equals* `last_written` the
+    plan returns **Skip** — disk is provably right, and rewriting would fire
+    theme-change notifications into every COSMIC app on each startup
+    reconciliation / same-hue apply. A failed `write_accents` **rolls back**
+    whatever (possibly) landed to the accents the plan compared, per mode,
+    best-effort — a half-write left on disk (light lands before dark; a
+    builder key can land without its theme) is *our* colour, which the guard
+    cannot tell from user intervention.
   - **Snapshot lifecycle**: enable snapshots the *live* accents (disable and
-    disarm clear the snapshot, so a normal re-enable re-snapshots) and clears
-    any stale last-written — **unless** a snapshot survived a disable that
-    couldn't restore: that one is the only record of the user's pre-feature
-    accents while the disk may still hold ours, so enable restores it (the
-    deferred restore) and keeps it, refusing to arm if that restore fails.
-    Disable restores the snapshot verbatim — including `None` = palette
-    default — then clears both. Enable *refuses* without theme handles or a
-    persistable applet config (memory-only state breaks restart
-    reversibility); disable without handles keeps the snapshot (it cannot
-    restore, so it must not destroy the only way back). External
-    `accent_enabled` flips arriving via `ConfigUpdated` route through the same
-    toggle path, never adopt the flag silently.
+    a recorded-write disarm clear the snapshot, so a normal re-enable
+    re-snapshots) and clears any stale last-written — **unless** a snapshot
+    survived a disabled period (a disable or gap disarm that couldn't
+    restore): that one is the only record of the user's pre-feature accents
+    while the disk may still hold ours, so enable restores it (the deferred
+    restore) and keeps it, refusing to arm if that restore fails. Disable
+    restores the snapshot verbatim — including `None` = palette default —
+    then clears both; a disable whose restore *fails* (handles missing or the
+    write erroring) keeps the snapshot while still turning off — the next
+    enable's deferred restore is the retry, so **no failure path ever clears
+    the snapshot without a successful restore**. Enable *refuses* without
+    theme handles or a persistable applet config (memory-only state breaks
+    restart reversibility). External `accent_enabled` flips arriving via
+    `ConfigUpdated` route through the same toggle path, never adopt the flag
+    silently — and every refusal to enable pins `accent_enabled = false` back
+    onto the disk config (raw `ConfigSet::set`; the external flip is already
+    persisted, and a disk-enabled/memory-disabled split would re-arm at the
+    next startup over state the toggler never built).
+  - **Checked persists**: the accent state machine's config persists (the
+    enable-time snapshot/toggle, `snapshot_now`, `last_written`) go through
+    the derive's per-key setters — which return the error — never the
+    warn-and-swallow `set_config`: the snapshot must be on disk *before* the
+    first write it undoes (persist failure aborts the write), and a
+    `last_written` that cannot be persisted rolls the theme write back so the
+    guard still holds. The setters mutate the field before writing, so every
+    error path also rolls the in-memory field back. Remaining exposure is a
+    genuine crash between the theme write and its record — accepted, and the
+    gap disarm keeping the snapshot makes even that recoverable via
+    re-enable.
   - Recompute runs on every successful apply (`app.rs`'s `on_apply_success`,
     all three runtime paths), as a startup reconciliation from `init`
     (startup does not pass through `on_apply_success`), and again at

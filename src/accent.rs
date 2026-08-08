@@ -544,9 +544,18 @@ fn write_builder_accent(
 ///   persist `last_written`; when `snapshot_now` is set, first capture the
 ///   *current* builder accents as the snapshot (they are still the user's —
 ///   nothing of ours has landed yet).
-/// - [`AccentAction::Disarm`]: the user (or Settings) changed the accent —
-///   flip `accent_enabled` off through the setter and clear snapshot +
-///   last-written **without restoring**; the user's manual choice stands.
+/// - [`AccentAction::Disarm`]: the accent no longer matches what we wrote —
+///   flip `accent_enabled` off through the setter and clear last-written
+///   **without restoring**; a manual choice stands. `keep_snapshot` says
+///   whether the snapshot survives the disarm: `false` after a *recorded*
+///   write (`last_written` proves ours landed, so the mismatch is genuinely
+///   the user — their pick supersedes the pre-feature record), `true` in the
+///   enable→first-write gap (`last_written` still `None`), where the mismatch
+///   cannot be told apart from our own **unrecorded** write — a crash or a
+///   failed persist between the theme write and its `last_written` record —
+///   and clearing would permanently destroy the only record of the user's
+///   pre-feature accents while ours stay on disk. The kept snapshot is
+///   reconciled by the next enable's deferred restore.
 /// - [`AccentAction::Skip`]: change nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccentAction {
@@ -555,7 +564,9 @@ pub enum AccentAction {
         dark: [u8; 3],
         snapshot_now: bool,
     },
-    Disarm,
+    Disarm {
+        keep_snapshot: bool,
+    },
     Skip,
 }
 
@@ -574,12 +585,19 @@ pub enum AccentAction {
 /// Don't-clobber: once `last_written` exists, both builders must still hold
 /// exactly those bytes (`[u8; 3]` compare — exact by the quantise-then-convert
 /// construction). Any difference, including a mode reset to palette default,
-/// means the user intervened → [`AccentAction::Disarm`]. Before the first
-/// successful write (`last_written` still `None`) the enable-time snapshot
-/// stands in: the only accents legitimately on disk then are the snapshot's
-/// own, so a mismatch there is the user intervening in the enable→first-write
-/// gap (e.g. after a transient write failure) and disarms too — without it
-/// the guard would be inert until a write finally lands.
+/// means the user intervened → [`AccentAction::Disarm`] (clearing the
+/// snapshot — their pick supersedes it). Before the first successful write
+/// (`last_written` still `None`) the enable-time snapshot stands in: the only
+/// accents legitimately on disk then are the snapshot's own, so a mismatch
+/// there disarms too — without it the guard would be inert until a write
+/// finally lands. That gap mismatch, though, is ambiguous: it is the user
+/// intervening (a Settings pick between enable and the first compute) *or*
+/// our own write whose `last_written` record never made it to disk (a crash
+/// or failed persist in the write→record window), and the two cannot be told
+/// apart. So the gap disarm keeps the snapshot (`keep_snapshot: true`) — the
+/// least-lossy rule: a genuine gap pick still stands now (no restore), while
+/// the pre-feature record survives for the next enable's deferred restore
+/// instead of being destroyed over what may be our own leftovers.
 ///
 /// Steady state: when the computed pair equals `last_written`, [`AccentAction::Skip`]
 /// — the non-Disarm path just proved the builders hold exactly those bytes,
@@ -614,10 +632,14 @@ pub fn accent_plan(
     }
     match (last_written, snapshot) {
         (Some(last), _) if current != (Some(last.light), Some(last.dark)) => {
-            return AccentAction::Disarm;
+            return AccentAction::Disarm {
+                keep_snapshot: false,
+            };
         }
         (None, Some(snap)) if current != (snap.light, snap.dark) => {
-            return AccentAction::Disarm;
+            return AccentAction::Disarm {
+                keep_snapshot: true,
+            };
         }
         _ => {}
     }
@@ -1387,11 +1409,15 @@ mod tests {
     }
 
     #[test]
-    fn a_change_in_the_enable_to_first_write_gap_disarms() {
+    fn a_change_in_the_enable_to_first_write_gap_disarms_keeping_the_snapshot() {
         // `last_written` is still None (the first write failed, or never
         // ran), but the builders no longer match the enable-time snapshot:
-        // the user intervened in that gap, and writing would clobber their
-        // pick — the snapshot stands in for `last_written` as the guard.
+        // either the user intervened in that gap (writing would clobber
+        // their pick) or our own write landed without its `last_written`
+        // record (crash / failed persist) — indistinguishable. So the gap
+        // disarm must keep the snapshot: clearing it over what may be our
+        // own leftovers would permanently destroy the user's pre-feature
+        // record; a genuine gap pick still stands (no restore happens now).
         let snapshot = AccentSnapshot {
             light: Some([10, 20, 30]),
             dark: None,
@@ -1405,7 +1431,12 @@ mod tests {
             dark_palette(),
             Some(120.0),
         );
-        assert_eq!(action, AccentAction::Disarm);
+        assert_eq!(
+            action,
+            AccentAction::Disarm {
+                keep_snapshot: true,
+            }
+        );
 
         // While the builders still match the snapshot, the retry writes.
         let action = accent_plan(
@@ -1449,7 +1480,11 @@ mod tests {
                     dark_palette(),
                     Some(120.0),
                 ),
-                AccentAction::Disarm,
+                // A recorded write proves the mismatch is genuinely the
+                // user: their pick supersedes the pre-feature record.
+                AccentAction::Disarm {
+                    keep_snapshot: false,
+                },
                 "{current:?} differs from last_written and must disarm"
             );
         }

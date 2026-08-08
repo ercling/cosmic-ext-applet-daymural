@@ -158,10 +158,38 @@ we drop: full-image decode (we use the 480×270 thumbnail), the subprocess
     pre-feature accents. Enable restores that snapshot (the deferred restore)
     and keeps it, refusing to arm if the restore fails.
   - **Disable** (toggle off): restore the snapshot verbatim (including `None` =
-    palette default), then clear snapshot + last-written.
+    palette default), then clear snapshot + last-written. ➕ *(review
+    iteration 3)* only after a **successful** restore: a disable whose restore
+    fails (theme handles missing *or* the restore write erroring) keeps the
+    snapshot while still turning off — the next enable's deferred restore is
+    the retry mechanism, so no failure path ever clears the snapshot without a
+    successful restore. ("Nothing would ever retry the restore" was the old
+    rationale for clearing anyway; the deferred-restore enable path made it
+    stale.)
   - **Disarm** (external accent change detected): flip the toggle off via the
-    config setter and clear snapshot + last-written **without restoring** — the
-    user's manual choice stands.
+    config setter and clear last-written **without restoring** — the user's
+    manual choice stands. ➕ *(review iteration 3)* the snapshot is cleared
+    only when `last_written` proves our write landed (the mismatch is
+    genuinely the user); in the enable→first-write gap (`last_written` still
+    `None`) the mismatch is indistinguishable from our own *unrecorded* write
+    (crash / failed persist between theme write and record), so the gap disarm
+    keeps the snapshot (`Disarm { keep_snapshot: true }`) for the next
+    enable's deferred restore — least-lossy: a genuine gap pick still stands
+    now, while the pre-feature record survives.
+  - ➕ *(review iteration 3)* **Checked persists**: the state machine's
+    critical config persists (enable-time snapshot/toggle, `snapshot_now`,
+    `last_written`) use the derive's per-key setters (which return the error)
+    instead of the warn-and-swallow `set_config`. The snapshot must be on disk
+    *before* the first write it undoes (persist failure aborts the write); a
+    `last_written` that cannot persist rolls the theme write back so the guard
+    still holds; the setters mutate before writing, so error paths roll the
+    in-memory field back too. Every *refusal* to enable also pins
+    `accent_enabled = false` onto the disk config (raw `ConfigSet::set`) —
+    an external `ConfigUpdated` enable is already persisted when the handler
+    refuses, and a disk-enabled/memory-disabled split would re-arm at the
+    next startup over state the toggler never built. Remaining exposure: a
+    genuine crash between the theme write and its record — accepted; the
+    keep-snapshot gap disarm makes even that recoverable via re-enable.
 - **Don't-clobber**: before each write, compare each builder's current accent
   against `accent_last_written` **in 8-bit space** (`[u8; 3]`); a mismatch
   means the user (or Settings) changed it → Disarm. Comparison is exact by
@@ -407,7 +435,10 @@ Types live in `src/accent.rs`; all colours are `[u8; 3]` (keeps `Eq` on
       by the caller (re-snapshot on a normal enable; ➕ *review re-check*: a
       snapshot surviving into an enable is restored and kept, never
       re-captured — see Solution Overview); `Disarm` means clear
-      snapshot + last-written, **no restore**; plan never writes when disabled
+      last-written, **no restore** (➕ *review iteration 3*: `Disarm` gained
+      `keep_snapshot` — `false` after a recorded write, `true` for the
+      ambiguous enable→first-write gap mismatch, see Solution Overview); plan
+      never writes when disabled
       (the plan itself never captures the snapshot: `Write.snapshot_now` flags
       "no snapshot persisted — capture the user's accents before writing")
 - [x] write tests: disabled → `Skip`; first write after enable carries
@@ -440,7 +471,11 @@ Types live in `src/accent.rs`; all colours are `[u8; 3]` (keeps `Eq` on
       fresh `read_current_accents`, `accent_plan`, execute the action (write +
       persist snapshot/last-written via config setters; `Disarm` flips
       `accent_enabled` off through the setter so the UI row follows and clears
-      snapshot + last-written without restoring)
+      last-written without restoring — snapshot cleared only when
+      `keep_snapshot` is false) ➕ *(review iteration 3)* the executor's
+      persists are the *checked* per-key setters: a failed `snapshot_now`
+      persist aborts the write entirely, a failed `last_written` persist rolls
+      the theme write back (see Solution Overview, Checked persists)
 - [x] `Message::SetAccentEnabled(bool)`: on → snapshot live accents (➕
       *review re-check*: unless one survives from a disable that couldn't
       restore — that one is restored and kept, see Solution Overview),
@@ -450,7 +485,12 @@ Types live in `src/accent.rs`; all colours are `[u8; 3]` (keeps `Eq` on
       enablement is on disk yet — a stale pair would trip the don't-clobber
       compare); enable with unusable theme handles refuses (stays off, logs);
       an echoed no-change toggle is a no-op (must not re-snapshot our own
-      accents as the user's)
+      accents as the user's) ➕ *(review iteration 3)* a disable whose restore
+      *fails* keeps the snapshot while turning off (next enable retries via
+      the deferred restore); enable-time persists are checked and refuse on
+      failure; every enable refusal pins `accent_enabled = false` back onto
+      the disk config so an already-persisted external flip cannot re-arm the
+      feature at the next startup
 - [x] startup reconciliation in `init`: when `accent_enabled` and a current
       wallpaper was restored, arm the same extraction task; add
       `accent_handles: Option<accent::ThemeHandles>` to `Window`, built in
