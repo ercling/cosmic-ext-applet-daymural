@@ -24,7 +24,8 @@ use cosmic::{
 
 use crate::catalogue::{self, Catalogue, ImageEntry};
 use crate::config::AppletConfig;
-use crate::fl;
+// No `fl!` here: every user-visible string this applet renders lives in the
+// popup (`view.rs`). The panel contributes an icon and nothing else.
 use crate::{bing, schedule, thumbs, view, wallpaper};
 
 /// One name everywhere: cosmic-config app ID, state dir, desktop entry.
@@ -1180,24 +1181,21 @@ impl cosmic::Application for Window {
             .map(|update| Message::ConfigUpdated(update.config))
     }
 
+    /// The panel button — bare, with **no** hover tooltip naming the applet.
+    ///
+    /// libcosmic's applet example wraps this button in `applet_tooltip`, but
+    /// the panel's own status applets (audio, battery, network, notifications,
+    /// time) do not label themselves on hover, and the first-party applets that
+    /// *do* use a panel tooltip put dynamic content in it rather than their own
+    /// name — window titles in cosmic-app-list and cosmic-applet-minimize, the
+    /// button label in cosmic-panel-button. A tooltip here made this applet the
+    /// only icon in the tray to announce itself. The tooltips inside the popup
+    /// stay: they name icon-only controls, which is what tooltips are for.
     fn view(&self) -> Element<'_, Self::Message> {
-        let button = self
-            .core
-            .applet
-            .icon_button(PANEL_ICON)
-            .on_press_down(Message::TogglePopup);
-        // Panel-level tooltip: parented to the panel (`parent_id: None`) and
-        // suppressed while our popup is open (`has_popup`), per libcosmic's
-        // own applet example.
         self.core
             .applet
-            .applet_tooltip::<Message>(
-                button,
-                fl!("panel-tooltip"),
-                self.popup.is_some(),
-                Message::Surface,
-                None,
-            )
+            .icon_button(PANEL_ICON)
+            .on_press_down(Message::TogglePopup)
             .into()
     }
 
@@ -1228,13 +1226,6 @@ mod tests {
     #[test]
     fn panel_icon_is_symbolic() {
         assert!(PANEL_ICON.ends_with("-symbolic"));
-    }
-
-    #[test]
-    fn panel_tooltip_names_the_applet() {
-        // Guards the English copy of the one string the panel shows on
-        // hover (the test loader is pinned to `en` — see `localize.rs`).
-        assert_eq!(fl!("panel-tooltip"), "Bing Wallpaper of the Day");
     }
 
     #[test]
@@ -2501,6 +2492,7 @@ mod tests {
             shuffle_enabled: true,
             shuffle_interval_secs: 3_600,
             retention_days: 1,
+            ..Default::default()
         };
         drop(window.update(Message::ConfigUpdated(external)));
 

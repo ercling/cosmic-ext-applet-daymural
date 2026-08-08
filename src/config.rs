@@ -12,6 +12,7 @@ use cosmic::cosmic_config::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::accent::{AccentPair, AccentSnapshot};
 use crate::app::APP_ID;
 
 /// The retention values the applet supports (the "Keep images" dropdown's
@@ -29,6 +30,16 @@ pub struct AppletConfig {
     pub shuffle_interval_secs: u32,
     /// Keep images for N days; 0 = forever.
     pub retention_days: u16,
+    /// Derive the COSMIC accent colour from the applied wallpaper (opt-in,
+    /// off by default).
+    pub accent_enabled: bool,
+    /// The user's accents captured at enable time, restored verbatim on
+    /// disable. `None` = no snapshot taken (feature never enabled, or
+    /// disarmed).
+    pub accent_snapshot: Option<AccentSnapshot>,
+    /// The accents we last wrote, persisted so the don't-clobber comparison
+    /// survives applet restarts.
+    pub accent_last_written: Option<AccentPair>,
 }
 
 impl Default for AppletConfig {
@@ -37,6 +48,9 @@ impl Default for AppletConfig {
             shuffle_enabled: false,
             shuffle_interval_secs: 86_400,
             retention_days: 8,
+            accent_enabled: false,
+            accent_snapshot: None,
+            accent_last_written: None,
         }
     }
 }
@@ -102,6 +116,10 @@ mod tests {
         assert!(!config.shuffle_enabled);
         assert_eq!(config.shuffle_interval_secs, 86_400);
         assert_eq!(config.retention_days, 8);
+        // The accent feature is opt-in: off by default, nothing persisted.
+        assert!(!config.accent_enabled);
+        assert_eq!(config.accent_snapshot, None);
+        assert_eq!(config.accent_last_written, None);
         assert_eq!(AppletConfig::VERSION, 1);
     }
 
@@ -121,6 +139,15 @@ mod tests {
             shuffle_enabled: true,
             shuffle_interval_secs: 1_800,
             retention_days: 30,
+            accent_enabled: true,
+            accent_snapshot: Some(AccentSnapshot {
+                light: Some([10, 20, 30]),
+                dark: None,
+            }),
+            accent_last_written: Some(AccentPair {
+                light: [40, 50, 60],
+                dark: [70, 80, 90],
+            }),
         };
         written.write_entry(&ctx).expect("write entry");
 
@@ -158,6 +185,7 @@ mod tests {
             shuffle_enabled: true,
             shuffle_interval_secs: 3_600,
             retention_days: 30,
+            ..Default::default()
         };
         written.write_entry(&ctx).expect("write entry");
 
@@ -205,6 +233,117 @@ mod tests {
         config.set_retention_days(&ctx, 1).expect("setter write");
 
         assert_eq!(AppletConfig::load(&ctx).retention_days, 8);
+    }
+
+    #[test]
+    fn pre_accent_v1_entry_still_loads() {
+        // A config written before the accent fields existed has no
+        // `accent_*` key files on disk. Simulate it by writing a full entry
+        // and deleting those keys — loading must yield the accent defaults
+        // while keeping the stored pre-existing values.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_context(&dir);
+
+        let written = AppletConfig {
+            shuffle_enabled: true,
+            shuffle_interval_secs: 1_800,
+            retention_days: 30,
+            accent_enabled: true,
+            accent_snapshot: Some(AccentSnapshot {
+                light: Some([1, 2, 3]),
+                dark: Some([4, 5, 6]),
+            }),
+            accent_last_written: Some(AccentPair {
+                light: [7, 8, 9],
+                dark: [10, 11, 12],
+            }),
+        };
+        written.write_entry(&ctx).expect("write entry");
+        for key in ["accent_enabled", "accent_snapshot", "accent_last_written"] {
+            std::fs::remove_file(find_key_file(dir.path(), key)).unwrap();
+        }
+
+        let loaded = AppletConfig::load(&ctx);
+        assert!(!loaded.accent_enabled);
+        assert_eq!(loaded.accent_snapshot, None);
+        assert_eq!(loaded.accent_last_written, None);
+        // Pre-existing fields keep their stored values.
+        assert!(loaded.shuffle_enabled);
+        assert_eq!(loaded.shuffle_interval_secs, 1_800);
+        assert_eq!(loaded.retention_days, 30);
+    }
+
+    #[test]
+    fn accent_setters_write_only_on_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_context(&dir);
+
+        let mut config = AppletConfig::default();
+        config.write_entry(&ctx).expect("write entry");
+
+        // accent_enabled: change → written, same value → no-op.
+        assert!(config.set_accent_enabled(&ctx, true).expect("setter write"));
+        assert!(!config.set_accent_enabled(&ctx, true).expect("setter no-op"));
+
+        // accent_snapshot: change → written, same value → no-op.
+        let snapshot = Some(AccentSnapshot {
+            light: None,
+            dark: Some([9, 9, 9]),
+        });
+        assert!(
+            config
+                .set_accent_snapshot(&ctx, snapshot)
+                .expect("setter write")
+        );
+        assert!(
+            !config
+                .set_accent_snapshot(&ctx, snapshot)
+                .expect("setter no-op")
+        );
+
+        // accent_last_written: change → written, same value → no-op.
+        let pair = Some(AccentPair {
+            light: [1, 2, 3],
+            dark: [4, 5, 6],
+        });
+        assert!(
+            config
+                .set_accent_last_written(&ctx, pair)
+                .expect("setter write")
+        );
+        assert!(
+            !config
+                .set_accent_last_written(&ctx, pair)
+                .expect("setter no-op")
+        );
+
+        let reloaded = AppletConfig::load(&ctx);
+        assert!(reloaded.accent_enabled);
+        assert_eq!(reloaded.accent_snapshot, snapshot);
+        assert_eq!(reloaded.accent_last_written, pair);
+    }
+
+    #[test]
+    fn normalize_leaves_accent_fields_alone() {
+        let config = AppletConfig {
+            // An out-of-set retention forces normalize to actually rewrite…
+            retention_days: 1,
+            accent_enabled: true,
+            accent_snapshot: Some(AccentSnapshot {
+                light: Some([1, 2, 3]),
+                dark: None,
+            }),
+            accent_last_written: Some(AccentPair {
+                light: [4, 5, 6],
+                dark: [7, 8, 9],
+            }),
+            ..Default::default()
+        };
+        let normalized = config.clone().normalize();
+        // …while every accent field passes through untouched.
+        assert_eq!(normalized.accent_enabled, config.accent_enabled);
+        assert_eq!(normalized.accent_snapshot, config.accent_snapshot);
+        assert_eq!(normalized.accent_last_written, config.accent_last_written);
     }
 
     /// Locate the per-field RON file cosmic-config wrote inside the TempDir.

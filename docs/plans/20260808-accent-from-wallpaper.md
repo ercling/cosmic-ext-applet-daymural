@@ -363,17 +363,18 @@ Types live in `src/accent.rs`; all colours are `[u8; 3]` (keeps `Eq` on
 **Files:**
 - Modify: `src/config.rs`
 
-- [ ] add `accent_enabled: bool` (default **false**), `accent_snapshot:
+- [x] add `accent_enabled: bool` (default **false**), `accent_snapshot:
       Option<AccentSnapshot>`, `accent_last_written: Option<AccentPair>` using
       the Task 3 types (`Eq` on `AppletConfig` must keep compiling — that is
       why the colours are `[u8; 3]`)
-- [ ] write-on-change setters following the existing pattern; `normalize()`
-      leaves the new fields alone
-- [ ] write tests: defaults (feature off, no snapshot), round-trip through a
+- [x] write-on-change setters following the existing pattern; `normalize()`
+      leaves the new fields alone (setters come from the `CosmicConfigEntry`
+      derive, same as the existing fields — no hand-written ones needed)
+- [x] write tests: defaults (feature off, no snapshot), round-trip through a
       `with_custom_path` config, pre-existing v1 entry without the new fields
       still loads (backward compat)
-- [ ] write tests for setter write-on-change behaviour (no write when equal)
-- [ ] run `just check` - must pass before task 5
+- [x] write tests for setter write-on-change behaviour (no write when equal)
+- [x] run `just check` - must pass before task 5
 
 ### Task 5: Pure apply/disarm decision (`accent_plan`)
 
