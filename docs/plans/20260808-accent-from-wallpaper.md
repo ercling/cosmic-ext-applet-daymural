@@ -198,11 +198,19 @@ we drop: full-image decode (we use the 480×270 thumbnail), the subprocess
   outside sRGB and clipping shifts the hue. `None` hue → the palette's own
   `accent_warm_grey`.
 - Guard: single check `max(contrast(accent, white), contrast(accent, black))
-  >= 4.5` via `Wcag21RelativeContrast`; on failure fall back to
+  >= 6.0` via `Wcag21RelativeContrast`; on failure fall back to
   `accent_warm_grey`. No iterative nudge loop — measured worst case over all
   360 hues on the stock palettes is ≥ 8.3, so a nudge would be unreachable
   dead code; the fallback branch is exercised by a test with a synthetic
   pathological palette instead.
+  ⚠️ Threshold corrected 4.5 → 6.0 during Task 2: for *any* colour the better
+  of white/black contrast has a hard floor of ≈ 4.58 (the two ratios are equal
+  at relative luminance Y ≈ 0.179, both ≈ 0.229/0.05), so a 4.5 guard is
+  mathematically unreachable — dead code, contradicting both the "branch must
+  not be dead code" requirement below and notes §4's purpose (reject
+  mid-luminance accents, which live exactly at that floor). 6.0 rejects the
+  mid-luminance band Y ∈ (0.125, 0.25) and keeps ≥ 2.3 margin under the stock
+  palettes' measured ≥ 8.3 (re-asserted in the sweep test).
 
 ### Theme write (`src/accent.rs`; supersedes notes §2)
 
@@ -301,22 +309,26 @@ Types live in `src/accent.rs`; all colours are `[u8; 3]` (keeps `Eq` on
 **Files:**
 - Modify: `src/accent.rs`
 
-- [ ] `tone_band(palette: &CosmicPaletteInner) -> (f32, f32)`: mean Oklch
+- [x] `tone_band(palette: &CosmicPaletteInner) -> (f32, f32)`: mean Oklch
       (L, C) of the 8 chromatic `accent_*` fields (`Srgba` → `Srgb`)
-- [ ] `accent_for(palette, hue: Option<f32>) -> Srgb`: transplant, then
+- [x] `accent_for(palette, hue: Option<f32>) -> Srgb`: transplant, then
       gamut-map by **chroma reduction at fixed (L, h)** (binary search on C);
       `None` → `accent_warm_grey`
-- [ ] WCAG guard via `Wcag21RelativeContrast`: single check ≥ 4.5 against the
+- [x] WCAG guard via `Wcag21RelativeContrast`: single check ≥ 6.0 against the
       better of white/black; failure → `accent_warm_grey` (no nudge loop)
-- [ ] write tests: transplant preserves hue **after gamut mapping** (±small,
+      ⚠️ threshold was specified as 4.5 but that is below the ≈ 4.58
+      mathematical floor of max-contrast-vs-white-or-black, i.e. a guard that
+      can never fire — see the correction note under "Transplant + gamut
+      mapping + guard" above
+- [x] write tests: transplant preserves hue **after gamut mapping** (±small,
       full 0..360 sweep in 1° steps for both `DARK_PALETTE` and
       `LIGHT_PALETTE`), and the same sweep passes the WCAG guard without
       hitting the fallback
-- [ ] write tests: light vs dark palette produce different tones from the same
+- [x] write tests: light vs dark palette produce different tones from the same
       hue; grey fallback returns the palette's own warm grey; a synthetic
       pathological palette (mid-luminance accents) does trigger the
       warm-grey fallback (the branch must not be dead code)
-- [ ] run `just check` - must pass before task 3
+- [x] run `just check` - must pass before task 3
 
 ### Task 3: Theme writer with snapshot/restore + persisted colour types
 
