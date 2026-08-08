@@ -269,9 +269,38 @@ Then exactly one branch:
 **Files:**
 - Modify: `src/view.rs` and/or `src/app.rs` tests (only if a gap is found)
 
-- [ ] confirm the two existing regression tests still cover the fix: `display_title_falls_back_to_file_stem_for_rebuilt_entries` (title fallback, `src/view.rs`) and `pipeline_never_downloads_when_the_catalogue_holds_the_file` (`src/app.rs:1174` — builds the catalogue via `rebuild_from_folder` and asserts the thumbnail file exists after the pipeline)
-- [ ] only if an uncovered aspect of the first-open scenario turns up: add a test for it (tempdir-rooted, mock server via `testutil::spawn_mock`); otherwise this task is a five-minute confirmation, no behavior change
-- [ ] run `just check` — must pass before task 3
+- [x] confirm the two existing regression tests still cover the fix: `display_title_falls_back_to_file_stem_for_rebuilt_entries` (title fallback, `src/view.rs:422`) and `pipeline_never_downloads_when_the_catalogue_holds_the_file` (`src/app.rs:1174` — builds the catalogue via `rebuild_from_folder` and asserts the thumbnail file exists after the pipeline) — both present and green
+- [x] only if an uncovered aspect of the first-open scenario turns up: add a test for it (tempdir-rooted, mock server via `testutil::spawn_mock`); otherwise this task is a five-minute confirmation, no behavior change — **a gap turned up, test added** (see findings)
+- [x] run `just check` — must pass before task 3 (131 tests pass, fmt + clippy clean)
+
+➕ **Findings (2026-08-08) — coverage confirmed, one gap found and closed**
+
+Both named tests are present and green, and between them they cover the two
+halves of the reported symptom:
+
+- *filename shown as title* — `display_title_falls_back_to_file_stem_for_rebuilt_entries`
+  (`src/view.rs:422`) pins the fallback, and `merge_fills_rebuilt_entry_without_redownload`
+  (`src/catalogue.rs:596`) pins the recovery: the next fetch refills a rebuilt
+  entry's title/copyright while keeping its on-disk `filename`.
+- *empty preview* — `pipeline_never_downloads_when_the_catalogue_holds_the_file`
+  (`src/app.rs:1174`) asserts the thumbnail exists after the pipeline for a
+  file the catalogue already held.
+
+⚠️ **Gap:** that second test's pre-existing file is *inside* the fetch window,
+so its thumbnail comes from the download loop's `ensure_thumbnail_logged`
+(`src/app.rs:517`), **not** from the out-of-window backfill pass
+(`src/app.rs:521-530`). Nothing exercised the backfill — yet it is exactly the
+code the real first-open case leans on: a folder migrated from the reference
+GNOME extension holds months of images while one fetch window covers ~8, so
+without the backfill every older entry keeps the placeholder forever.
+
+Added `pipeline_backfills_thumbnails_outside_the_fetch_window` (`src/app.rs`):
+a rebuilt catalogue whose only entry is dated outside the mock's one-image
+list, plus a foreign non-wallpaper file in the same folder. Asserts the
+out-of-window entry gets a thumbnail and the untracked foreign file does not.
+Mutation-checked: disabling the backfill loop fails this test and no other.
+
+No behavior change — test-only.
 
 ### Task 3: Tooltips on all icon-only controls
 

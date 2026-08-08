@@ -1205,4 +1205,51 @@ mod tests {
         // The thumbnail backfill covered the pre-existing entry too.
         assert!(thumbs::thumbnail_path(&existing, &state).is_file());
     }
+
+    #[tokio::test]
+    async fn pipeline_backfills_thumbnails_outside_the_fetch_window() {
+        // First open after a migration: the folder holds far more images
+        // than one fetch window covers (the reference GNOME extension kept
+        // months of them). Entries older than the window are never touched
+        // by the download loop, so only the backfill pass gives them a
+        // preview — without it the popup shows the placeholder forever for
+        // everything but the last few days.
+        let dir = tempfile::tempdir().unwrap();
+        let download_dir = dir.path().join("images");
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&download_dir).unwrap();
+        let old = download_dir.join("20250101-Old_ROW0_UHD.jpg");
+        std::fs::write(&old, crate::testutil::tiny_jpeg(64, 36)).unwrap();
+        // A foreign file in the folder is not catalogued and gets no thumb.
+        let foreign = download_dir.join("holiday.jpg");
+        std::fs::write(&foreign, crate::testutil::tiny_jpeg(32, 18)).unwrap();
+        let catalogue = Catalogue::rebuild_from_folder(&download_dir);
+        assert_eq!(catalogue.images.len(), 1, "only the wallpaper is tracked");
+
+        let jpeg = crate::testutil::tiny_jpeg(64, 36);
+        let base = crate::testutil::spawn_mock(move |path| {
+            if path.starts_with("/HPImageArchive.aspx") {
+                (200, LIST_JSON.as_bytes().to_vec())
+            } else if path.starts_with("/th?id=OHR.") {
+                (200, jpeg.clone())
+            } else {
+                (404, Vec::new())
+            }
+        });
+
+        let client = bing::http_client().unwrap();
+        let fetched = fetch_and_download(&client, &base, &catalogue, 1, &download_dir, &state)
+            .await
+            .unwrap();
+
+        // The fetch window holds only the new image…
+        assert_eq!(fetched.len(), 1);
+        assert!(thumbs::thumbnail_path(&fetched[0].filename, &state).is_file());
+        // …yet the older catalogue entry got a thumbnail all the same.
+        assert!(
+            thumbs::thumbnail_path(&old, &state).is_file(),
+            "out-of-window entry must be backfilled"
+        );
+        assert!(!thumbs::thumbnail_path(&foreign, &state).exists());
+    }
 }
