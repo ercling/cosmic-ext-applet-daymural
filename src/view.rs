@@ -46,6 +46,23 @@ const RETENTION_LABELS: &[&str] = &["3 days", "8 days", "30 days", "Forever"];
 /// hand-edited config values that match no choice.
 const RETENTION_DEFAULT_INDEX: usize = 1;
 
+/// Opacity applied to a *disabled* icon button's glyph.
+///
+/// The theme's own disabled appearance is a no-op for `Button::Icon`, so this
+/// has to be explicit (verified against libcosmic rev `8a017a1`):
+/// * `icon_button.on` and `.on_disabled` are the **same RGB** colour
+///   (`control_steps_array[8]`), differing only in alpha (1.0 vs 0.65 — see
+///   `Component::component`, `cosmic-theme/src/model/derivation.rs`), and the
+///   SVG rasteriser tints RGB only, keeping each pixel's source alpha
+///   (`iced/wgpu/src/image/vector.rs:173`). The alpha delta is discarded.
+/// * the disabled background tweak (`background.a *= 0.5`,
+///   `theme/style/button.rs`) is also a no-op because `icon_button.base` is
+///   fully transparent.
+///
+/// `Icon::opacity` survives to the renderer as its own uniform
+/// (`iced/wgpu/src/image/mod.rs:348`), so it is the one lever that works.
+const DISABLED_ICON_OPACITY: f32 = 0.4;
+
 // ---------------------------------------------------------------------------
 // Pure decisions (tested)
 // ---------------------------------------------------------------------------
@@ -154,6 +171,13 @@ pub fn retention_days(index: usize) -> u16 {
         .get(index)
         .copied()
         .unwrap_or(RETENTION_DAYS[RETENTION_DEFAULT_INDEX])
+}
+
+/// Opacity for an icon button's glyph: full while it can be pressed, dimmed
+/// once it cannot (see [`DISABLED_ICON_OPACITY`] for why the theme cannot do
+/// this for us).
+pub fn icon_opacity(enabled: bool) -> f32 {
+    if enabled { 1.0 } else { DISABLED_ICON_OPACITY }
 }
 
 /// Status footer text.
@@ -344,14 +368,32 @@ fn refresh_button(window: &Window) -> Element<'_, Message> {
     )
 }
 
-/// One icon button with a hover tooltip; `None` renders it disabled.
+/// One icon button with a hover tooltip; `None` renders it disabled — and
+/// *visibly* so, via [`icon_opacity`].
+///
+/// This open-codes what `widget::button::icon` builds internally (a padded
+/// row holding the glyph, wrapped in `button::custom` with
+/// `theme::Button::Icon`) because that constructor takes a bare `Handle` and
+/// gives no way to reach the `Icon`'s opacity.
 fn nav_button<'a>(
     window: &Window,
     icon: &'static str,
     tooltip: &'static str,
     on_press: Option<Message>,
 ) -> Element<'a, Message> {
-    let button = widget::button::icon(widget::icon::from_name(icon)).on_press_maybe(on_press);
+    let space = cosmic::theme::spacing();
+    let glyph = widget::icon::from_name(icon)
+        .icon()
+        .opacity(icon_opacity(on_press.is_some()));
+    let button = widget::button::custom(
+        widget::Row::new()
+            .push(glyph)
+            .padding(space.space_xxs)
+            .align_y(Alignment::Center),
+    )
+    .padding(0)
+    .class(cosmic::theme::Button::Icon)
+    .on_press_maybe(on_press);
     popup_tooltip(window, button, tooltip)
 }
 
@@ -522,6 +564,20 @@ mod tests {
         // Hand-edited config value → displays as the 8-day default.
         assert_eq!(retention_index(5), 1);
         assert_eq!(retention_index(9_999), 1);
+    }
+
+    #[test]
+    fn disabled_icons_are_visibly_dimmed() {
+        // An enabled glyph must stay untouched, a disabled one must be dim
+        // enough to read as disabled at a glance — the theme's own disabled
+        // styling is invisible for `Button::Icon` (see DISABLED_ICON_OPACITY).
+        assert_eq!(icon_opacity(true), 1.0);
+        let disabled = icon_opacity(false);
+        assert!(
+            (0.2..=0.6).contains(&disabled),
+            "disabled opacity {disabled} is not a clear visual difference"
+        );
+        assert!(disabled < icon_opacity(true));
     }
 
     #[test]

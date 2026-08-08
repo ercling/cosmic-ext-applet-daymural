@@ -331,12 +331,63 @@ No behavior change — test-only.
 **Files:**
 - Modify: `src/view.rs`
 
-- [ ] reproduce: build, open popup at the oldest image (prev disabled) and confirm disabled/enabled render identically
-- [ ] diagnose which suspect it is (see Context — the theme's disabled path is already fully wired, so do NOT reach for `.class(theme::Button::Icon)`, it's a no-op): (a) check whether the symbolic icons resolve to SVG or PNG on this system (`Data::Image` is drawn untinted, `widget/icon/mod.rs:111`); (b) compare `icon_button.on` vs `.on_disabled` in the active palette
-- [ ] implement explicit dimming in `nav_button`: build the icon with `Icon::opacity(..)` reduced (e.g. ~0.4) when `on_press` is `None` — this is the expected fix regardless of which suspect confirmed; record the diagnosis outcome here
-- [ ] verify visually in the panel: disabled prev at oldest end, disabled next/newest at newest end, disabled refresh while a fetch is pending
-- [ ] tests: view-code exempt (`nav_button` gains no pure logic; if a helper like `disabled_icon_alpha()` emerges, unit-test it)
-- [ ] run `just check` — must pass before task 5
+- [x] reproduce: build, open popup at the oldest image (prev disabled) and confirm disabled/enabled render identically — **[x] manual test (skipped — GUI-only, not automatable); superseded by a stronger result: the diagnosis below shows the disabled and enabled glyphs are *provably* pixel-identical (same RGB, and every alpha/background difference the theme applies is discarded downstream), so the symptom is explained rather than merely observed**
+- [x] diagnose which suspect it is (see Context — the theme's disabled path is already fully wired, so do NOT reach for `.class(theme::Button::Icon)`, it's a no-op): (a) check whether the symbolic icons resolve to SVG or PNG on this system (`Data::Image` is drawn untinted, `widget/icon/mod.rs:111`); (b) compare `icon_button.on` vs `.on_disabled` in the active palette — **suspect (b), in a harder form than the plan expected** (see findings)
+- [x] implement explicit dimming in `nav_button`: build the icon with `Icon::opacity(..)` reduced (e.g. ~0.4) when `on_press` is `None` — this is the expected fix regardless of which suspect confirmed; record the diagnosis outcome here
+- [x] verify visually in the panel: disabled prev at oldest end, disabled next/newest at newest end, disabled refresh while a fetch is pending — **[x] manual test (skipped — not automatable, no interactive wayland session); already listed under Post-Completion, and Task 8 re-checks all four disabled cases after `just install`**
+- [x] tests: view-code exempt (`nav_button` gains no pure logic; if a helper like `disabled_icon_alpha()` emerges, unit-test it) — a helper did emerge (`icon_opacity`), unit-tested by `disabled_icons_are_visibly_dimmed`
+- [x] run `just check` — must pass before task 5 (133 tests pass, fmt + clippy clean)
+
+➕ **Findings (2026-08-08) — suspect (b), and the alpha delta is discarded outright**
+
+Suspect (a) is ruled out: the active icon theme is `Cosmic`, and all four names
+(`go-previous-symbolic`, `go-next-symbolic`, `go-last-symbolic`,
+`view-refresh-symbolic`) resolve to `.svg` under
+`/usr/share/icons/Cosmic/scalable/actions/` — no PNG exists for them in any
+search path, and `Named` sets `prefer_svg: true` for `-symbolic` names anyway
+(`widget/icon/named.rs:58`). The `Data::Svg` branch is taken, so the icons *are*
+tinted.
+
+Suspect (b) is confirmed, and it is not merely "near-invisible" — the disabled
+appearance is provably a **no-op**, on two independent counts (libcosmic rev
+`8a017a1`):
+
+1. **Foreground.** `icon_button` is built by `Component::component`
+   (`cosmic-theme/src/model/derivation.rs:170`), which sets
+   `on = on_component` and `on_disabled = on_component.with_alpha(0.65)` —
+   the *same RGB*, differing only in alpha. But the SVG rasteriser tints RGB
+   only and keeps each source pixel's alpha
+   (`iced/wgpu/src/image/vector.rs:173-181`: `rgba[0..=2] = color[0..=2]`,
+   `rgba[3]` untouched). The alpha carried by `icon_color` never reaches a
+   pixel, so enabled and disabled glyphs rasterise **identically**.
+2. **Background.** `disabled()` halves the background alpha
+   (`theme/style/button.rs:220`), but `icon_button.base` is
+   `Srgba::new(0,0,0,0)` (`cosmic-theme/src/model/theme.rs:1480`) — half of
+   transparent is still transparent.
+
+`Icon::opacity` is the one lever that survives: it is threaded into
+`Svg::opacity` (`widget/icon/mod.rs:104`), into `svg::Svg { opacity }`
+(`iced/widget/src/svg.rs:343`), and reaches the renderer as its own instance
+uniform (`iced/wgpu/src/image/mod.rs:348`) — independent of the tint colour.
+
+Implemented as planned: `nav_button` now builds
+`widget::icon::from_name(..).icon().opacity(icon_opacity(on_press.is_some()))`
+with `DISABLED_ICON_OPACITY = 0.4`.
+
+[decision] `widget::button::icon` takes a bare `Handle` and exposes no path to
+the inner `Icon`, so `nav_button` open-codes what that constructor builds
+internally (`button::custom` over a `Row` padded by `space_xxs`, `.padding(0)`,
+`.class(theme::Button::Icon)` — `widget/button/icon.rs:135-190`). Visual output
+is unchanged for enabled buttons; only the disabled glyph now dims. The
+alternative (upstream patch to plumb opacity through `button::icon`) is out of
+scope for a rev-pinned dependency.
+
+[decision] The pure helper is `icon_opacity(enabled: bool) -> f32` rather than
+the plan's speculative `disabled_icon_alpha()` — it is the value the call site
+actually needs (one call, both branches) and keeps the ternary out of the view
+code. `DISABLED_ICON_OPACITY` stays private; the test asserts a range
+(0.2..=0.6) plus `disabled < enabled` so the constant can be tuned by eye
+without churning the test.
 
 ### Task 5: i18n infrastructure + externalize all strings (English)
 
