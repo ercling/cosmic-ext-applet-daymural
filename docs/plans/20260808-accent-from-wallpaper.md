@@ -468,19 +468,20 @@ Types live in `src/accent.rs`; all colours are `[u8; 3]` (keeps `Eq` on
 
 ### Task 8: Verify acceptance criteria
 
-- [ ] verify all requirements from Overview: off by default, hue transplant per
+- [x] verify all requirements from Overview: off by default, hue transplant per
       the decided algorithm, gamut-mapped + WCAG-guarded, snapshot/restore
       exact (incl. the `None` = palette-default state), don't-clobber disarm,
       builder writes touch only the `accent` key
-- [ ] verify failure paths leave the accent untouched (grep the handler for an
+- [x] verify failure paths leave the accent untouched (grep the handler for an
       early-return on every `Err`)
-- [ ] run full test suite: `just check`
-- [ ] smoke-test on the live desktop: `just install`, toggle on → accent
+- [x] run full test suite: `just check`
+- [x] smoke-test on the live desktop: `just install`, toggle on → accent
       follows wallpaper across browse/shuffle/refresh; change accent in
       Settings → applet disarms (toggle drops, chosen accent stays); toggle
       off → snapshot accent returns; light/dark flip shows per-mode tones;
       restart applet with feature on → startup reconciliation runs
-- [ ] confirm no new dependencies were added to `Cargo.toml`
+      (skipped - live-desktop smoke test is for the human, not automatable)
+- [x] confirm no new dependencies were added to `Cargo.toml`
 
 ### Task 9: [Final] Update documentation
 
