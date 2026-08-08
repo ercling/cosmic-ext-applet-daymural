@@ -15,10 +15,6 @@
 // dominant-*vibrant* rather than dominant-pixel: a small saturated subject
 // beats a large washed-out ground because grey pixels carry ~zero weight.
 
-// TODO(Task 6): drop this once app.rs wires the extraction task in — until
-// then nothing outside the tests calls into this module.
-#![allow(dead_code)]
-
 use cosmic::cosmic_config::{self, Config, ConfigGet, CosmicConfigEntry};
 use cosmic::cosmic_theme::palette::{
     IntoColor, IsWithinBounds, Oklch, Srgb, color_difference::Wcag21RelativeContrast,

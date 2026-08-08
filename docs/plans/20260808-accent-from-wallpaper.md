@@ -410,32 +410,41 @@ Types live in `src/accent.rs`; all colours are `[u8; 3]` (keeps `Eq` on
 **Files:**
 - Modify: `src/app.rs`
 
-- [ ] change `on_apply_success` to return `cosmic::app::Task<Message>` and
+- [x] change `on_apply_success` to return `cosmic::app::Task<Message>` and
       batch it at its three call sites (`src/app.rs:516`, `:1077`, `:1119`)
-- [ ] async extraction task producing `Message::AccentComputed { source, hue }`:
+- [x] async extraction task producing `Message::AccentComputed { source, hue }`:
       `thumbs::thumbnail_path`, decode **only if `thumbs::is_cached`**, skip
       (log, no change) on `decode_failed`/missing — never `ensure_thumbnail`
       on this path; spawned from `on_apply_success` and gated on
       `accent_enabled`
-- [ ] `AccentComputed` handler: drop stale results (`source != self.current`),
+      ➕ a failed extraction produces **no message at all**
+      (`cosmic::Action::None` from the task) rather than an `AccentComputed`
+      with a sentinel — `hue: None` is reserved for the real "grey wallpaper"
+      answer, which *does* write (warm grey)
+- [x] `AccentComputed` handler: drop stale results (`source != self.current`),
       fresh `read_current_accents`, `accent_plan`, execute the action (write +
       persist snapshot/last-written via config setters; `Disarm` flips
       `accent_enabled` off through the setter so the UI row follows and clears
       snapshot + last-written without restoring)
-- [ ] `Message::SetAccentEnabled(bool)`: on → snapshot live accents (always),
+- [x] `Message::SetAccentEnabled(bool)`: on → snapshot live accents (always),
       then immediate compute for the current wallpaper; off →
       `restore_accents(snapshot)`, clear snapshot + last-written
-- [ ] startup reconciliation in `init`: when `accent_enabled` and a current
+      ➕ enable also clears any stale `accent_last_written` (nothing of this
+      enablement is on disk yet — a stale pair would trip the don't-clobber
+      compare); enable with unusable theme handles refuses (stays off, logs);
+      an echoed no-change toggle is a no-op (must not re-snapshot our own
+      accents as the user's)
+- [x] startup reconciliation in `init`: when `accent_enabled` and a current
       wallpaper was restored, arm the same extraction task; add
       `accent_handles: Option<accent::ThemeHandles>` to `Window`, built in
       `init` (mirroring `config_context`, `src/app.rs:943-953`), injectable in
       tests
-- [ ] every failure path (no thumbnail, decode error, config write error) logs
+- [x] every failure path (no thumbnail, decode error, config write error) logs
       via `tracing` and changes nothing
-- [ ] write tests for the handler-level decisions kept pure (plan execution
+- [x] write tests for the handler-level decisions kept pure (plan execution
       mapping, stale-source drop, toggle-off clears persisted state) using
       injected `ThemeHandles` + `TempDir` config
-- [ ] run `just check` - must pass before task 7
+- [x] run `just check` - must pass before task 7
 
 ### Task 7: Popup UI row + i18n across all 73 catalogues
 

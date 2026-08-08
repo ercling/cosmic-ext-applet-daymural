@@ -26,7 +26,7 @@ use crate::catalogue::{self, Catalogue, ImageEntry};
 use crate::config::AppletConfig;
 // No `fl!` here: every user-visible string this applet renders lives in the
 // popup (`view.rs`). The panel contributes an icon and nothing else.
-use crate::{bing, schedule, thumbs, view, wallpaper};
+use crate::{accent, bing, schedule, thumbs, view, wallpaper};
 
 /// One name everywhere: cosmic-config app ID, state dir, desktop entry.
 pub const APP_ID: &str = "io.github.ercling.CosmicBingWallpaper";
@@ -107,6 +107,12 @@ pub struct Window {
     pub(crate) last_updated: Option<DateTime<Utc>>,
     /// The last fetch error, cleared on success (status footer).
     pub(crate) last_error: Option<RefreshError>,
+    /// cosmic-theme config handles for the accent-from-wallpaper feature,
+    /// built in `init` (mirroring `config_context`). `None` only if the theme
+    /// configs could not be opened — the feature is then inert (the toggle
+    /// refuses to enable, computes are never armed). Tests inject
+    /// TempDir-rooted handles ([`accent::ThemeHandles::sandboxed`]).
+    accent_handles: Option<accent::ThemeHandles>,
 }
 
 /// The one-shot cold-start auto-apply: a fresh install (empty catalogue at
@@ -215,6 +221,22 @@ pub enum Message {
     /// The popup's "Keep images" retention dropdown (payload: dropdown
     /// index).
     SetRetention(usize),
+    /// The accent-from-wallpaper toggler. On: snapshot the live accents,
+    /// then compute for the current wallpaper. Off: restore the snapshot
+    /// verbatim and clear the persisted feature state.
+    // TODO(Task 7): constructed by the popup's toggler row once it exists;
+    // until then only the tests exercise it.
+    #[allow(dead_code)]
+    SetAccentEnabled(bool),
+    /// The async accent extraction finished. `source` is the staleness
+    /// guard (same hazard class as the generation-counter timers): a result
+    /// for a wallpaper that is no longer current is dropped. `hue: None`
+    /// means an effectively grey wallpaper — still a real answer (warm
+    /// grey), never a failure (failures send no message at all).
+    AccentComputed {
+        source: PathBuf,
+        hue: Option<f32>,
+    },
     /// Forwarded surface actions (the dropdown's menu opens as its own
     /// wayland popup and drives it through these).
     Surface(cosmic::surface::Action),
@@ -508,12 +530,13 @@ impl Window {
             Utc::now(),
         );
         let mut apply_failed = false;
+        let mut accent = Task::none();
         if plan.auto_apply
             && let Some(newest) = &newest
         {
             let path = newest.filename.clone();
             match wallpaper::apply(&path) {
-                Ok(()) => self.on_apply_success(path),
+                Ok(()) => accent = self.on_apply_success(path),
                 Err(error) => {
                     tracing::warn!("failed to apply wallpaper: {error}");
                     apply_failed = true;
@@ -548,7 +571,7 @@ impl Window {
         // A grown catalogue may unlock a waiting shuffle (≥2 images); a
         // pending tick keeps its countdown.
         let shuffle = self.sync_shuffle(false);
-        Task::batch([refresh_timer, shuffle])
+        Task::batch([refresh_timer, shuffle, accent])
     }
 
     /// Shared state transition for every path that successfully applied a
@@ -560,9 +583,210 @@ impl Window {
     /// auto-apply followed by a successful manual apply would let a later
     /// refresh's cold-start branch ([`wallpaper::should_auto_apply`]) clobber
     /// a wallpaper the user picked in COSMIC Settings in the meantime.
-    fn on_apply_success(&mut self, path: PathBuf) {
-        self.current = Some(path);
+    ///
+    /// Returns the accent recompute task for the freshly applied wallpaper
+    /// (`Task::none()` unless the accent feature is on) — callers batch it
+    /// into whatever they were returning anyway.
+    fn on_apply_success(&mut self, path: PathBuf) -> app::Task<Message> {
+        self.current = Some(path.clone());
         self.cold_start = ColdStart::Done;
+        self.start_accent_compute(path)
+    }
+
+    /// Arm the async accent extraction for `source` (a freshly applied
+    /// wallpaper, or the startup-restored current). Gated on the setting and
+    /// on usable theme handles; finishes in [`Message::AccentComputed`],
+    /// whose handler re-checks everything against live state.
+    fn start_accent_compute(&self, source: PathBuf) -> app::Task<Message> {
+        if !self.config.accent_enabled || self.accent_handles.is_none() {
+            return Task::none();
+        }
+        cosmic::task::future(async move {
+            match extract_accent_hue(&source, state_dir()).await {
+                Some(hue) => cosmic::Action::App(Message::AccentComputed { source, hue }),
+                // Failure paths (no thumbnail, decode error) change nothing:
+                // they were logged in the task and produce no message.
+                None => cosmic::Action::None,
+            }
+        })
+    }
+
+    /// The `AccentComputed` handler: run on the UI thread against *live*
+    /// state, because the async task's snapshot goes stale during the decode
+    /// — the wallpaper may have changed (the `source` guard) and so may the
+    /// builder accents (read fresh here, right before the plan).
+    fn finish_accent_compute(&mut self, source: PathBuf, hue: Option<f32>) {
+        if self.current.as_deref() != Some(source.as_path()) {
+            tracing::debug!("dropping stale accent result for {}", source.display());
+            return;
+        }
+        let Some(handles) = &self.accent_handles else {
+            return;
+        };
+        let light = handles.read_builder(accent::Mode::Light);
+        let dark = handles.read_builder(accent::Mode::Dark);
+        let current = (
+            light.accent.map(accent::quantize),
+            dark.accent.map(accent::quantize),
+        );
+        let action = accent::accent_plan(
+            self.config.accent_enabled,
+            self.config.accent_snapshot,
+            self.config.accent_last_written,
+            current,
+            light.palette.as_ref(),
+            dark.palette.as_ref(),
+            hue,
+        );
+        self.execute_accent_action(action, current);
+    }
+
+    /// Execute a pure [`accent::AccentAction`] against the theme configs and
+    /// the persisted feature state. Every failure path logs and leaves the
+    /// user's accent exactly as it was.
+    fn execute_accent_action(
+        &mut self,
+        action: accent::AccentAction,
+        current: accent::BuilderAccents,
+    ) {
+        match action {
+            accent::AccentAction::Write {
+                light,
+                dark,
+                snapshot_now,
+            } => {
+                if snapshot_now {
+                    // The current accents are still the user's — nothing of
+                    // ours has landed yet — so capture them *before* writing.
+                    let mut config = self.config.clone();
+                    config.accent_snapshot = Some(accent::AccentSnapshot {
+                        light: current.0,
+                        dark: current.1,
+                    });
+                    self.set_config(config);
+                }
+                let Some(handles) = &self.accent_handles else {
+                    return;
+                };
+                if let Err(error) = accent::write_accents(handles, light, dark) {
+                    tracing::warn!("failed to write accent colours: {error}");
+                    return;
+                }
+                let mut config = self.config.clone();
+                config.accent_last_written = Some(accent::AccentPair { light, dark });
+                self.set_config(config);
+            }
+            accent::AccentAction::Disarm => {
+                // The user (or Settings) changed the accent: their manual
+                // choice stands — no restore. Flipping the setting through
+                // `set_config` persists it, so the popup's toggler row
+                // follows by itself.
+                tracing::info!("accent changed externally: disabling accent-from-wallpaper");
+                let mut config = self.config.clone();
+                config.accent_enabled = false;
+                config.accent_snapshot = None;
+                config.accent_last_written = None;
+                self.set_config(config);
+            }
+            accent::AccentAction::Skip => {}
+        }
+    }
+
+    /// The accent toggler. Enable: snapshot the *live* accents now — always,
+    /// even over a stale snapshot (re-enable re-snapshots) — then compute for
+    /// the current wallpaper. Disable: restore the snapshot verbatim
+    /// (including the `None` = palette-default state), then clear snapshot +
+    /// last-written.
+    fn set_accent_enabled(&mut self, enabled: bool) -> app::Task<Message> {
+        if enabled == self.config.accent_enabled {
+            // The toggler only fires on a flip; an echo must not re-snapshot
+            // (it would capture *our* accents as the user's).
+            return Task::none();
+        }
+        if enabled {
+            let Some(handles) = &self.accent_handles else {
+                // Without theme handles nothing could ever write or restore —
+                // enabling would be a lie, so the toggle stays off.
+                tracing::warn!("cannot enable accent-from-wallpaper: theme configs unavailable");
+                return Task::none();
+            };
+            let (light, dark) = accent::read_current_accents(handles);
+            let mut config = self.config.clone();
+            config.accent_enabled = true;
+            config.accent_snapshot = Some(accent::AccentSnapshot { light, dark });
+            // Nothing of ours is on disk yet as far as this enablement is
+            // concerned; a stale pair would trip the don't-clobber compare.
+            config.accent_last_written = None;
+            self.set_config(config);
+            return match self.current.clone() {
+                Some(current) => self.start_accent_compute(current),
+                None => Task::none(),
+            };
+        }
+        if let (Some(handles), Some(snapshot)) = (&self.accent_handles, self.config.accent_snapshot)
+            && let Err(error) = accent::restore_accents(handles, snapshot)
+        {
+            // The accents stay ours on disk; the cleared state below still
+            // ends the feature (nothing would ever retry the restore).
+            tracing::warn!("failed to restore accent snapshot: {error}");
+        }
+        let mut config = self.config.clone();
+        config.accent_enabled = false;
+        config.accent_snapshot = None;
+        config.accent_last_written = None;
+        self.set_config(config);
+        Task::none()
+    }
+}
+
+/// The async half of the accent recompute: decode the *cached* thumbnail of
+/// `source` and extract its dominant hue, off the UI thread (the decode goes
+/// to the blocking pool for the same reason [`ensure_thumbnail_logged`]'s
+/// does).
+///
+/// Outer `None` = nothing to act on (no cached thumbnail, or the decode
+/// failed): the caller sends no message and the accent stays exactly as it
+/// was — the plan's failure rule. `Some(None)` is a real answer: an
+/// effectively grey wallpaper. Never `ensure_thumbnail` here — it
+/// short-circuits only a `Cached` slot, so a `Failed` one would re-decode the
+/// full ~5 MB UHD file on every apply (the unbounded-retry bug the
+/// `decode_failed` guard exists to prevent).
+async fn extract_accent_hue(source: &Path, state_dir: &Path) -> Option<Option<f32>> {
+    if !thumbs::is_cached(source, state_dir) {
+        if thumbs::decode_failed(source, state_dir) {
+            tracing::info!(
+                "no accent from {}: its thumbnail failed to decode",
+                source.display()
+            );
+        } else {
+            tracing::info!(
+                "no accent from {}: no cached thumbnail yet",
+                source.display()
+            );
+        }
+        return None;
+    }
+    let thumb = thumbs::thumbnail_path(source, state_dir)?;
+    match tokio::task::spawn_blocking(move || {
+        image::open(&thumb).map(|img| accent::dominant_hue(&img.into_rgb8()))
+    })
+    .await
+    {
+        Ok(Ok(hue)) => Some(hue),
+        Ok(Err(error)) => {
+            tracing::warn!(
+                "failed to decode the thumbnail of {}: {error}",
+                source.display()
+            );
+            None
+        }
+        Err(error) => {
+            tracing::warn!(
+                "accent extraction task for {} failed: {error}",
+                source.display()
+            );
+            None
+        }
     }
 }
 
@@ -952,6 +1176,16 @@ impl cosmic::Application for Window {
             .map(AppletConfig::load)
             .unwrap_or_default();
 
+        // Same degradation for the theme configs: without them the accent
+        // feature is inert, everything else keeps working.
+        let accent_handles = match accent::ThemeHandles::system() {
+            Ok(handles) => Some(handles),
+            Err(error) => {
+                tracing::warn!("cannot open theme configs (accent feature inactive): {error}");
+                None
+            }
+        };
+
         // Restore instantly from disk — no network involved. A corrupt or
         // missing catalogue rebuilds from the download folder scan; entries
         // whose file vanished while we weren't running are dropped so a
@@ -990,6 +1224,7 @@ impl cosmic::Application for Window {
             shuffle_armed: false,
             last_updated: None,
             last_error: None,
+            accent_handles,
         };
         let timer = window.schedule_refresh(delay);
         // Shuffle restored as enabled starts a fresh full-interval cycle.
@@ -998,7 +1233,17 @@ impl cosmic::Application for Window {
         // the files already on disk — not by a refresh that may be ~24 h out
         // (or never, offline).
         let thumbnails = window.start_thumbnail_pass_over(live);
-        (window, Task::batch([timer, shuffle, thumbnails]))
+        // Startup reconciliation: startup does *not* pass through
+        // `on_apply_success` (`current` was restored above), and the next
+        // apply can be ~24 h out — or never, offline — while the wallpaper or
+        // the accent may have changed when the applet was down. The same
+        // extraction task catches both: an external accent change disarms,
+        // anything else re-applies. Gated inside on `accent_enabled`.
+        let accent = match window.current.clone() {
+            Some(current) => window.start_accent_compute(current),
+            None => Task::none(),
+        };
+        (window, Task::batch([timer, shuffle, thumbnails, accent]))
     }
 
     fn on_close_requested(&self, id: window::Id) -> Option<Message> {
@@ -1074,8 +1319,9 @@ impl cosmic::Application for Window {
                 // fulfills its purpose; see `on_apply_success`).
                 match wallpaper::apply(&path) {
                     Ok(()) => {
-                        self.on_apply_success(path);
-                        return self.sync_shuffle(true);
+                        let accent = self.on_apply_success(path);
+                        let shuffle = self.sync_shuffle(true);
+                        return Task::batch([accent, shuffle]);
                     }
                     Err(error) => {
                         tracing::warn!("failed to apply {}: {error}", path.display());
@@ -1113,10 +1359,11 @@ impl cosmic::Application for Window {
                 if !self.config.shuffle_enabled {
                     return Task::none();
                 }
+                let mut accent = Task::none();
                 if let Some(pick) = self.catalogue.random_other(self.current.as_deref()) {
                     let path = pick.filename.clone();
                     match wallpaper::apply(&path) {
-                        Ok(()) => self.on_apply_success(path),
+                        Ok(()) => accent = self.on_apply_success(path),
                         Err(error) => {
                             tracing::warn!("shuffle failed to apply {}: {error}", path.display());
                             // A vanished file gets dropped from the
@@ -1133,7 +1380,8 @@ impl cosmic::Application for Window {
                 }
                 // A tick starts a fresh cycle: re-arming waits one full
                 // interval again.
-                return self.sync_shuffle(false);
+                let shuffle = self.sync_shuffle(false);
+                return Task::batch([accent, shuffle]);
             }
             Message::SetShuffleEnabled(enabled) => {
                 let mut config = self.config.clone();
@@ -1162,6 +1410,8 @@ impl cosmic::Application for Window {
                     return self.prune_immediately();
                 }
             }
+            Message::SetAccentEnabled(enabled) => return self.set_accent_enabled(enabled),
+            Message::AccentComputed { source, hue } => self.finish_accent_compute(source, hue),
             Message::Surface(action) => {
                 return cosmic::surface::surface_task(action);
             }
@@ -1298,7 +1548,7 @@ mod tests {
             ..Window::default()
         };
 
-        window.on_apply_success(PathBuf::from("/imgs/20260807-Foo_ROW1_UHD.jpg"));
+        drop(window.on_apply_success(PathBuf::from("/imgs/20260807-Foo_ROW1_UHD.jpg")));
 
         assert_eq!(
             window.current.as_deref(),
@@ -2643,5 +2893,267 @@ mod tests {
         changed.shuffle_interval_secs = 1_800;
         window.set_config(changed.clone());
         assert_eq!(window.config, changed);
+    }
+
+    // -----------------------------------------------------------------
+    // Accent-from-wallpaper wiring. The theme configs are TempDir-rooted
+    // (`accent::ThemeHandles::sandboxed`) and the applet config context is
+    // either absent (in-memory only) or TempDir-rooted — nothing ever
+    // touches the real user theme or settings.
+    // -----------------------------------------------------------------
+
+    use crate::accent::{AccentPair, AccentSnapshot};
+    use cosmic::cosmic_theme::{CosmicPaletteInner, DARK_PALETTE, LIGHT_PALETTE};
+
+    fn light_palette() -> &'static CosmicPaletteInner {
+        (*LIGHT_PALETTE).as_ref()
+    }
+
+    fn dark_palette() -> &'static CosmicPaletteInner {
+        (*DARK_PALETTE).as_ref()
+    }
+
+    /// A window with the accent feature on and sandboxed theme handles.
+    fn accent_window(dir: &tempfile::TempDir) -> Window {
+        let mut window = Window {
+            accent_handles: Some(accent::ThemeHandles::sandboxed(dir.path()).unwrap()),
+            ..Window::default()
+        };
+        window.config.accent_enabled = true;
+        window
+    }
+
+    fn current_accents(window: &Window) -> accent::BuilderAccents {
+        accent::read_current_accents(window.accent_handles.as_ref().unwrap())
+    }
+
+    /// The transplant's own answer for `hue`, per mode — what a `Write` is
+    /// expected to put on disk.
+    fn expected_pair(hue: Option<f32>) -> AccentPair {
+        AccentPair {
+            light: accent::quantize(accent::accent_for(light_palette(), hue)),
+            dark: accent::quantize(accent::accent_for(dark_palette(), hue)),
+        }
+    }
+
+    #[test]
+    fn accent_computed_writes_snapshots_and_persists_last_written() {
+        use cosmic::Application as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = accent_window(&dir);
+        let source = PathBuf::from("/imgs/20260808-Foo_ROW1_UHD.jpg");
+        window.current = Some(source.clone());
+
+        let hue = Some(200.0);
+        drop(window.update(Message::AccentComputed { source, hue }));
+
+        // Both builders hold the transplanted colours…
+        let expected = expected_pair(hue);
+        assert_eq!(
+            current_accents(&window),
+            (Some(expected.light), Some(expected.dark))
+        );
+        // …the don't-clobber pair is persisted…
+        assert_eq!(window.config.accent_last_written, Some(expected));
+        // …and the first write captured the user's accents (palette default
+        // on both modes here) before anything of ours landed.
+        assert_eq!(
+            window.config.accent_snapshot,
+            Some(AccentSnapshot {
+                light: None,
+                dark: None,
+            })
+        );
+    }
+
+    #[test]
+    fn stale_accent_results_are_dropped() {
+        use cosmic::Application as _;
+
+        // The wallpaper changed while the extraction ran: the result must
+        // change nothing at all — the newer apply armed its own compute.
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = accent_window(&dir);
+        window.current = Some(PathBuf::from("/imgs/20260808-New_ROW1_UHD.jpg"));
+
+        drop(window.update(Message::AccentComputed {
+            source: PathBuf::from("/imgs/20260807-Old_ROW1_UHD.jpg"),
+            hue: Some(120.0),
+        }));
+
+        assert_eq!(current_accents(&window), (None, None));
+        assert_eq!(window.config.accent_snapshot, None);
+        assert_eq!(window.config.accent_last_written, None);
+    }
+
+    #[test]
+    fn an_external_accent_change_disarms_without_restoring() {
+        use cosmic::Application as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = accent_window(&dir);
+        let source = PathBuf::from("/imgs/20260808-Foo_ROW1_UHD.jpg");
+        window.current = Some(source.clone());
+
+        // Steady state: we wrote once, snapshot + last-written persisted.
+        let ours = AccentPair {
+            light: [1, 2, 3],
+            dark: [4, 5, 6],
+        };
+        accent::write_accents(
+            window.accent_handles.as_ref().unwrap(),
+            ours.light,
+            ours.dark,
+        )
+        .unwrap();
+        window.config.accent_snapshot = Some(AccentSnapshot {
+            light: None,
+            dark: None,
+        });
+        window.config.accent_last_written = Some(ours);
+
+        // The user picks a new dark accent in Settings…
+        let picked = AccentSnapshot {
+            light: Some(ours.light),
+            dark: Some([99, 88, 77]),
+        };
+        accent::restore_accents(window.accent_handles.as_ref().unwrap(), picked).unwrap();
+
+        // …and the next recompute disarms: toggle off, state cleared, and
+        // crucially *no* restore — the user's choice stands.
+        drop(window.update(Message::AccentComputed {
+            source,
+            hue: Some(10.0),
+        }));
+
+        assert!(!window.config.accent_enabled);
+        assert_eq!(window.config.accent_snapshot, None);
+        assert_eq!(window.config.accent_last_written, None);
+        assert_eq!(current_accents(&window), (picked.light, picked.dark));
+    }
+
+    #[test]
+    fn accent_toggle_snapshots_on_enable_and_restores_on_disable() {
+        use cosmic::Application as _;
+        use cosmic_config::CosmicConfigEntry as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = accent_window(&dir);
+        window.config.accent_enabled = false;
+        // A real (TempDir-rooted) config context, so "persisted state" below
+        // means the on-disk entry, not just the in-memory struct.
+        let ctx = cosmic_config::Config::with_custom_path(
+            APP_ID,
+            AppletConfig::VERSION,
+            dir.path().join("applet-config"),
+        )
+        .unwrap();
+        window.config_context = Some(ctx.clone());
+
+        // The user's pre-feature accents: an explicit light one, dark on the
+        // palette default — the mixed case a restore must reproduce exactly.
+        let user = AccentSnapshot {
+            light: Some([10, 20, 30]),
+            dark: None,
+        };
+        accent::restore_accents(window.accent_handles.as_ref().unwrap(), user).unwrap();
+
+        drop(window.update(Message::SetAccentEnabled(true)));
+        assert!(window.config.accent_enabled);
+        assert_eq!(window.config.accent_snapshot, Some(user));
+        assert_eq!(window.config.accent_last_written, None);
+
+        // A compute lands (the enable-time snapshot must survive it).
+        let source = PathBuf::from("/imgs/20260808-Foo_ROW1_UHD.jpg");
+        window.current = Some(source.clone());
+        drop(window.update(Message::AccentComputed {
+            source,
+            hue: Some(30.0),
+        }));
+        assert_eq!(
+            window.config.accent_last_written,
+            Some(expected_pair(Some(30.0)))
+        );
+        assert_eq!(window.config.accent_snapshot, Some(user));
+        assert_ne!(current_accents(&window), (user.light, user.dark));
+
+        // Toggle off: the snapshot comes back verbatim — including the
+        // palette-default `None` dark — and the feature state is cleared,
+        // on disk too.
+        drop(window.update(Message::SetAccentEnabled(false)));
+        assert!(!window.config.accent_enabled);
+        assert_eq!(window.config.accent_snapshot, None);
+        assert_eq!(window.config.accent_last_written, None);
+        assert_eq!(current_accents(&window), (user.light, user.dark));
+        assert_eq!(AppletConfig::load(&ctx), window.config);
+    }
+
+    #[test]
+    fn enabling_without_theme_handles_refuses() {
+        use cosmic::Application as _;
+
+        // No theme configs: nothing could ever write or restore an accent,
+        // so the toggle must stay off instead of pretending.
+        let mut window = Window::default();
+        assert!(window.accent_handles.is_none());
+
+        drop(window.update(Message::SetAccentEnabled(true)));
+
+        assert!(!window.config.accent_enabled);
+        assert_eq!(window.config.accent_snapshot, None);
+    }
+
+    #[tokio::test]
+    async fn accent_extraction_reads_only_the_cached_thumbnail() {
+        let dir = tempfile::tempdir().unwrap();
+        let images = dir.path().join("images");
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&images).unwrap();
+        let source = images.join("20260808-Foo_ROW1_UHD.jpg");
+
+        // No thumbnail cached: nothing to act on (and no `ensure_thumbnail`
+        // in disguise — there is no source file to decode either).
+        assert_eq!(extract_accent_hue(&source, &state).await, None);
+
+        // A recorded decode failure: still nothing to act on, for free.
+        std::fs::write(&source, b"not actually a jpeg").unwrap();
+        assert!(thumbs::ensure_thumbnail(&source, &state).is_err());
+        assert!(thumbs::decode_failed(&source, &state));
+        assert_eq!(extract_accent_hue(&source, &state).await, None);
+
+        // A repaired, cached, vibrant wallpaper yields its hue. Synthetic
+        // solid image saved as a real JPEG (not `testutil::tiny_jpeg`, whose
+        // gradient is a poor substrate for hue assertions).
+        image::RgbImage::from_pixel(64, 36, image::Rgb([200, 30, 40]))
+            .save(&source)
+            .unwrap();
+        thumbs::ensure_thumbnail(&source, &state).unwrap();
+        let hue = extract_accent_hue(&source, &state)
+            .await
+            .expect("cached thumbnail must extract")
+            .expect("a solid vibrant red is not grey");
+        // JPEG chroma subsampling shifts hue a little; the reference value is
+        // the extractor's own answer for the raw colour.
+        let reference = accent::dominant_hue(&image::RgbImage::from_pixel(
+            8,
+            8,
+            image::Rgb([200, 30, 40]),
+        ))
+        .unwrap();
+        let diff = (hue - reference).rem_euclid(360.0);
+        assert!(
+            diff.min(360.0 - diff) <= 10.0,
+            "hue {hue} too far from the source colour's {reference}"
+        );
+
+        // An effectively grey wallpaper is a real answer (`Some(None)`), not
+        // a failure — the plan writes the palette's warm grey for it.
+        let grey = images.join("20260807-Grey_ROW1_UHD.jpg");
+        image::RgbImage::from_pixel(64, 36, image::Rgb([128, 128, 128]))
+            .save(&grey)
+            .unwrap();
+        thumbs::ensure_thumbnail(&grey, &state).unwrap();
+        assert_eq!(extract_accent_hue(&grey, &state).await, Some(None));
     }
 }
