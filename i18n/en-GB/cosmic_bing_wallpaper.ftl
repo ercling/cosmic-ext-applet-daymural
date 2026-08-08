@@ -6,7 +6,7 @@
 panel-tooltip = Bing Wallpaper of the Day
 
 about-this-image = About this image
-bing-wallpaper = Bing wallpaper
+bing-wallpaper = Bing Wallpaper
 
 tooltip-previous = Previous wallpaper
 tooltip-next = Next wallpaper

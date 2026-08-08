@@ -40,9 +40,17 @@ fn config_err(err: impl fmt::Display) -> WallpaperError {
 
 /// The hardcoded download folder, `~/Pictures/BingWallpaper` — same location
 /// as the reference GNOME extension's default, so an existing folder migrates.
+///
+/// With no home directory at all the temp dir stands in, so the result stays
+/// absolute: a relative download dir would put ~5 MB downloads wherever the
+/// process happened to be started, and `is_ours` (which feeds the auto-apply
+/// rule) rejects relative paths outright.
 pub fn download_dir() -> PathBuf {
     dirs::home_dir()
-        .unwrap_or_default()
+        .unwrap_or_else(|| {
+            tracing::warn!("no home directory: downloading wallpapers into the temp dir");
+            std::env::temp_dir()
+        })
         .join("Pictures")
         .join("BingWallpaper")
 }
@@ -91,13 +99,13 @@ fn check_apply_source(path: &Path) -> Result<(), WallpaperError> {
 /// flash of the previous default). Both writes are change-only, so a
 /// re-apply of the current image touches nothing.
 ///
-/// Test note: `apply` and `current_source` have no automated coverage —
-/// `cosmic_bg_config::context()` always opens the *real* user config, and
+/// Test note: what stays uncovered is only the *context* plumbing —
+/// `cosmic_bg_config::context()` always opens the real user config, and
 /// building a `Context` rooted elsewhere requires naming the crate's own
 /// `cosmic_config` instance, which this crate cannot (see module comment).
-/// They remain covered by the Post-Completion manual smoke test; the pure
-/// halves (`updated_entry`, `check_apply_source`, `is_ours`,
-/// `should_auto_apply`) are unit-tested below.
+/// That much is covered by the Post-Completion manual smoke test; everything
+/// decided around it (`updated_entry`, `check_apply_source`, `classify`,
+/// `is_ours`, `should_auto_apply`) is pure and unit-tested below.
 pub fn apply(path: &Path) -> Result<(), WallpaperError> {
     check_apply_source(path)?;
     let context = cosmic_bg_config::context().map_err(config_err)?;
@@ -124,42 +132,54 @@ pub enum CurrentWallpaper {
     Unknown,
 }
 
-/// Read what cosmic-bg currently displays from its config.
-///
-/// Accepted v1 limitation: this is read on demand (startup / next apply /
-/// prune), not watched — external changes are picked up then.
-///
-/// Test note: no automated coverage for the same reason as [`apply`] (the
-/// real user config is the only constructible context); the decisions built
-/// on the result ([`prune_retention`], [`should_auto_apply`]) are pure and
-/// tested.
-pub fn current_wallpaper() -> CurrentWallpaper {
-    let Ok(context) = cosmic_bg_config::context() else {
-        return CurrentWallpaper::Unknown;
-    };
-    if !context.same_on_all() {
+impl CurrentWallpaper {
+    /// The displayed file, if one is knowable. Every non-file state maps to
+    /// `None` — that is what keeps the auto-apply "don't clobber" rule and
+    /// the prune's "never delete what is displayed" rule conservative.
+    pub fn into_file(self) -> Option<PathBuf> {
+        match self {
+            Self::File(path) => Some(path),
+            Self::NoFile | Self::Unknown => None,
+        }
+    }
+}
+
+/// Classify cosmic-bg's config state. Split out of [`current_wallpaper`] as a
+/// pure function so the three-way mapping is testable without a `Context`
+/// (which can only ever be opened against the *real* user config — see
+/// [`apply`]).
+fn classify(same_on_all: bool, entry: Option<Entry>) -> CurrentWallpaper {
+    if !same_on_all {
         return CurrentWallpaper::Unknown;
     }
-    match context.entry(DEFAULT_BACKGROUND) {
-        Ok(entry) => match entry.source {
+    match entry {
+        Some(entry) => match entry.source {
             Source::Path(path) => CurrentWallpaper::File(path),
             Source::Color(_) => CurrentWallpaper::NoFile,
         },
         // Same-on-all but no readable `all` entry: cosmic-bg falls back to
         // its default wallpaper — none of our files is displayed.
-        Err(_) => CurrentWallpaper::NoFile,
+        None => CurrentWallpaper::NoFile,
     }
 }
 
-/// What is currently applied, per cosmic-bg's config: the `all` entry's
-/// `Source::Path`. `None` for every non-file state (see
-/// [`current_wallpaper`]) — keeps the auto-apply "don't clobber" rule
-/// conservative.
-pub fn current_source() -> Option<PathBuf> {
-    match current_wallpaper() {
-        CurrentWallpaper::File(path) => Some(path),
-        CurrentWallpaper::NoFile | CurrentWallpaper::Unknown => None,
-    }
+/// Read what cosmic-bg currently displays from its config.
+///
+/// Accepted v1 limitation: this is read on demand (startup / next apply /
+/// prune), not watched — external changes are picked up then.
+///
+/// Test note: only the context read has no automated coverage (the real user
+/// config is the only constructible context); the classification it feeds is
+/// the pure, tested [`classify`], as are the decisions built on the result
+/// ([`prune_retention`], [`should_auto_apply`]).
+pub fn current_wallpaper() -> CurrentWallpaper {
+    let Ok(context) = cosmic_bg_config::context() else {
+        return CurrentWallpaper::Unknown;
+    };
+    classify(
+        context.same_on_all(),
+        context.entry(DEFAULT_BACKGROUND).ok(),
+    )
 }
 
 /// The applet's tracked "current" after a fresh read of the live state:
@@ -202,7 +222,7 @@ pub fn is_ours(path: &Path) -> bool {
 /// reason the user installed the applet), or (b) the currently applied
 /// wallpaper is a file inside our download folder. If the user picked
 /// another wallpaper in COSMIC Settings (or uses a color/per-output setup,
-/// where `current_source` is `None`), the applet downloads but does not
+/// where the live state maps to `None`), the applet downloads but does not
 /// apply until they act.
 pub fn should_auto_apply(cold_start_first_fetch: bool, current_source: Option<&Path>) -> bool {
     cold_start_first_fetch || current_source.is_some_and(is_ours)
@@ -313,13 +333,41 @@ mod tests {
 
     #[test]
     fn download_dir_is_under_home_pictures() {
-        if dirs::home_dir().is_none() {
-            eprintln!("skipping: no home dir in this environment");
-            return;
-        }
+        // No self-skip: `download_dir` falls back to the temp dir when there
+        // is no home, so both assertions hold in every environment.
         let dir = download_dir();
         assert!(dir.ends_with("Pictures/BingWallpaper"));
         assert!(dir.is_absolute());
+    }
+
+    #[test]
+    fn classify_maps_the_three_cosmic_bg_states() {
+        let path = PathBuf::from("/home/u/Pictures/BingWallpaper/20260807-Foo_UHD.jpg");
+        let file_entry = Entry::new("all".to_owned(), Source::Path(path.clone()));
+        let color_entry = Entry::new(
+            "all".to_owned(),
+            Source::Color(cosmic_bg_config::Color::Single([0.1, 0.2, 0.3])),
+        );
+
+        // Same-on-all with a path: that file is displayed.
+        assert_eq!(
+            classify(true, Some(file_entry.clone())),
+            CurrentWallpaper::File(path.clone())
+        );
+        // Same-on-all with a color, or without a readable entry: nothing of
+        // ours is displayed, but the state *is* known.
+        assert_eq!(classify(true, Some(color_entry)), CurrentWallpaper::NoFile);
+        assert_eq!(classify(true, None), CurrentWallpaper::NoFile);
+        // Per-output mode: the `all` entry says nothing about what is on
+        // screen, whatever it holds.
+        assert_eq!(classify(false, Some(file_entry)), CurrentWallpaper::Unknown);
+        assert_eq!(classify(false, None), CurrentWallpaper::Unknown);
+
+        // `into_file` keeps only the knowable file (what the callers hand
+        // to the auto-apply rule).
+        assert_eq!(CurrentWallpaper::File(path.clone()).into_file(), Some(path));
+        assert_eq!(CurrentWallpaper::NoFile.into_file(), None);
+        assert_eq!(CurrentWallpaper::Unknown.into_file(), None);
     }
 
     #[test]
@@ -347,10 +395,6 @@ mod tests {
 
     #[test]
     fn auto_apply_when_current_is_ours() {
-        if dirs::home_dir().is_none() {
-            eprintln!("skipping: no home dir in this environment");
-            return;
-        }
         let ours = download_dir().join("20260807-Foo_UHD.jpg");
         assert!(should_auto_apply(false, Some(&ours)));
     }

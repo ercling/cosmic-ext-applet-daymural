@@ -60,7 +60,26 @@ the pinned rev before coding against remembered names.
   the async task, its snapshot goes stale during a long fetch), one-shot
   generation-counter timers for refresh and shuffle (a stale tick is ignored, so
   rescheduling atomically replaces the pending timer), `state_dir()`/`catalogue_path()`,
-  and the tested pure decisions `refresh_success_plan`/`config_diff`.
+  and the tested pure decision `refresh_success_plan`.
+  The out-of-window thumbnail backfill at the end of `fetch_and_download` is
+  governed by the `Backfill` policy struct (budget + retention + applied file,
+  injected by tests). Its rule: **the budget buys decodes, and no entry is ever
+  paid for twice.** Three free skips come first — an entry the imminent prune
+  will delete (`ImageEntry::within_retention`, the *same* test `prune` applies,
+  applied file exempt), one already cached (`thumbs::is_cached`), and one that
+  already failed to decode (`thumbs::decode_failed`) — then every real
+  `image::open` costs budget whether it succeeds or not, and a failure is
+  recorded. Weakening any one of the three re-opens a starvation or an
+  unbounded-retry bug fixed before; do not "optimize" the ordering.
+  That backfill (`backfill_thumbnails`) is also run **on its own at startup**
+  (`run_thumbnail_pass`, armed by `start_thumbnail_pass_over` from `init`):
+  previews come from the cache, a non-empty catalogue is not a cold start, and
+  the first refresh can be ~24 h out — or never, offline — so thumbnail
+  generation must never depend on a fetch. While either producer is running
+  (`refresh_pending` / `thumbnail_pass_pending`, i.e. `may_sweep_thumbnails`)
+  the prune's `thumbs::reconcile` sweep is deferred: fetched entries only join
+  the catalogue at `RefreshFinished`, so an unconditional sweep deletes what
+  the in-flight pass just wrote. Every pass ends in a sweep of its own.
 - `src/view.rs` — popup UI (thumbnail, title/copyright, About link, prev/next/
   newest/refresh controls, shuffle + retention rows, status footer) plus the pure
   display helpers (`displayed`/`prev_target`/`next_target`/`newest_target`,
@@ -72,21 +91,41 @@ the pinned rev before coding against remembered names.
   URL/filename builders and the inverse `parse_filename`, reqwest client +
   `fetch_image_list` + atomic `.part`-then-rename `download_image`.
 - `src/thumbs.rs` — 480×270 thumbnail cache in the state dir; the UI never
-  decodes the full ~5 MB UHD file.
+  decodes the full ~5 MB UHD file. Each cache slot has a `<thumb>.meta`
+  sidecar holding the source's *identity* (mtime + size) and the outcome
+  (`cached`/`failed`), compared for **exact equality** — never an mtime ordering,
+  which cannot answer "unchanged?" and "changed?" with one test and made the
+  suite flaky at timestamp ties. So `is_cached`/`decode_failed` are one
+  predicate (`slot`), an undecodable image is opened once rather than once per
+  refresh, and a repaired file is retried. Only `image::open` failing writes a
+  `failed` verdict — a state-dir write failure never condemns a decodable
+  image. Cleanup is `reconcile(live_filenames, state_dir)`: a *sweep* of the
+  thumbs dir (not a removal list), so artefacts a prune-racing backfill wrote
+  are still collected.
+- `src/fsutil.rs` — shared atomic-write mechanics: `temp_sibling(dest, suffix)`
+  and `write_atomic(dest, suffix, write)` (write to a temp sibling, then
+  rename). Used by `bing::download_image`, `Catalogue::save` and
+  `thumbs::ensure_thumbnail` — never hand-roll another temp-then-rename.
 - `src/catalogue.rs` — `ImageEntry`/`Catalogue`: JSON persistence (atomic write),
   merge-with-dedupe by `urlbase`, retention prune (never deletes the currently
   applied file), `rebuild_from_folder` (filename ↔ urlbase mapping is
   deterministic both ways, so rebuilds dedupe against the next fetch with no
-  re-downloads), navigation helpers.
+  re-downloads), navigation helpers. Two guards keep a transient from erasing
+  the history: `prune` is a no-op while `images_dir` cannot be enumerated (an
+  absent folder is not evidence that its files are gone — otherwise every entry
+  looks vanished and the startup sweep *persists* that), and `load_or_rebuild`
+  rescans the folder for an **empty** catalogue as well as an unusable one (a
+  valid-but-empty JSON would otherwise load fine forever).
 - `src/config.rs` — `AppletConfig` (shuffle on/off, interval, retention) via
   cosmic-config under app ID `io.github.ercling.CosmicBingWallpaper`, version 1,
   write-on-change setters, watch subscription for external edits.
 - `src/wallpaper.rs` — cosmic-bg config writer: `updated_entry` mutates only
   `source`, `apply` writes the `all` entry *before* flipping `same-on-all`,
-  `current_source`/`is_ours`/`should_auto_apply` back the don't-clobber rule,
-  `download_dir()`. `apply`/`current_source` have no automated coverage (the
-  cosmic-bg config context cannot be rooted in a tempdir from this crate — see
-  the comment on `apply`); they are covered by the manual smoke test only.
+  `current_wallpaper`/`is_ours`/`should_auto_apply` back the don't-clobber rule,
+  `download_dir()`. Only the cosmic-bg *context* plumbing inside
+  `apply`/`current_wallpaper` is uncovered (the context cannot be rooted in a
+  tempdir from this crate — see the comment on `apply`); the three-way state
+  mapping is the pure, tested `classify`.
 - `src/schedule.rs` — pure timing math: `next_refresh` (reference-exact,
   including the out-of-range reset to 60 s and the +300 s fudge),
   `shuffle_interval` (sanitizes hand-edited values — `0`/tiny must never
@@ -145,15 +184,29 @@ ships; the 72 non-English ones are machine-generated. Notes:
   libcosmic's copy. That is what pins the test binary to `en`, so tests keep
   asserting literal English strings; keep it that way (`loader_is_pinned_to_english`).
 - The loader sets `set_use_isolating(false)` — otherwise every placeable comes
-  back wrapped in U+2068/U+2069.
+  back wrapped in U+2068/U+2069. **It only affects bundles that already exist**,
+  and `select`/`load_languages` swap in brand-new ones with fluent's
+  `use_isolating: true` default, so it must be re-applied after *every* language
+  load: go through `localize::disable_bidi_isolation` / `select_languages`, never
+  call `select` directly.
 - Localized label arrays must be functions returning `Vec<String>`
   (`shuffle_interval_labels`/`retention_labels`), never consts or `LazyLock` —
   a static would freeze the labels before the language is selected.
-- Adding a locale means adding a directory *and* bumping `COSMIC_LOCALES` in
-  `localize.rs`; the three guard tests there assert the dir count, that every
-  locale defines exactly `en`'s ids (catching both missing keys and broken
-  fluent syntax, which fluent otherwise only logs), and that every message keeps
-  `en`'s `$variable` set.
+- **Adding or renaming a message id means editing all 73 catalogues**, not just
+  `i18n/en/`: `every_locale_defines_every_english_message` asserts each locale
+  defines *exactly* `en`'s ids, so a lone English addition turns `just check`
+  into 72 failures. Same for placeables — a new `{ $variable }` must appear in
+  every locale's copy of that message
+  (`every_locale_preserves_the_english_placeables`), and no locale may invent a
+  `{ reference }` `en` does not have.
+- Adding a locale means adding a directory *and* listing it in `COSMIC_LOCALES`
+  in `localize.rs` (a sorted array, compared as a set — a locale *swapped* for
+  another is caught too). The guard tests there also assert that every locale
+  defines exactly `en`'s ids (catching both missing keys and broken fluent
+  syntax, which fluent otherwise only logs), that placeables survive
+  translation, and that every id is actually rendered by `app.rs`/`view.rs`
+  (`every_message_id_is_referenced_by_the_ui` — dropping a tooltip must not
+  leave 73 orphaned strings behind).
 - `data/…desktop`'s `Comment[<locale>]=` lines are separate from Fluent
   (desktop-entry spec, POSIX locale tags); `Name=` stays untranslated.
 

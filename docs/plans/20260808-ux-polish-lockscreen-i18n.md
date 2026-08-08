@@ -11,8 +11,13 @@ use:
    an upstream cosmic-greeter/cosmic-bg bug, document it and link/file the issue
    (per user decision: workaround only if it is clean — no fighting the daemons).
 2. **First-open regression check** — the "empty preview, filename shown as title
-   on first open after `just install`" problem is already fixed on this branch;
-   only verify regression coverage exists, no new feature work.
+   on first open after `just install`" problem was believed to be already fixed
+   on this branch; only verify regression coverage exists, no new feature work.
+   ⚠️ **Superseded during review:** only the *title* half was fixed. The empty
+   preview was still real — thumbnails were generated exclusively by the fetch
+   pipeline, which over a migrated folder is up to ~24 h away (and never on an
+   offline machine). Closed for real in the review round, see the Task 2
+   findings.
 3. **Tooltips** — the icon-only buttons (prev/next/newest/refresh, thumbnail) get
    hover tooltips describing their action.
 4. **Disabled-button visuals** — disabled icon buttons currently render
@@ -301,6 +306,49 @@ out-of-window entry gets a thumbnail and the untracked foreign file does not.
 Mutation-checked: disabling the backfill loop fails this test and no other.
 
 No behavior change — test-only.
+
+➕ ⚠️ **Correction (2026-08-08, external review round 6) — the verify-only
+scope was wrong; the empty preview was still broken.**
+
+Every test cited above asserts the state *after* a successful fetch, and that
+was the only state in which thumbnails were ever produced: `ensure_thumbnail`
+was reachable from `fetch_and_download` alone. On the branch's headline path —
+a fresh install over a folder migrated from the GNOME extension — the restored
+catalogue is non-empty, so startup is `ColdStart::Done` and the first refresh
+is scheduled off the newest `fullstartdate` (`next_refresh`), i.e. up to ~24 h
+out rather than the 5 s cold-start path. Until it landed the popup showed the
+placeholder for every entry; on an offline machine, forever. So the Overview's
+"already fixed" claim held only for the *title* half
+(`display_title_falls_back_to_file_stem_for_rebuilt_entries`).
+
+Fixed by making thumbnail generation independent of the network: the backfill
+loop is now `backfill_thumbnails`, called both at the end of
+`fetch_and_download` and on its own at startup (`run_thumbnail_pass`, armed by
+`Window::start_thumbnail_pass_over` from `init`, finished by
+`Message::ThumbnailsReady` — which also re-renders an open popup). Same
+`Backfill` policy object either way, so the two callers cannot disagree about
+what is worth decoding. New test:
+`thumbnails_are_generated_at_startup_before_any_fetch` (`src/app.rs`) — a
+migrated folder, no mock server at all, previews present afterwards.
+Mutation-checked: emptying `run_thumbnail_pass` fails that test and no other.
+
+Two further defects found in the same review round and fixed here:
+
+- A prune landing while a pass is writing (`SetRetention`, an external
+  retention edit, a failed apply) swept the thumbnail cache down to the live
+  catalogue — which does not yet hold the in-flight fetch's entries. It
+  deleted the preview of the image being applied, unrecoverable until the next
+  refresh. `thumbs::reconcile` is now deferred while either producer runs
+  (`Window::may_sweep_thumbnails`), and every pass ends in a sweep of its own
+  (`a_prune_landing_mid_pass_keeps_what_that_pass_is_writing`).
+- A transiently unreachable download folder destroyed the catalogue
+  permanently: the startup sweep pruned every entry as "vanished" and
+  persisted the empty result, which `load_or_rebuild` then loaded happily
+  forever. `Catalogue::prune` is now a no-op while `images_dir` cannot be
+  enumerated, and `load_or_rebuild` rescans an *empty* catalogue as well as an
+  unusable one (`prune_does_nothing_while_the_images_dir_cannot_be_read`,
+  `an_empty_catalogue_takes_the_rebuild_path_too`,
+  `restore_catalogue_survives_a_download_folder_that_is_not_there`).
 
 ### Task 3: Tooltips on all icon-only controls
 

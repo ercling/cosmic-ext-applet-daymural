@@ -5,12 +5,37 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
 
+/// How the mock frames a response body.
+#[derive(Clone, Copy)]
+pub enum Framing {
+    /// Accurate `Content-Length` — the honest server.
+    Sized,
+    /// No `Content-Length` at all: body, then EOF ends the message
+    /// (RFC 9112 §6.3, legal for responses). This is what a `gzip`-encoded
+    /// reply looks like to reqwest — the decoder's size is unknown, so
+    /// `Response::content_length()` is `None` and only a streamed budget can
+    /// bound the read.
+    ///
+    /// A *lying* `Content-Length` needs no mode of its own: hyper frames the
+    /// message by the advertised length, so a short header simply truncates
+    /// the body — it can never grow past the budget.
+    UntilEof,
+}
+
 /// Spawn a mock HTTP server on a random loopback port and return its base
 /// URL (`http://127.0.0.1:<port>`). `routes` maps a request path (with
 /// query string) to `(status, body)`. The server thread runs detached for
 /// the rest of the test process; every response closes its connection so
 /// the client's pool never holds a stale socket.
 pub fn spawn_mock(routes: impl Fn(&str) -> (u16, Vec<u8>) + Send + 'static) -> String {
+    spawn_mock_framed(routes, Framing::Sized)
+}
+
+/// [`spawn_mock`] with the response framing chosen by the caller.
+pub fn spawn_mock_framed(
+    routes: impl Fn(&str) -> (u16, Vec<u8>) + Send + 'static,
+    framing: Framing,
+) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback mock server");
     let base = format!("http://{}", listener.local_addr().unwrap());
     std::thread::spawn(move || {
@@ -33,11 +58,16 @@ pub fn spawn_mock(routes: impl Fn(&str) -> (u16, Vec<u8>) + Send + 'static) -> S
             let head = String::from_utf8_lossy(&buf);
             let path = head.split_whitespace().nth(1).unwrap_or("/").to_owned();
             let (status, body) = routes(&path);
-            let _ = write!(
-                stream,
-                "HTTP/1.1 {status} Mock\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
+            let head = match framing {
+                Framing::Sized => format!(
+                    "HTTP/1.1 {status} Mock\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                ),
+                Framing::UntilEof => format!("HTTP/1.1 {status} Mock\r\nConnection: close\r\n\r\n"),
+            };
+            let _ = stream.write_all(head.as_bytes());
+            // A client that gives up mid-body (an exceeded size budget) drops
+            // its end, so the write failing here is expected — not a panic.
             let _ = stream.write_all(&body);
         }
     });

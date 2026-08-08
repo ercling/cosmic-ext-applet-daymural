@@ -17,6 +17,7 @@ use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::bing;
+use crate::fsutil::{self, TMP_SUFFIX};
 
 /// Filename of the persisted catalogue inside the state dir.
 pub const CATALOGUE_FILENAME: &str = "catalogue.json";
@@ -72,7 +73,7 @@ impl ImageEntry {
     /// it does not name — a tampered entry pointing at a *different*
     /// image's valid file must neither have prune delete that file nor
     /// have `existing_file` skip its own image's download.
-    fn names_own_file(&self) -> bool {
+    pub fn names_own_file(&self) -> bool {
         self.filename
             .file_name()
             .and_then(|n| n.to_str())
@@ -84,6 +85,24 @@ impl ImageEntry {
         NaiveDateTime::parse_from_str(&self.fullstartdate, "%Y%m%d%H%M")
             .ok()
             .map(|n| n.and_utc())
+    }
+
+    /// Whether the entry is young enough to survive a prune with
+    /// `retention_days` at `now` (`0` = keep forever). Malformed dates count
+    /// as young — never delete on a guess.
+    ///
+    /// [`Catalogue::prune`] is the primary caller, but the age test is public
+    /// so everything that wants to know what the *next* prune will delete
+    /// asks the same question: the thumbnail backfill in `app.rs` skips
+    /// entries this rejects rather than decoding ~5 MB apiece for thumbnails
+    /// the same refresh unlinks minutes later. Two spellings of the cutoff
+    /// would drift.
+    pub fn within_retention(&self, retention_days: u16, now: DateTime<Utc>) -> bool {
+        if retention_days == 0 {
+            return true;
+        }
+        let cutoff = now - Duration::days(i64::from(retention_days));
+        !self.start_time().is_some_and(|t| t < cutoff)
     }
 }
 
@@ -101,19 +120,36 @@ impl Catalogue {
     pub fn load(path: &Path) -> io::Result<Self> {
         let json = fs::read_to_string(path)?;
         let mut cat: Self = serde_json::from_str(&json)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         cat.sort();
         Ok(cat)
     }
 
     /// Load from `path`, falling back to a rescan of `images_dir` when the
-    /// JSON is missing or corrupt (the catalogue is rebuildable by design).
+    /// JSON is missing, corrupt, or *empty* (the catalogue is rebuildable by
+    /// design).
+    ///
+    /// An empty catalogue is treated exactly like an unusable one: it holds
+    /// no more information than a fresh install does, while the folder it
+    /// describes may be full of images. Without the rescan, a single bad
+    /// startup that persisted an empty catalogue (a download folder that was
+    /// briefly unreachable — see [`Catalogue::prune`]) would be permanent:
+    /// valid-but-empty JSON loads fine, so nothing would ever rescan again
+    /// and every restored image would stay invisible and unpruned forever.
     pub fn load_or_rebuild(path: &Path, images_dir: &Path) -> Self {
         match Self::load(path) {
-            Ok(cat) => cat,
-            Err(e) => {
+            Ok(cat) if !cat.images.is_empty() => cat,
+            Ok(_) => {
+                tracing::info!(
+                    "catalogue at {} is empty; rescanning {}",
+                    path.display(),
+                    images_dir.display()
+                );
+                Self::rebuild_from_folder(images_dir)
+            }
+            Err(error) => {
                 tracing::warn!(
-                    "catalogue at {} unusable ({e}); rebuilding from {}",
+                    "catalogue at {} unusable ({error}); rebuilding from {}",
                     path.display(),
                     images_dir.display()
                 );
@@ -129,8 +165,8 @@ impl Catalogue {
             fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string_pretty(self)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        crate::fsutil::write_atomic(path, ".tmp", |tmp| fs::write(tmp, &json))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        fsutil::write_atomic(path, TMP_SUFFIX, |tmp| fs::write(tmp, &json))
     }
 
     /// Rebuild by scanning `dir` for wallpaper files
@@ -270,6 +306,14 @@ impl Catalogue {
     /// dropped from the catalogue with its file left untouched, so a
     /// hand-edited `catalogue.json` can never make the prune delete
     /// arbitrary files or another entry's image.
+    ///
+    /// The whole pass is skipped when `images_dir` cannot be enumerated at
+    /// all (never created yet, renamed, on an unmounted or slow-mounting
+    /// drive, unreadable modes). "This one file is gone" is only evidence
+    /// while the folder holding it is readable — otherwise *every* entry
+    /// looks vanished, and dropping them all would discard the catalogue's
+    /// entire history for a transient the next start recovers from. Nothing
+    /// is lost by skipping: there is no reachable file to delete either.
     pub fn prune(
         &mut self,
         images_dir: &Path,
@@ -277,7 +321,13 @@ impl Catalogue {
         currently_applied: Option<&Path>,
         now: DateTime<Utc>,
     ) -> Vec<PathBuf> {
-        let cutoff = (retention_days > 0).then(|| now - Duration::days(i64::from(retention_days)));
+        if fs::read_dir(images_dir).is_err() {
+            tracing::warn!(
+                "skipping prune: {} cannot be read right now",
+                images_dir.display()
+            );
+            return Vec::new();
+        }
         let mut removed = Vec::new();
         self.images.retain(|entry| {
             let ours = entry.filename.parent() == Some(images_dir) && entry.names_own_file();
@@ -293,12 +343,9 @@ impl Catalogue {
                 removed.push(entry.filename.clone());
                 return false; // vanished externally — drop the entry
             }
-            let Some(cutoff) = cutoff else {
-                return true; // keep forever
-            };
-            // Malformed dates are kept — never delete on a guess.
-            let too_old = entry.start_time().is_some_and(|t| t < cutoff);
-            if !too_old || currently_applied == Some(entry.filename.as_path()) {
+            if entry.within_retention(retention_days, now)
+                || currently_applied == Some(entry.filename.as_path())
+            {
                 return true;
             }
             match fs::remove_file(&entry.filename) {
@@ -306,8 +353,8 @@ impl Catalogue {
                     removed.push(entry.filename.clone());
                     false
                 }
-                Err(e) => {
-                    tracing::warn!("failed to prune {}: {e}", entry.filename.display());
+                Err(error) => {
+                    tracing::warn!("failed to prune {}: {error}", entry.filename.display());
                     true // keep the entry — retry the deletion next prune
                 }
             }
@@ -345,15 +392,22 @@ impl Catalogue {
     /// where the mere existence check on the UHD path would miss it and
     /// re-download ~5 MB the merge then orphans.
     ///
-    /// Only files the entry legitimately names count
-    /// ([`ImageEntry::names_own_file`]): a tampered catalogue pointing an
-    /// entry at a *different* image's file must not skip this image's
-    /// download — the pipeline re-downloads and the merge then heals the
-    /// entry with the fresh path.
-    pub fn existing_file(&self, urlbase: &str) -> Option<PathBuf> {
+    /// Only files the entry legitimately names *inside `images_dir`* count —
+    /// the same containment gate [`Catalogue::prune`] and the thumbnail
+    /// backfill apply ([`ImageEntry::names_own_file`] plus the parent
+    /// directory). A tampered catalogue pointing an entry at a *different*
+    /// image's file, or at a file outside the download folder, must not skip
+    /// this image's download — the pipeline re-downloads and the merge then
+    /// heals the entry with the fresh path.
+    pub fn existing_file(&self, urlbase: &str, images_dir: &Path) -> Option<PathBuf> {
         self.images
             .iter()
-            .find(|e| e.urlbase == urlbase && e.names_own_file() && e.filename.is_file())
+            .find(|e| {
+                e.urlbase == urlbase
+                    && e.filename.parent() == Some(images_dir)
+                    && e.names_own_file()
+                    && e.filename.is_file()
+            })
             .map(|e| e.filename.clone())
     }
 
@@ -510,6 +564,59 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_catalogue_takes_the_rebuild_path_too() {
+        // Valid-but-empty JSON is the state a single bad startup can persist
+        // (a briefly unreachable download folder used to drop every entry).
+        // It loads fine, so without treating "empty" as "unusable" nothing
+        // would ever rescan and the restored images would stay invisible —
+        // and unpruned — for good.
+        let dir = tempfile::tempdir().unwrap();
+        let images = dir.path().join("BingWallpaper");
+        fs::create_dir_all(&images).unwrap();
+        fs::write(images.join("20260806-Foo_ROW1_UHD.jpg"), b"x").unwrap();
+        let path = dir.path().join(CATALOGUE_FILENAME);
+        Catalogue::default().save(&path).unwrap();
+        assert!(Catalogue::load(&path).unwrap().images.is_empty());
+
+        let cat = Catalogue::load_or_rebuild(&path, &images);
+
+        assert_eq!(cat.images.len(), 1);
+        assert_eq!(cat.images[0].urlbase, urlbase("Foo_ROW1"));
+
+        // A genuinely empty folder still yields an empty catalogue (the
+        // cold start must stay armed).
+        let empty = dir.path().join("Empty");
+        fs::create_dir_all(&empty).unwrap();
+        assert!(Catalogue::load_or_rebuild(&path, &empty).images.is_empty());
+    }
+
+    #[test]
+    fn prune_does_nothing_while_the_images_dir_cannot_be_read() {
+        // A folder that is renamed, not mounted yet, or unreadable makes
+        // *every* entry look vanished. Dropping them all would discard the
+        // whole catalogue for a transient — and the caller persists that
+        // result — so the pass is skipped entirely instead.
+        let dir = tempfile::tempdir().unwrap();
+        let images = dir.path().join("BingWallpaper");
+        fs::create_dir_all(&images).unwrap();
+        let old = entry_with_file(&images, "20260101", "Old_ROW1");
+        let new = entry_with_file(&images, "20260807", "New_ROW2");
+        let mut cat = Catalogue {
+            images: vec![old.clone(), new.clone()],
+        };
+        fs::rename(&images, dir.path().join("moved")).unwrap();
+
+        // Neither the vanished-entry sweep nor age deletion runs.
+        assert!(cat.prune(&images, 3, None, now()).is_empty());
+        assert_eq!(cat.images, vec![old.clone(), new.clone()]);
+
+        // Back in place, the ordinary rules apply again.
+        fs::rename(dir.path().join("moved"), &images).unwrap();
+        assert_eq!(cat.prune(&images, 3, None, now()), vec![old.filename]);
+        assert_eq!(cat.images, vec![new]);
+    }
+
+    #[test]
     fn rebuild_scans_any_resolution_and_skips_noise() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("20260805-Foo_ROW1_UHD.jpg"), b"x").unwrap();
@@ -564,7 +671,7 @@ mod tests {
         assert_eq!(bar.startdate, "20260807");
         // A later merge of the same urlbase updates the one entry cleanly.
         assert_eq!(
-            cat.existing_file(&urlbase("Foo_ROW1")),
+            cat.existing_file(&urlbase("Foo_ROW1"), dir.path()),
             Some(dir.path().join("20260806-Foo_ROW1_UHD.jpg"))
         );
     }
@@ -634,11 +741,11 @@ mod tests {
 
         // The pipeline's pre-download check must find the existing file...
         assert_eq!(
-            cat.existing_file(&urlbase("Foo_ROW1")),
+            cat.existing_file(&urlbase("Foo_ROW1"), dir.path()),
             Some(dir.path().join("20260807-Foo_ROW1_1920x1080.jpg"))
         );
         // ...and report nothing for images not on disk.
-        assert_eq!(cat.existing_file(&urlbase("Other_ROW2")), None);
+        assert_eq!(cat.existing_file(&urlbase("Other_ROW2"), dir.path()), None);
     }
 
     #[test]
@@ -652,7 +759,7 @@ mod tests {
 
         // Vanished file → the pipeline should re-download, not trust the
         // stale catalogue path.
-        assert_eq!(cat.existing_file(&urlbase("Foo_ROW1")), None);
+        assert_eq!(cat.existing_file(&urlbase("Foo_ROW1"), dir.path()), None);
     }
 
     #[test]
@@ -669,12 +776,50 @@ mod tests {
             images: vec![tampered, b.clone()],
         };
 
-        assert_eq!(cat.existing_file(&urlbase("A_ROW1")), None);
+        assert_eq!(cat.existing_file(&urlbase("A_ROW1"), dir.path()), None);
         // The legitimate entry is unaffected.
         assert_eq!(
-            cat.existing_file(&urlbase("B_ROW2")),
+            cat.existing_file(&urlbase("B_ROW2"), dir.path()),
             Some(b.filename.clone())
         );
+    }
+
+    #[test]
+    fn existing_file_rejects_entries_pointing_outside_the_download_dir() {
+        // The same containment gate `prune` and the thumbnail backfill apply:
+        // a hand-edited entry naming a file elsewhere must not pass for a
+        // downloaded image (the pipeline re-downloads and the merge heals it).
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let entry = entry_with_file(&elsewhere, "20260807", "Foo_ROW1");
+        let cat = Catalogue {
+            images: vec![entry.clone()],
+        };
+
+        assert_eq!(cat.existing_file(&urlbase("Foo_ROW1"), dir.path()), None);
+        // …and is found when asked about its own directory.
+        assert_eq!(
+            cat.existing_file(&urlbase("Foo_ROW1"), &elsewhere),
+            Some(entry.filename)
+        );
+    }
+
+    #[test]
+    fn within_retention_is_the_cutoff_prune_applies() {
+        // Shared with the thumbnail backfill, which uses it to skip entries
+        // the imminent prune deletes — the two must not drift.
+        let dir = tempfile::tempdir().unwrap();
+        let entry = entry_with_file(dir.path(), "20260801", "Old_ROW1");
+        let now = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+
+        assert!(entry.within_retention(0, now), "0 days = keep forever");
+        assert!(entry.within_retention(30, now));
+        assert!(!entry.within_retention(8, now), "older than the cutoff");
+        // Malformed dates are never deleted on a guess.
+        let mut undated = entry.clone();
+        undated.fullstartdate = "not a date".to_owned();
+        assert!(undated.within_retention(1, now));
     }
 
     #[test]
@@ -908,18 +1053,24 @@ mod tests {
         };
         // Read-only parent dir → remove_file fails (for non-root).
         fs::set_permissions(&sub, fs::Permissions::from_mode(0o555)).unwrap();
+        // Verify the arrangement instead of trusting it: as root the mode is
+        // ignored, and a test that quietly asserts nothing is worse than one
+        // that fails.
+        let blocked = fs::write(sub.join(".probe"), b"x").is_err();
 
         let removed = cat.prune(&sub, 3, None, now());
 
         fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
-        if removed.is_empty() {
-            // Deletion failed as arranged: the entry must survive so the
-            // next prune retries — dropping it would orphan the file.
-            assert_eq!(cat.images, vec![old.clone()]);
-            assert!(old.filename.exists());
-        }
-        // (Running as root, remove_file succeeds despite the read-only dir
-        // and the ordinary prune path applies — nothing to assert.)
+        assert!(
+            blocked,
+            "a read-only parent dir did not block writes — running as root? \
+             the delete-failure path cannot be exercised here"
+        );
+        // Deletion failed as arranged: the entry must survive so the next
+        // prune retries — dropping it would orphan the file.
+        assert!(removed.is_empty());
+        assert_eq!(cat.images, vec![old.clone()]);
+        assert!(old.filename.exists());
     }
 
     #[test]
@@ -1116,7 +1267,7 @@ mod tests {
     }
 
     #[test]
-    fn random_other_never_returns_current() {
+    fn random_other_never_returns_current_and_actually_varies() {
         let dir = tempfile::tempdir().unwrap();
         let a = entry_with_file(dir.path(), "20260805", "A_ROW1");
         let b = entry_with_file(dir.path(), "20260806", "B_ROW2");
@@ -1125,10 +1276,19 @@ mod tests {
             images: vec![a.clone(), b.clone(), c.clone()],
         };
 
-        for _ in 0..200 {
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..1_000 {
             let picked = cat.random_other(Some(&b.filename)).unwrap();
             assert_ne!(picked.filename, b.filename);
+            seen.insert(picked.filename.clone());
         }
+        // The property shuffle actually needs: successive picks differ. An
+        // implementation always returning the first candidate satisfies
+        // "never the current one" and would leave the wallpaper stuck.
+        assert!(
+            seen.len() > 1,
+            "shuffle picked the same image every time: {seen:?}"
+        );
         // With no current, any image qualifies — but it must pick one.
         assert!(cat.random_other(None).is_some());
     }

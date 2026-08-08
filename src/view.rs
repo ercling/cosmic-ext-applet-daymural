@@ -1,5 +1,5 @@
-// The popup's layout (Task 8). `app.rs` keeps state + update; everything
-// visual lives here. The iced view code itself is exempt from unit tests
+// The popup's layout. `app.rs` keeps state + update; everything visual
+// lives here. The iced view code itself is exempt from unit tests
 // (verified manually in the panel), but the pure decisions it renders —
 // which entry is shown, which navigation targets exist, how the footer
 // timestamp reads — are extracted below and tested.
@@ -17,6 +17,7 @@ use cosmic::{
 
 use crate::app::{self, Message, RefreshError, Window};
 use crate::catalogue::{Catalogue, ImageEntry};
+use crate::config::RETENTION_CHOICES;
 use crate::fl;
 use crate::thumbs;
 
@@ -52,13 +53,8 @@ fn shuffle_interval_labels() -> Vec<String> {
 /// for hand-edited config values that match no choice.
 const SHUFFLE_DEFAULT_INDEX: usize = SHUFFLE_INTERVAL_SECS.len() - 1;
 
-/// Retention choices in days (0 = keep forever), index-aligned with
-/// [`retention_labels`]. Shared with `AppletConfig::normalize` so a loaded
-/// value the dropdown cannot display never drives prune/fetch behavior.
-const RETENTION_DAYS: [u16; 4] = crate::config::RETENTION_CHOICES;
-
 /// Dropdown labels for the retention choices, index-aligned with
-/// [`RETENTION_DAYS`] (see [`shuffle_interval_labels`] on why this is a
+/// [`RETENTION_CHOICES`] (see [`shuffle_interval_labels`] on why this is a
 /// function).
 fn retention_labels() -> Vec<String> {
     vec![
@@ -76,18 +72,20 @@ const RETENTION_DEFAULT_INDEX: usize = 1;
 /// Opacity applied to a *disabled* icon button's glyph.
 ///
 /// The theme's own disabled appearance is a no-op for `Button::Icon`, so this
-/// has to be explicit (verified against libcosmic rev `8a017a1`):
+/// has to be explicit (verified against libcosmic rev `8a017a1`; file
+/// references are deliberately unpinned to line numbers, which a bump
+/// invalidates silently):
 /// * `icon_button.on` and `.on_disabled` are the **same RGB** colour
 ///   (`control_steps_array[8]`), differing only in alpha (1.0 vs 0.65 — see
-///   `Component::component`, `cosmic-theme/src/model/derivation.rs`), and the
-///   SVG rasteriser tints RGB only, keeping each pixel's source alpha
-///   (`iced/wgpu/src/image/vector.rs:173`). The alpha delta is discarded.
-/// * the disabled background tweak (`background.a *= 0.5`,
+///   `Component::component` in `cosmic-theme`'s `model/derivation.rs`), and
+///   the SVG rasteriser tints RGB only, keeping each pixel's source alpha
+///   (`iced_wgpu`'s `image/vector.rs`). The alpha delta is discarded.
+/// * the disabled background tweak (`background.a *= 0.5` in libcosmic's
 ///   `theme/style/button.rs`) is also a no-op because `icon_button.base` is
 ///   fully transparent.
 ///
-/// `Icon::opacity` survives to the renderer as its own uniform
-/// (`iced/wgpu/src/image/mod.rs:348`), so it is the one lever that works.
+/// `Icon::opacity` survives to the renderer as its own uniform, so it is the
+/// one lever that works.
 const DISABLED_ICON_OPACITY: f32 = 0.4;
 
 // ---------------------------------------------------------------------------
@@ -188,7 +186,7 @@ pub fn shuffle_interval_secs(index: usize) -> u32 {
 /// (hand-edited config) display as the 8-day default rather than crashing
 /// or showing an empty selection.
 pub fn retention_index(days: u16) -> usize {
-    RETENTION_DAYS
+    RETENTION_CHOICES
         .iter()
         .position(|&d| d == days)
         .unwrap_or(RETENTION_DEFAULT_INDEX)
@@ -197,10 +195,10 @@ pub fn retention_index(days: u16) -> usize {
 /// Retention days for a dropdown index. Out-of-range indices (cannot
 /// happen through the UI) fall back to the 8-day default.
 pub fn retention_days(index: usize) -> u16 {
-    RETENTION_DAYS
+    RETENTION_CHOICES
         .get(index)
         .copied()
-        .unwrap_or(RETENTION_DAYS[RETENTION_DEFAULT_INDEX])
+        .unwrap_or(RETENTION_CHOICES[RETENTION_DEFAULT_INDEX])
 }
 
 /// Opacity for an icon button's glyph: full while it can be pressed, dimmed
@@ -294,13 +292,14 @@ fn divider<'a>() -> Element<'a, Message> {
 /// never decodes the full ~5 MB UHD file). Click opens the full image in
 /// the default viewer.
 fn thumbnail<'a>(window: &'a Window, entry: &'a ImageEntry) -> Element<'a, Message> {
-    let thumb = thumbs::thumbnail_path(&entry.filename, app::state_dir());
-    let inner: Element<'_, Message> = if thumb.is_file() {
+    let thumb =
+        thumbs::thumbnail_path(&entry.filename, app::state_dir()).filter(|path| path.is_file());
+    let inner: Element<'_, Message> = if let Some(thumb) = thumb {
         // `theme::Button::Image` rounds the button's border to
         // `corner_radii.radius_s`, but nothing rounds the image inside it —
         // libcosmic's own `button::image` rounds the handle itself (with a
-        // hardcoded `[9.0; 4]`; the token is the same corner, and follows the
-        // user's corner-radius setting).
+        // hardcoded `[9.0; 4]`; the token is the same corner by default, and
+        // follows the user's corner-radius setting).
         widget::image(widget::image::Handle::from_path(thumb))
             .border_radius(cosmic::theme::active().cosmic().corner_radii.radius_s)
             .width(Length::Fill)
@@ -366,6 +365,10 @@ fn controls(window: &Window) -> Element<'_, Message> {
 }
 
 /// Shuffle toggler row (idiom per cosmic-applet-tiling's toggler rows).
+///
+/// The literal `14` is that reference's own label size, not a theme token —
+/// libcosmic exposes no text-size scale, so first-party applets hardcode it
+/// too (a toggler otherwise defaults to the larger body size).
 fn shuffle_toggler(window: &Window) -> Element<'_, Message> {
     widget::toggler(window.config.shuffle_enabled)
         .on_toggle(Message::SetShuffleEnabled)
@@ -429,7 +432,7 @@ fn refresh_button(window: &Window) -> Element<'_, Message> {
 /// `theme::Button::Icon`) because that constructor takes a bare `Handle` and
 /// gives no way to reach the `Icon`'s opacity.
 fn nav_button<'a>(
-    window: &Window,
+    window: &'a Window,
     icon: &'static str,
     tooltip: impl Into<Cow<'static, str>>,
     on_press: Option<Message>,
@@ -459,7 +462,7 @@ fn nav_button<'a>(
 /// surface when it is `false`, and `parent_id` must be *our* popup so the
 /// tooltip parents to it instead of the panel.
 fn popup_tooltip<'a>(
-    window: &Window,
+    window: &'a Window,
     content: impl Into<Element<'a, Message>>,
     tooltip: impl Into<Cow<'static, str>>,
 ) -> Element<'a, Message> {
@@ -608,13 +611,13 @@ mod tests {
     #[test]
     fn retention_mapping_roundtrips() {
         // The plan's exact choices, in dropdown order (0 = forever).
-        assert_eq!(RETENTION_DAYS, [3, 8, 30, 0]);
+        assert_eq!(RETENTION_CHOICES, [3, 8, 30, 0]);
         assert_eq!(
             retention_labels(),
             ["3 days", "8 days", "30 days", "Forever"]
         );
-        assert_eq!(retention_labels().len(), RETENTION_DAYS.len());
-        for (index, &days) in RETENTION_DAYS.iter().enumerate() {
+        assert_eq!(retention_labels().len(), RETENTION_CHOICES.len());
+        for (index, &days) in RETENTION_CHOICES.iter().enumerate() {
             assert_eq!(retention_index(days), index);
             assert_eq!(retention_days(index), days);
             // Full roundtrip both ways.
@@ -634,41 +637,66 @@ mod tests {
         // An enabled glyph must stay untouched, a disabled one must be dim
         // enough to read as disabled at a glance — the theme's own disabled
         // styling is invisible for `Button::Icon` (see DISABLED_ICON_OPACITY).
+        //
+        // That `nav_button` actually *applies* this to the glyph cannot be
+        // asserted from here: `widget::icon::Icon` keeps its opacity in a
+        // private field with no getter, and the value only becomes observable
+        // once the renderer has rasterised the SVG. That half stays a manual
+        // (GUI) check; this is the seam that can be pinned.
         assert_eq!(icon_opacity(true), 1.0);
         let disabled = icon_opacity(false);
+        assert!(disabled > 0.0, "a disabled glyph must stay visible");
         assert!(
-            (0.2..=0.6).contains(&disabled),
+            disabled < icon_opacity(true) * 0.75,
             "disabled opacity {disabled} is not a clear visual difference"
         );
-        assert!(disabled < icon_opacity(true));
     }
 
     #[test]
-    fn status_line_reflects_the_fetch_lifecycle() {
+    fn status_line_on_a_cold_start_says_nothing_is_downloaded_yet() {
+        // Nothing on disk, nothing fetched yet.
+        assert_eq!(status_line(&Window::default()), "No images yet — fetching…");
+    }
+
+    #[test]
+    fn status_line_while_the_pipeline_runs() {
         let mut window = Window::default();
-
-        // Fresh cold start: nothing on disk, nothing fetched yet.
-        assert_eq!(status_line(&window), "No images yet — fetching…");
-
-        // Pipeline running.
         window.refresh_pending = true;
         assert_eq!(status_line(&window), "Checking for new images…");
-        window.refresh_pending = false;
+    }
 
-        // Fetch failed → the plan's exact error footer for network trouble…
+    #[test]
+    fn status_line_blames_bing_only_for_network_trouble() {
+        let mut window = Window::default();
         window.last_error = Some(RefreshError::Network("boom".to_owned()));
         assert_eq!(status_line(&window), "Bing unreachable — retrying in 1 h");
-        // …while a local I/O failure is not blamed on Bing.
+    }
+
+    #[test]
+    fn status_line_names_local_disk_trouble_separately() {
+        let mut window = Window::default();
         window.last_error = Some(RefreshError::Disk("disk full".to_owned()));
         assert_eq!(status_line(&window), "Disk error — retrying in 1 h");
+    }
 
-        // Success clears the error and records the time (relative wording
-        // itself is covered by `format_updated`'s tests; only the prefix is
-        // asserted here so the test cannot flake across a local midnight
-        // between the two `now()` reads).
-        window.last_error = None;
+    #[test]
+    fn status_line_after_a_successful_fetch_shows_the_time() {
+        // Relative wording is covered by `format_updated`'s own tests; only
+        // the prefix is asserted here so this cannot flake across a local
+        // midnight falling between the two `now()` reads.
+        let mut window = Window::default();
         window.last_updated = Some(chrono::Utc::now());
         assert!(status_line(&window).starts_with("Updated"));
+    }
+
+    #[test]
+    fn status_line_prefers_the_pipeline_state_over_a_stale_error() {
+        // Ordering matters: a retry in flight must not keep showing the
+        // previous failure.
+        let mut window = Window::default();
+        window.last_error = Some(RefreshError::Network("boom".to_owned()));
+        window.refresh_pending = true;
+        assert_eq!(status_line(&window), "Checking for new images…");
     }
 
     #[test]

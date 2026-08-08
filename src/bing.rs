@@ -7,9 +7,12 @@
 
 use std::fmt;
 use std::io;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+
+use crate::fsutil::{self, PART_SUFFIX};
 
 /// Base URL images are fetched from (`https://www.bing.com<urlbase>_<res>.jpg`).
 pub const BING_BASE_URL: &str = "https://www.bing.com";
@@ -45,24 +48,51 @@ pub struct BingImage {
     pub copyrightlink: String,
 }
 
-/// Parse an HPImageArchive JSON response and validate the field that feeds
-/// filesystem paths: `startdate` must be exactly 8 ASCII digits — it is
-/// embedded verbatim in the download filename, so a hostile value like
-/// `../../.config/x` must never escape the download dir. Malformed input
-/// is an error, never a panic.
+/// Parse an HPImageArchive JSON response, dropping the images whose two
+/// path/URL-forming fields do not validate. Malformed *JSON* is an error,
+/// never a panic; a malformed *image* is skipped.
+///
+/// Per-image rather than whole-batch rejection on purpose: one anomalous or
+/// newly-formatted entry among the eight must not take the applet offline
+/// (`Parse` → `Network` → 1 h backoff, forever, with zero images). When
+/// nothing survives, [`fetch_image_list`] reports [`FetchError::EmptyList`].
+///
+/// * `startdate` must be exactly 8 ASCII digits — it is embedded verbatim in
+///   the download filename, so a hostile value like `../../.config/x` must
+///   never escape the download dir.
+/// * `urlbase` must carry Bing's own `/th?id=OHR.` prefix — it is
+///   concatenated straight onto the base URL, so `"@evil.example/x"` would
+///   otherwise turn `https://www.bing.com` into userinfo and send the
+///   download to another host entirely.
 pub fn parse_image_list(json: &str) -> Result<ImageArchive, serde_json::Error> {
-    use serde::de::Error as _;
-
-    let archive: ImageArchive = serde_json::from_str(json)?;
-    for image in &archive.images {
-        if image.startdate.len() != 8 || !image.startdate.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(serde_json::Error::custom(format!(
-                "invalid startdate {:?} (expected 8 ASCII digits)",
-                image.startdate
-            )));
-        }
-    }
+    let mut archive: ImageArchive = serde_json::from_str(json)?;
+    archive
+        .images
+        .retain(|image| match rejection_reason(image) {
+            None => true,
+            Some(reason) => {
+                tracing::warn!("skipping Bing image: {reason}");
+                false
+            }
+        });
     Ok(archive)
+}
+
+/// Why `image` must not be used, if so (see [`parse_image_list`]).
+fn rejection_reason(image: &BingImage) -> Option<String> {
+    if image.startdate.len() != 8 || !image.startdate.bytes().all(|b| b.is_ascii_digit()) {
+        return Some(format!(
+            "invalid startdate {:?} (expected 8 ASCII digits)",
+            image.startdate
+        ));
+    }
+    if !image.urlbase.starts_with(URLBASE_PREFIX) {
+        return Some(format!(
+            "invalid urlbase {:?} (expected a leading {URLBASE_PREFIX:?})",
+            image.urlbase
+        ));
+    }
+    None
 }
 
 /// Everything that can go wrong talking to Bing: transport failures,
@@ -84,6 +114,9 @@ pub enum FetchError {
     /// Persisting it would poison the catalogue permanently, since
     /// downloads skip files that already exist.
     NotJpeg,
+    /// A response body exceeded its budget ([`MAX_LIST_BYTES`] for the
+    /// image list, [`MAX_IMAGE_BYTES`] for a download).
+    TooLarge,
     /// Local I/O failure writing the downloaded file.
     Io(io::Error),
 }
@@ -100,19 +133,20 @@ impl FetchError {
 impl fmt::Display for FetchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Http(e) => write!(f, "HTTP request failed: {e}"),
-            Self::Status(s) => write!(f, "Bing returned HTTP {s}"),
-            Self::Parse(e) => write!(f, "failed to parse Bing response: {e}"),
+            Self::Http(error) => write!(f, "HTTP request failed: {error}"),
+            Self::Status(status) => write!(f, "Bing returned HTTP {status}"),
+            Self::Parse(error) => write!(f, "failed to parse Bing response: {error}"),
             Self::EmptyList => write!(f, "Bing returned an empty image list"),
             Self::NotJpeg => write!(f, "downloaded body is not a JPEG image"),
-            Self::Io(e) => write!(f, "I/O error: {e}"),
+            Self::TooLarge => write!(f, "response body exceeds its size limit"),
+            Self::Io(error) => write!(f, "I/O error: {error}"),
         }
     }
 }
 
 impl From<io::Error> for FetchError {
-    fn from(e: io::Error) -> Self {
-        Self::Io(e)
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
     }
 }
 
@@ -137,7 +171,8 @@ pub fn http_client() -> Result<reqwest::Client, FetchError> {
 
 /// Fetch and parse the image-of-the-day list for the latest `n` images
 /// from `base_url` ([`BING_BASE_URL`] in production). A successful but
-/// empty list is [`FetchError::EmptyList`].
+/// empty list is [`FetchError::EmptyList`] — including a batch whose images
+/// were all dropped by [`parse_image_list`]'s validation.
 pub async fn fetch_image_list(
     client: &reqwest::Client,
     base_url: &str,
@@ -152,7 +187,13 @@ pub async fn fetch_image_list(
     if !status.is_success() {
         return Err(FetchError::Status(status));
     }
-    let body = resp.text().await.map_err(FetchError::Http)?;
+    // Same reasoning as the image download: `gzip` is enabled and reqwest
+    // imposes no default response-size limit, so an uncapped read of *this*
+    // body — the one contacted first on every refresh — would let a
+    // compromised, MITM'd or redirected endpoint drive unbounded allocation
+    // with a highly compressible reply.
+    let body = read_capped(resp, MAX_LIST_BYTES).await?;
+    let body = String::from_utf8_lossy(&body);
     let archive = parse_image_list(&body).map_err(FetchError::Parse)?;
     if archive.images.is_empty() {
         return Err(FetchError::EmptyList);
@@ -167,9 +208,10 @@ pub fn download_path(dir: &Path, image: &BingImage) -> PathBuf {
 }
 
 /// Download `image` at UHD into `dir` (created if missing). Skips the
-/// network entirely when the file already exists; otherwise writes to a
-/// `.part` sibling and renames, so a crashed download never leaves a
-/// torn file behind at the final path. Returns the final path.
+/// network entirely when the file is already there *and still looks like a
+/// JPEG*; otherwise writes to a `.part` sibling and renames, so a crashed
+/// download never leaves a torn file behind at the final path. Returns the
+/// final path.
 pub async fn download_image(
     client: &reqwest::Client,
     base_url: &str,
@@ -177,8 +219,19 @@ pub async fn download_image(
     dir: &Path,
 ) -> Result<PathBuf, FetchError> {
     let dest = download_path(dir, image);
+    // "Already downloaded" has to mean more than "a file sits at that path":
+    // the skip is permanent, so anything else under this name — a captive
+    // portal's HTML saved by another tool, a zero-byte stub from a full disk,
+    // a folder migrated from the reference GNOME extension, which had no
+    // magic-byte check — would be skipped by *every* later refresh, sit in
+    // the catalogue as a normal entry, and be applied as the wallpaper for
+    // good. The same two bytes a fresh body is checked against decide it;
+    // falling through re-downloads over the bad file.
     if dest.exists() {
-        return Ok(dest);
+        if is_jpeg_file(&dest) {
+            return Ok(dest);
+        }
+        tracing::warn!("{} is not a JPEG: re-downloading it", dest.display());
     }
     std::fs::create_dir_all(dir)?;
 
@@ -191,18 +244,65 @@ pub async fn download_image(
     if !status.is_success() {
         return Err(FetchError::Status(status));
     }
-    let bytes = resp.bytes().await.map_err(FetchError::Http)?;
+    let bytes = read_capped(resp, MAX_IMAGE_BYTES).await?;
     // Captive portals and CDN error pages answer 2xx with HTML; a JPEG
     // always starts FF D8. Never persist anything else.
     if !bytes.starts_with(&JPEG_MAGIC) {
         return Err(FetchError::NotJpeg);
     }
-    crate::fsutil::write_atomic(&dest, PART_SUFFIX, |part| std::fs::write(part, &bytes))?;
+    fsutil::write_atomic(&dest, PART_SUFFIX, |part| std::fs::write(part, &bytes))?;
     Ok(dest)
 }
 
 /// The two bytes every JPEG stream starts with (SOI marker).
 const JPEG_MAGIC: [u8; 2] = [0xFF, 0xD8];
+
+/// Whether the file at `path` starts with [`JPEG_MAGIC`] — the download's
+/// own body check, applied to bytes already on disk.
+///
+/// Two bytes rather than a decode on purpose: proving an image *whole* means
+/// reading all ~5 MB of it, which is the cost the thumbnail cache exists to
+/// avoid (and where a decodable-but-truncated file is caught instead, once,
+/// and remembered). What this rules out is the file that was never an image
+/// at all — the one case no later refresh would ever repair on its own.
+/// Unreadable counts as "not a JPEG": a file that cannot be read is no use
+/// as a wallpaper either, and re-downloading is the cheapest way to find out.
+pub fn is_jpeg_file(path: &Path) -> bool {
+    let mut head = [0u8; JPEG_MAGIC.len()];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut head))
+        .is_ok_and(|()| head == JPEG_MAGIC)
+}
+
+/// Hard ceiling on a downloaded image. Bing's UHD JPEGs run ~5 MB and have
+/// never approached this; the point is that `gzip` is enabled, so an
+/// unbounded `resp.bytes()` lets a compromised or redirected endpoint drive
+/// allocation with a highly compressible body.
+const MAX_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Hard ceiling on the HPImageArchive reply. The real JSON is a few KB for
+/// the largest batch the applet ever asks for; 1 MiB leaves room for Bing
+/// growing the payload while still bounding the very first response of every
+/// refresh.
+const MAX_LIST_BYTES: u64 = 1024 * 1024;
+
+/// Read the whole body, refusing anything over `limit` — both by the
+/// advertised `Content-Length` (cheap, catches the honest case) and by a
+/// running budget over the decompressed stream (the one that actually bounds
+/// memory).
+async fn read_capped(mut resp: reqwest::Response, limit: u64) -> Result<Vec<u8>, FetchError> {
+    if resp.content_length().is_some_and(|n| n > limit) {
+        return Err(FetchError::TooLarge);
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(FetchError::Http)? {
+        if body.len() as u64 + chunk.len() as u64 > limit {
+            return Err(FetchError::TooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
 
 /// Remove orphaned `.part` temps a crash mid-download may have left in
 /// `dir` (the pipeline sweeps before downloading anew; downloads are
@@ -226,16 +326,12 @@ pub fn sweep_part_files(dir: &Path) {
         }
         let path = entry.path();
         if path.is_file()
-            && let Err(e) = std::fs::remove_file(&path)
+            && let Err(error) = std::fs::remove_file(&path)
         {
-            tracing::warn!("failed to remove orphaned {}: {e}", path.display());
+            tracing::warn!("failed to remove orphaned {}: {error}", path.display());
         }
     }
 }
-
-/// Suffix of the temporary sibling a download is written to before the
-/// atomic rename (`sweep_part_files` cleans up orphans carrying it).
-const PART_SUFFIX: &str = ".part";
 
 /// Split Bing's `copyright` string into (display title, copyright notice).
 ///
@@ -558,11 +654,12 @@ mod tests {
     const DEAD_BASE: &str = "http://127.0.0.1:9";
 
     #[tokio::test]
-    async fn download_image_skips_when_file_exists() {
+    async fn download_image_skips_when_the_file_exists() {
         let dir = tempfile::tempdir().unwrap();
         let image = fixture_image();
         let dest = download_path(dir.path(), &image);
-        std::fs::write(&dest, b"pre-existing bytes").unwrap();
+        let existing = crate::testutil::tiny_jpeg(32, 18);
+        std::fs::write(&dest, &existing).unwrap();
 
         // Dead base URL: if the skip check failed, the request would error
         // out (connection refused) and fail the test — the real network is
@@ -573,7 +670,62 @@ mod tests {
             .unwrap();
 
         assert_eq!(got, dest);
-        assert_eq!(std::fs::read(&dest).unwrap(), b"pre-existing bytes");
+        assert_eq!(std::fs::read(&dest).unwrap(), existing);
+    }
+
+    #[tokio::test]
+    async fn download_image_replaces_an_existing_file_that_is_not_a_jpeg() {
+        // The skip is permanent: whatever sits at the download path is what
+        // the catalogue carries and what gets applied as the wallpaper, for
+        // every refresh from now on. A file under a valid Bing name that
+        // never was an image (a saved error page, a zero-byte stub, a folder
+        // migrated from the reference extension, which checked no magic
+        // bytes) must therefore be re-downloaded, not adopted.
+        let jpeg = crate::testutil::tiny_jpeg(32, 18);
+        let expected = jpeg.clone();
+        let base = crate::testutil::spawn_mock(move |_| (200, jpeg.clone()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let image = fixture_image();
+        let dest = download_path(dir.path(), &image);
+        let client = http_client().unwrap();
+
+        for corrupt in [b"<html>login here</html>".to_vec(), Vec::new()] {
+            std::fs::write(&dest, &corrupt).unwrap();
+            let got = download_image(&client, &base, &image, dir.path())
+                .await
+                .unwrap();
+            assert_eq!(got, dest);
+            assert_eq!(std::fs::read(&dest).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn is_jpeg_file_reads_only_the_magic_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let jpeg = dir.path().join("real.jpg");
+        std::fs::write(&jpeg, crate::testutil::tiny_jpeg(32, 18)).unwrap();
+        assert!(is_jpeg_file(&jpeg));
+
+        // Truncated to the marker alone: still "a JPEG" here — proving an
+        // image *whole* is the thumbnail cache's job, not a 5 MB re-read on
+        // every refresh.
+        let stub = dir.path().join("stub.jpg");
+        std::fs::write(&stub, JPEG_MAGIC).unwrap();
+        assert!(is_jpeg_file(&stub));
+
+        for (name, bytes) in [
+            ("html.jpg", b"<html>".as_slice()),
+            ("empty.jpg", b""),
+            ("short.jpg", &JPEG_MAGIC[..1]),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            assert!(!is_jpeg_file(&path), "{name}");
+        }
+        // Unreadable (here: missing) is not a JPEG either.
+        assert!(!is_jpeg_file(&dir.path().join("nope.jpg")));
+        assert!(!is_jpeg_file(dir.path()));
     }
 
     #[tokio::test]
@@ -643,7 +795,7 @@ mod tests {
 
         assert_eq!(dest, download_path(dir.path(), &image));
         assert_eq!(std::fs::read(&dest).unwrap(), expected);
-        assert!(!crate::fsutil::temp_sibling(&dest, PART_SUFFIX).exists());
+        assert!(!fsutil::temp_sibling(&dest, PART_SUFFIX).exists());
     }
 
     #[tokio::test]
@@ -663,7 +815,7 @@ mod tests {
         // Nothing persisted — neither the final file nor a .part.
         let dest = download_path(dir.path(), &image);
         assert!(!dest.exists());
-        assert!(!crate::fsutil::temp_sibling(&dest, PART_SUFFIX).exists());
+        assert!(!fsutil::temp_sibling(&dest, PART_SUFFIX).exists());
     }
 
     #[test]
@@ -713,6 +865,10 @@ mod tests {
             FetchError::NotJpeg.to_string(),
             "downloaded body is not a JPEG image"
         );
+        assert_eq!(
+            FetchError::TooLarge.to_string(),
+            "response body exceeds its size limit"
+        );
 
         let io_err: FetchError = io::Error::new(io::ErrorKind::PermissionDenied, "denied").into();
         assert_eq!(io_err.to_string(), "I/O error: denied");
@@ -734,6 +890,7 @@ mod tests {
         assert!(FetchError::from(io::Error::other("disk full")).is_local());
         assert!(!FetchError::EmptyList.is_local());
         assert!(!FetchError::NotJpeg.is_local());
+        assert!(!FetchError::TooLarge.is_local());
         assert!(!FetchError::Status(reqwest::StatusCode::BAD_GATEWAY).is_local());
         assert!(!FetchError::Parse(parse_image_list("x").unwrap_err()).is_local());
     }
@@ -748,16 +905,25 @@ mod tests {
         assert!(parse_image_list("{\"images\": [").is_err()); // truncated
     }
 
+    /// One image object with the given `startdate`/`urlbase`; every other
+    /// field valid.
+    fn image_json(urlbase: &str, startdate: &str) -> String {
+        format!(
+            r#"{{"urlbase":{},"startdate":{},"fullstartdate":"202608070700",
+                "copyright":"Foo (© Bar)","copyrightlink":"https://example.com"}}"#,
+            serde_json::to_string(urlbase).unwrap(),
+            serde_json::to_string(startdate).unwrap()
+        )
+    }
+
     #[test]
-    fn parse_rejects_startdates_that_could_escape_the_download_dir() {
+    fn parse_drops_startdates_that_could_escape_the_download_dir() {
         // `startdate` feeds the download filename verbatim; anything but
-        // 8 ASCII digits is refused at parse time.
+        // 8 ASCII digits is dropped at parse time.
         let with_startdate = |startdate: &str| {
             format!(
-                r#"{{"images":[{{"urlbase":"/th?id=OHR.Foo_ROW1","startdate":{},
-                    "fullstartdate":"202608070700","copyright":"Foo (© Bar)",
-                    "copyrightlink":"https://example.com"}}]}}"#,
-                serde_json::to_string(startdate).unwrap()
+                "{{\"images\":[{}]}}",
+                image_json("/th?id=OHR.Foo_ROW1", startdate)
             )
         };
         for hostile in [
@@ -769,10 +935,182 @@ mod tests {
             "",
         ] {
             assert!(
-                parse_image_list(&with_startdate(hostile)).is_err(),
+                parse_image_list(&with_startdate(hostile))
+                    .unwrap()
+                    .images
+                    .is_empty(),
                 "{hostile}"
             );
         }
-        assert!(parse_image_list(&with_startdate("20260807")).is_ok());
+        assert_eq!(
+            parse_image_list(&with_startdate("20260807"))
+                .unwrap()
+                .images
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn parse_drops_urlbases_that_could_redirect_the_download() {
+        // `urlbase` is concatenated straight onto the base URL, so a value
+        // starting with `@` turns `https://www.bing.com` into userinfo and
+        // the download goes to a host of the attacker's choosing.
+        let with_urlbase =
+            |urlbase: &str| format!("{{\"images\":[{}]}}", image_json(urlbase, "20260807"));
+        for hostile in [
+            "@evil.example/x",
+            "https://evil.example/x",
+            "//evil.example/x",
+            "/th?id=Other.Foo_ROW1",
+            "",
+        ] {
+            assert!(
+                parse_image_list(&with_urlbase(hostile))
+                    .unwrap()
+                    .images
+                    .is_empty(),
+                "{hostile}"
+            );
+        }
+        assert_eq!(
+            parse_image_list(&with_urlbase("/th?id=OHR.Foo_ROW1"))
+                .unwrap()
+                .images
+                .len(),
+            1
+        );
+        // The URL built from an accepted value never leaves bing.com.
+        assert!(
+            image_url(BING_BASE_URL, "/th?id=OHR.Foo_ROW1")
+                .starts_with("https://www.bing.com/th?id=OHR.")
+        );
+    }
+
+    #[test]
+    fn parse_keeps_the_sound_images_around_a_rejected_one() {
+        // The blast radius of one anomalous entry is that entry alone: a
+        // whole-batch rejection would surface as `Parse` → 1 h backoff with
+        // zero images, forever, for as long as Bing serves it.
+        let json = format!(
+            "{{\"images\":[{},{},{}]}}",
+            image_json("/th?id=OHR.Good_ROW1", "20260806"),
+            image_json("@evil.example/x", "20260807"),
+            image_json("/th?id=OHR.Good_ROW2", "../../x"),
+        );
+        let kept = parse_image_list(&json).unwrap().images;
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].urlbase, "/th?id=OHR.Good_ROW1");
+    }
+
+    #[tokio::test]
+    async fn fetch_image_list_treats_an_all_rejected_batch_as_empty() {
+        // Nothing survived validation: `EmptyList` (the documented "back off
+        // for an hour" path), not a parse error misreported as unreachable.
+        let json = format!("{{\"images\":[{}]}}", image_json("@evil.example/x", "x"));
+        let base = crate::testutil::spawn_mock(move |_| (200, json.clone().into_bytes()));
+        let err = fetch_image_list(&http_client().unwrap(), &base, 8)
+            .await
+            .expect_err("an all-rejected batch must not look like a success");
+        assert!(matches!(err, FetchError::EmptyList));
+    }
+
+    #[tokio::test]
+    async fn download_image_refuses_an_oversized_body() {
+        // gzip is enabled, so an unbounded read lets a compromised endpoint
+        // drive allocation with a highly compressible body.
+        let oversized = (MAX_IMAGE_BYTES + 1) as usize;
+        let base = crate::testutil::spawn_mock(move |_| {
+            let mut body = vec![0u8; oversized];
+            body[0] = JPEG_MAGIC[0];
+            body[1] = JPEG_MAGIC[1];
+            (200, body)
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let image = fixture_image();
+        let client = http_client().unwrap();
+        let err = download_image(&client, &base, &image, dir.path())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, FetchError::TooLarge));
+        assert!(!download_path(dir.path(), &image).exists());
+    }
+
+    #[tokio::test]
+    async fn fetch_image_list_refuses_an_oversized_body() {
+        // The list endpoint runs first on every refresh and is the URL the
+        // applet always contacts, so it needs the same budget the image
+        // download has — an uncapped `text()` there is an OOM handed to
+        // whoever answers.
+        let oversized = (MAX_LIST_BYTES + 1) as usize;
+        let base = crate::testutil::spawn_mock(move |_| (200, vec![b'{'; oversized]));
+
+        let err = fetch_image_list(&http_client().unwrap(), &base, 8)
+            .await
+            .expect_err("an oversized list body must not be buffered whole");
+
+        assert!(matches!(err, FetchError::TooLarge));
+    }
+
+    #[tokio::test]
+    async fn download_image_refuses_an_oversized_streamed_body() {
+        // The threat model is a *compressed* reply: with gzip enabled reqwest
+        // wraps the body in a decoder of unknown size, so `content_length()`
+        // is `None` and the cheap pre-check above never fires — the running
+        // budget over the stream is then the only thing bounding memory. The
+        // EOF-framed mock reproduces exactly that shape.
+        let oversized = (MAX_IMAGE_BYTES + 1) as usize;
+        let base = crate::testutil::spawn_mock_framed(
+            move |_| {
+                let mut body = vec![0u8; oversized];
+                body[0] = JPEG_MAGIC[0];
+                body[1] = JPEG_MAGIC[1];
+                (200, body)
+            },
+            crate::testutil::Framing::UntilEof,
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let image = fixture_image();
+        let client = http_client().unwrap();
+        let err = download_image(&client, &base, &image, dir.path())
+            .await
+            .expect_err("an unsized oversized body must not be buffered whole");
+
+        assert!(matches!(err, FetchError::TooLarge));
+        assert!(!download_path(dir.path(), &image).exists());
+    }
+
+    #[tokio::test]
+    async fn fetch_image_list_refuses_an_oversized_streamed_body() {
+        let oversized = (MAX_LIST_BYTES + 1) as usize;
+        let base = crate::testutil::spawn_mock_framed(
+            move |_| (200, vec![b'{'; oversized]),
+            crate::testutil::Framing::UntilEof,
+        );
+
+        let err = fetch_image_list(&http_client().unwrap(), &base, 8)
+            .await
+            .expect_err("an unsized oversized list body must not be buffered whole");
+
+        assert!(matches!(err, FetchError::TooLarge));
+    }
+
+    #[tokio::test]
+    async fn an_unsized_body_within_the_budget_still_arrives_whole() {
+        // Guard against "fixing" the streamed budget by refusing every
+        // unsized body: a chunked/compressed reply of a normal size is the
+        // ordinary case and must parse.
+        let base = crate::testutil::spawn_mock_framed(
+            |_| (200, FIXTURE.as_bytes().to_vec()),
+            crate::testutil::Framing::UntilEof,
+        );
+
+        let archive = fetch_image_list(&http_client().unwrap(), &base, 8)
+            .await
+            .expect("an unsized body under the budget must be read to EOF");
+        assert_eq!(archive.images.len(), 8);
     }
 }

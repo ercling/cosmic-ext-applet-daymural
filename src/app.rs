@@ -9,6 +9,7 @@
 // pending timer. The pipeline itself runs as one async task and reports
 // back via `RefreshFinished`.
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -32,12 +33,6 @@ pub const APP_ID: &str = "io.github.ercling.CosmicBingWallpaper";
 /// Symbolic icon shown in the panel.
 const PANEL_ICON: &str = "preferences-desktop-wallpaper-symbolic";
 
-/// Hover tooltip on the panel button. A function, not a const: the text is
-/// localized and must be read after `localize::localize()` has run.
-fn panel_tooltip() -> String {
-    fl!("panel-tooltip")
-}
-
 pub fn run() -> cosmic::iced::Result {
     cosmic::applet::run::<Window>(())
 }
@@ -45,14 +40,18 @@ pub fn run() -> cosmic::iced::Result {
 /// The applet's state dir (`~/.local/state/<APP_ID>/`): catalogue JSON +
 /// cached thumbnails. Resolved once — the view asks for it on every
 /// re-render and must not repeat env/home lookups per frame.
+///
+/// `dirs::state_dir()` already resolves `$XDG_STATE_HOME` then
+/// `~/.local/state`, so it only fails with no home at all; falling back to the
+/// temp dir keeps the result *absolute* (an empty-home `unwrap_or_default()`
+/// would silently scatter the catalogue and thumbnails through the process's
+/// working directory).
 pub fn state_dir() -> &'static Path {
     static STATE_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
         dirs::state_dir()
             .unwrap_or_else(|| {
-                dirs::home_dir()
-                    .unwrap_or_default()
-                    .join(".local")
-                    .join("state")
+                tracing::warn!("no home directory: keeping applet state in the temp dir");
+                std::env::temp_dir()
             })
             .join(APP_ID)
     });
@@ -85,9 +84,15 @@ pub struct Window {
     pub(crate) current: Option<PathBuf>,
     /// A fetch pipeline is running (debounces refresh triggers).
     pub(crate) refresh_pending: bool,
+    /// The startup thumbnail pass is running (see
+    /// [`Window::start_thumbnail_pass_over`]). Together with
+    /// `refresh_pending` this is the whole set of things that write into the
+    /// thumbnail cache, which is what [`Window::may_sweep_thumbnails`] needs
+    /// to know.
+    thumbnail_pass_pending: bool,
     /// Cold-start auto-apply state (see [`ColdStart`]). Spent by *any*
     /// successful apply (auto, manual navigation, shuffle tick): see
-    /// [`on_apply_success`].
+    /// [`Window::on_apply_success`].
     cold_start: ColdStart,
     /// Generation counter for the one-shot refresh timer; `RefreshDue`
     /// messages carrying a stale generation are ignored.
@@ -134,8 +139,9 @@ impl ColdStart {
             Self::Pending => true,
             Self::RetryOver(at_failure) => match live {
                 // Nothing knowable is displayed (color source,
-                // per-output mode) — same ground the reviewer's rule
-                // treats as safe to apply over.
+                // per-output mode) — the same ground
+                // `wallpaper::should_auto_apply` treats as safe to
+                // apply over.
                 None => true,
                 Some(path) => Some(path) == at_failure.as_deref(),
             },
@@ -184,6 +190,9 @@ pub enum Message {
     /// The fetch pipeline finished (payload: the freshly fetched entries,
     /// merged into the live catalogue on the UI thread).
     RefreshFinished(Result<Vec<ImageEntry>, RefreshError>),
+    /// The startup thumbnail pass finished. Also re-renders the popup, so
+    /// previews generated while it was open appear without a reopen.
+    ThumbnailsReady,
     /// Apply this downloaded file as the wallpaper (prev/next/newest
     /// buttons — browsing applies immediately).
     ApplyImage(PathBuf),
@@ -293,9 +302,10 @@ impl Window {
     /// The one prune sequence both the immediate path and the post-fetch
     /// path run: refresh our idea of what is applied from cosmic-bg's live
     /// config (so the right file is protected even after external
-    /// wallpaper changes), prune against the *current* retention, drop the
-    /// pruned images' cached thumbnails (later prunes never report these
-    /// entries again — skipping this would orphan them permanently), and
+    /// wallpaper changes), prune against the *current* retention, sweep the
+    /// thumbnail cache down to what the catalogue still holds
+    /// ([`thumbs::reconcile`] — a sweep, not a removal list, because the
+    /// backfill may be generating on a blocking pool right now), and
     /// persist the catalogue. Returns the live wallpaper source that was
     /// read (`None` for every non-file state).
     ///
@@ -304,22 +314,66 @@ impl Window {
     /// entirely — protecting only the possibly stale `self.current` could
     /// delete a Bing image some output actually displays.
     fn prune_and_persist(&mut self) -> Option<PathBuf> {
-        let live = wallpaper::current_wallpaper();
-        self.current = wallpaper::synced_current(&live, self.current.take());
-        let removed = self.catalogue.prune(
+        self.prune_over(
+            wallpaper::current_wallpaper(),
             &wallpaper::download_dir(),
+            state_dir(),
+            &catalogue_path(),
+        )
+    }
+
+    /// [`Window::prune_and_persist`] against an already-read cosmic-bg state
+    /// and explicit roots (injected so tests never touch the real folder,
+    /// state dir or catalogue — same idiom as
+    /// [`Window::start_refresh_over`]).
+    fn prune_over(
+        &mut self,
+        live: wallpaper::CurrentWallpaper,
+        download_dir: &Path,
+        state_dir: &Path,
+        catalogue_path: &Path,
+    ) -> Option<PathBuf> {
+        self.current = wallpaper::synced_current(&live, self.current.take());
+        self.catalogue.prune(
+            download_dir,
             wallpaper::prune_retention(&live, self.config.retention_days),
             self.current.as_deref(),
             Utc::now(),
         );
-        thumbs::remove_thumbnails(&removed, state_dir());
-        if let Err(error) = self.catalogue.save(&catalogue_path()) {
+        self.sweep_thumbnails(state_dir);
+        if let Err(error) = self.catalogue.save(catalogue_path) {
             // Non-fatal: the catalogue is rebuildable from the folder scan.
             tracing::warn!("failed to persist catalogue after prune: {error}");
         }
-        match live {
-            wallpaper::CurrentWallpaper::File(path) => Some(path),
-            _ => None,
+        live.into_file()
+    }
+
+    /// Whether the thumbnail cache may be swept right now.
+    ///
+    /// [`thumbs::reconcile`] deletes every cache file the *live* catalogue
+    /// does not name, and a thumbnail pass writes files before the UI thread
+    /// knows about them: the fetch pipeline's downloads only join the
+    /// catalogue when `RefreshFinished` merges them, and the startup pass
+    /// runs on a blocking pool while the UI thread may prune. A sweep landing
+    /// inside either window deletes what that pass just produced, and nothing
+    /// regenerates it until the next successful refresh — up to ~24 h of the
+    /// placeholder on the image that was just applied. Skipping costs
+    /// nothing: every pass ends in a sweep of its own
+    /// ([`Window::finish_refresh`], [`Window::finish_thumbnail_pass`]), and
+    /// startup sweeps unconditionally whatever was missed.
+    fn may_sweep_thumbnails(&self) -> bool {
+        !self.refresh_pending && !self.thumbnail_pass_pending
+    }
+
+    /// Sweep the thumbnail cache down to what the catalogue still holds,
+    /// unless a pass is writing into it right now
+    /// ([`Window::may_sweep_thumbnails`]).
+    fn sweep_thumbnails(&self, state_dir: &Path) {
+        if self.may_sweep_thumbnails() {
+            thumbs::reconcile(
+                self.catalogue.images.iter().map(|e| e.filename.as_path()),
+                state_dir,
+            );
         }
     }
 
@@ -330,12 +384,86 @@ impl Window {
         if self.refresh_pending {
             return Task::none();
         }
+        // The backfill skips what the prune after this refresh will delete,
+        // so it must see the same live cosmic-bg state that prune reads —
+        // `prune_retention` turns age deletion *off* whenever the displayed
+        // file is unknowable (per-output mode is a permanent such state, not
+        // a transient one), and a backfill still honouring the configured
+        // cutoff there would leave every older entry on the placeholder for
+        // good while the catalogue grows without bound.
+        self.start_refresh_over(wallpaper::current_wallpaper())
+    }
+
+    /// [`Window::start_refresh`] against an already-read cosmic-bg state
+    /// (injected so tests can stage a wallpaper the applet has not seen
+    /// itself apply). The caller has established that no fetch is in flight.
+    fn start_refresh_over(&mut self, live: wallpaper::CurrentWallpaper) -> app::Task<Message> {
         self.refresh_pending = true;
         let catalogue = self.catalogue.clone();
         let retention_days = self.config.retention_days;
+        // The applied file is passed along so the backfill protects its
+        // thumbnail exactly as the prune protects its file — which means it
+        // must be the file the *prune* will protect. `self.current` only
+        // records what the applet itself applied, so it goes stale the
+        // moment the user picks a wallpaper in Settings; the prune reads the
+        // live state (see `prune_and_persist`), and reading it here without
+        // doing the same would skip the thumbnail of the one image the prune
+        // keeps no matter its age.
+        let current = wallpaper::synced_current(&live, self.current.take());
+        self.current = current.clone();
         cosmic::task::future(async move {
-            Message::RefreshFinished(run_refresh(catalogue, retention_days).await)
+            Message::RefreshFinished(run_refresh(catalogue, retention_days, &live, current).await)
         })
+    }
+
+    /// Kick off the startup thumbnail pass against an already-read cosmic-bg
+    /// state: generate the previews the restored catalogue is still missing,
+    /// with no network involved.
+    ///
+    /// The popup renders previews from the cache only, and until this pass
+    /// existed the cache was filled *exclusively* by the fetch pipeline. A
+    /// non-empty catalogue at startup (a folder migrated from the reference
+    /// GNOME extension, a warm start whose cache was swept, a state dir
+    /// cleared by hand) is not a cold start, so the first refresh is due off
+    /// the newest `fullstartdate` — up to ~24 h away, and never at all on a
+    /// machine that is offline. Every entry would show the placeholder until
+    /// then. The files are all on disk already; nothing about generating
+    /// their thumbnails needs Bing.
+    ///
+    /// Same policy object as the pipeline's own backfill ([`Backfill::new`]),
+    /// so the two cannot disagree about what is worth decoding.
+    fn start_thumbnail_pass_over(
+        &mut self,
+        live: wallpaper::CurrentWallpaper,
+    ) -> app::Task<Message> {
+        self.thumbnail_pass_pending = true;
+        let catalogue = self.catalogue.clone();
+        let retention_days = self.config.retention_days;
+        // As in `start_refresh_over`: the protected file must be the one the
+        // *prune* protects, i.e. the live state, not our own last apply.
+        let current = wallpaper::synced_current(&live, self.current.take());
+        self.current = current.clone();
+        let download_dir = wallpaper::download_dir();
+        cosmic::task::future(async move {
+            run_thumbnail_pass(
+                catalogue,
+                retention_days,
+                &live,
+                current,
+                &download_dir,
+                state_dir(),
+            )
+            .await;
+            Message::ThumbnailsReady
+        })
+    }
+
+    /// The startup thumbnail pass finished: nothing writes into the cache
+    /// any more, so collect whatever a prune skipped while it ran (see
+    /// [`Window::may_sweep_thumbnails`]).
+    fn finish_thumbnail_pass(&mut self, state_dir: &Path) {
+        self.thumbnail_pass_pending = false;
+        self.sweep_thumbnails(state_dir);
     }
 
     /// React to the fetch pipeline finishing: merge the fetched entries
@@ -367,19 +495,24 @@ impl Window {
         self.last_updated = Some(Utc::now());
         self.last_error = None;
 
+        // Bound once: the newest entry answers all three questions below —
+        // whether the fetch delivered anything at all, when the next refresh
+        // is due, and what to auto-apply. Cloned because the apply arm
+        // mutates `self`.
+        let newest = self.catalogue.newest().cloned();
         let plan = refresh_success_plan(
             self.cold_start.applies_over(live.as_deref()),
             live.as_deref(),
-            self.catalogue.newest().map(|e| e.fullstartdate.as_str()),
+            newest.as_ref().map(|e| e.fullstartdate.as_str()),
             Utc::now(),
         );
         let mut apply_failed = false;
         if plan.auto_apply
-            && let Some(newest) = self.catalogue.newest()
+            && let Some(newest) = &newest
         {
             let path = newest.filename.clone();
             match wallpaper::apply(&path) {
-                Ok(()) => on_apply_success(&mut self.current, &mut self.cold_start, path),
+                Ok(()) => self.on_apply_success(path),
                 Err(error) => {
                     tracing::warn!("failed to apply wallpaper: {error}");
                     apply_failed = true;
@@ -404,7 +537,9 @@ impl Window {
         // *suppressed* because the user picked another wallpaper lands
         // here with `auto_apply` false and spends the flag: the user's
         // choice wins permanently, the warm rule governs from then on.
-        if plan.clear_cold_start && !apply_failed {
+        // A "success" that somehow delivered no images keeps the flag armed
+        // for the fetch that finally does.
+        if newest.is_some() && !apply_failed {
             self.cold_start = ColdStart::Done;
         }
 
@@ -414,20 +549,20 @@ impl Window {
         let shuffle = self.sync_shuffle(false);
         Task::batch([refresh_timer, shuffle])
     }
-}
 
-/// Shared state transition for every path that successfully applied a
-/// wallpaper (post-fetch auto-apply, manual navigation, shuffle tick):
-/// remember the file as current and spend the cold-start state. Its only
-/// purpose is guaranteeing that a fresh install ends up with *some*
-/// wallpaper applied once; any successful apply through the applet
-/// fulfills that. Leaving it armed after e.g. a failed cold-start
-/// auto-apply followed by a successful manual apply would let a later
-/// refresh's cold-start branch ([`wallpaper::should_auto_apply`]) clobber
-/// a wallpaper the user picked in COSMIC Settings in the meantime.
-fn on_apply_success(current: &mut Option<PathBuf>, cold_start: &mut ColdStart, path: PathBuf) {
-    *current = Some(path);
-    *cold_start = ColdStart::Done;
+    /// Shared state transition for every path that successfully applied a
+    /// wallpaper (post-fetch auto-apply, manual navigation, shuffle tick):
+    /// remember the file as current and spend the cold-start state. Its only
+    /// purpose is guaranteeing that a fresh install ends up with *some*
+    /// wallpaper applied once; any successful apply through the applet
+    /// fulfills that. Leaving it armed after e.g. a failed cold-start
+    /// auto-apply followed by a successful manual apply would let a later
+    /// refresh's cold-start branch ([`wallpaper::should_auto_apply`]) clobber
+    /// a wallpaper the user picked in COSMIC Settings in the meantime.
+    fn on_apply_success(&mut self, path: PathBuf) {
+        self.current = Some(path);
+        self.cold_start = ColdStart::Done;
+    }
 }
 
 /// Restore the catalogue at startup and drop entries whose file vanished
@@ -437,8 +572,14 @@ fn on_apply_success(current: &mut Option<PathBuf>, cold_start: &mut ColdStart, p
 /// and the popup/actions would trust dead paths until a much later
 /// refresh. Pruning with retention `0` deletes nothing: it only drops
 /// vanished entries — and scrubs tampered entries pointing outside
-/// `images_dir` (their files stay untouched) — reporting them so their
-/// thumbnails go too.
+/// `images_dir` (their files stay untouched).
+///
+/// The thumbnail cache is then swept against the surviving entries
+/// ([`thumbs::reconcile`]) — unconditionally, because the leftovers this
+/// collects are exactly the ones no removal list can name: artefacts a
+/// killed process or a prune-racing backfill wrote for entries the
+/// catalogue no longer holds, and everything a rebuild from the folder
+/// scan silently dropped.
 fn restore_catalogue(path: &Path, images_dir: &Path, state_dir: &Path) -> Catalogue {
     let mut catalogue = Catalogue::load_or_rebuild(path, images_dir);
     let removed = catalogue.prune(images_dir, 0, None, Utc::now());
@@ -448,13 +589,27 @@ fn restore_catalogue(path: &Path, images_dir: &Path, state_dir: &Path) -> Catalo
             removed.len(),
             if removed.len() == 1 { "y" } else { "ies" }
         );
-        thumbs::remove_thumbnails(&removed, state_dir);
         if let Err(error) = catalogue.save(path) {
             // Non-fatal: the catalogue is rebuildable from the folder scan.
             tracing::warn!("failed to persist catalogue after startup sweep: {error}");
         }
     }
+    thumbs::reconcile(
+        catalogue.images.iter().map(|e| e.filename.as_path()),
+        state_dir,
+    );
     catalogue
+}
+
+/// `link` if it is an ordinary web URL, otherwise `None`.
+///
+/// The "About this image" link comes from Bing's JSON and survives in the
+/// user-editable `catalogue.json`, and it is handed to `xdg-open` — which
+/// takes flags (a value starting with `-`) and happily launches the default
+/// handler for a `file:` URL or a bare local path. Only `http(s)://` reaches
+/// the browser.
+fn web_url(link: &str) -> Option<&str> {
+    (link.starts_with("https://") || link.starts_with("http://")).then_some(link)
 }
 
 /// Open `target` with the default handler (`xdg-open`), detached; a
@@ -481,6 +636,8 @@ fn open_detached(target: OsString) {
 async fn run_refresh(
     catalogue: Catalogue,
     retention_days: u16,
+    live: &wallpaper::CurrentWallpaper,
+    current: Option<PathBuf>,
 ) -> Result<Vec<ImageEntry>, RefreshError> {
     let client = bing::http_client()?;
     fetch_and_download(
@@ -490,15 +647,17 @@ async fn run_refresh(
         schedule::fetch_count(retention_days),
         &wallpaper::download_dir(),
         state_dir(),
+        &Backfill::new(live, retention_days, current.as_deref()),
     )
     .await
     .map_err(RefreshError::from)
 }
 
 /// Fetch the latest `count` images from `base_url` and download the
-/// missing ones into `download_dir` (thumbnails cached under `state_dir`).
-/// All roots and the endpoint are injected so tests can run the whole
-/// pipeline against tempdirs and a loopback mock server.
+/// missing ones into `download_dir` (thumbnails cached under `state_dir`),
+/// then backfill thumbnails for older catalogue entries per `backfill`.
+/// All roots, the endpoint and the backfill policy are injected so tests can
+/// run the whole pipeline against tempdirs and a loopback mock server.
 async fn fetch_and_download(
     client: &reqwest::Client,
     base_url: &str,
@@ -506,6 +665,7 @@ async fn fetch_and_download(
     count: u8,
     download_dir: &Path,
     state_dir: &Path,
+    backfill: &Backfill<'_>,
 ) -> Result<Vec<ImageEntry>, bing::FetchError> {
     // A crash mid-download leaves an orphaned `.part` behind; sweep first.
     bing::sweep_part_files(download_dir);
@@ -517,45 +677,230 @@ async fn fetch_and_download(
         // A rebuilt entry may already hold this image at a different
         // resolution suffix — that file stays authoritative (no
         // re-download); the merge refills its metadata.
-        let path = match catalogue.existing_file(&image.urlbase) {
-            Some(existing) => existing,
-            None => bing::download_image(client, base_url, image, download_dir).await?,
+        //
+        // Unless it never was an image: this lookup skips the download just
+        // as permanently as `bing::download_image`'s own existence check
+        // does, so a catalogued file failing the same magic-byte test the
+        // download applies to a fresh body would otherwise stay the entry's
+        // wallpaper for good. Unlinking it *after* the replacement lands is
+        // what lets the merge heal the entry — an entry's file claim only
+        // counts as dead once the file is gone — while a failed download
+        // leaves the user's folder exactly as it was.
+        let path = match catalogue.existing_file(&image.urlbase, download_dir) {
+            Some(existing) if bing::is_jpeg_file(&existing) => existing,
+            existing => {
+                let fresh = bing::download_image(client, base_url, image, download_dir).await?;
+                if let Some(corrupt) = existing.filter(|path| *path != fresh)
+                    && let Err(error) = std::fs::remove_file(&corrupt)
+                {
+                    tracing::warn!("failed to remove {}: {error}", corrupt.display());
+                }
+                fresh
+            }
         };
-        ensure_thumbnail_logged(&path, state_dir);
+        ensure_thumbnail_logged(&path, state_dir).await;
         fetched.push(ImageEntry::from_bing(image, path));
     }
 
     // Backfill thumbnails for catalogue entries outside this fetch window —
     // rebuilt or older entries would otherwise show the placeholder forever.
     // Files the fetch loop above just handled are skipped.
-    let handled: std::collections::HashSet<&Path> =
-        fetched.iter().map(|e| e.filename.as_path()).collect();
-    for entry in &catalogue.images {
-        if !handled.contains(entry.filename.as_path()) && entry.filename.is_file() {
-            ensure_thumbnail_logged(&entry.filename, state_dir);
-        }
-    }
+    let handled: HashSet<&Path> = fetched.iter().map(|e| e.filename.as_path()).collect();
+    backfill_thumbnails(catalogue, &handled, download_dir, state_dir, backfill).await;
 
     Ok(fetched)
 }
 
-/// A failed thumbnail is not fatal: `ensure_thumbnail` regenerates missing
-/// thumbs on the next refresh.
-fn ensure_thumbnail_logged(path: &Path, state_dir: &Path) {
-    if let Err(error) = thumbs::ensure_thumbnail(path, state_dir) {
-        tracing::warn!(
-            "thumbnail generation failed for {}: {error}",
-            path.display()
-        );
+/// Give catalogue entries that still lack a usable preview one, newest first,
+/// within `backfill`'s budget and policy; `handled` names paths the caller
+/// already thumbnailed itself.
+///
+/// Deliberately free of anything network-shaped: this is the whole of the
+/// applet's thumbnail production, run both as the tail of a refresh
+/// ([`fetch_and_download`]) and on its own at startup
+/// ([`run_thumbnail_pass`]), so previews never depend on Bing being
+/// reachable — only on the image files already sitting in `download_dir`.
+async fn backfill_thumbnails(
+    catalogue: &Catalogue,
+    handled: &HashSet<&Path>,
+    download_dir: &Path,
+    state_dir: &Path,
+    backfill: &Backfill<'_>,
+) {
+    let mut spent = 0;
+    for entry in catalogue.images.iter().rev() {
+        if spent >= backfill.budget {
+            break;
+        }
+        if handled.contains(entry.filename.as_path())
+            || !backfill.should_decode(entry, download_dir, state_dir)
+        {
+            continue;
+        }
+        // Everything past this point is a real decode, so it costs budget
+        // whether or not it succeeds — a *decode* failure is remembered by
+        // [`thumbs::ensure_thumbnail`] and skipped for free from the next
+        // refresh on. That is what keeps the two bounds true at once: work
+        // per refresh is capped, and no entry is ever paid for twice, so the
+        // budget always moves down the catalogue instead of being pinned to
+        // an undecodable newest end.
+        spent += 1;
+        ensure_thumbnail_logged(&entry.filename, state_dir).await;
+    }
+}
+
+/// The startup thumbnail pass, run off the UI thread: [`backfill_thumbnails`]
+/// over the whole restored catalogue, nothing pre-handled and no network at
+/// any point. See [`Window::start_thumbnail_pass_over`] for why it exists.
+/// Roots are injected exactly as the pipeline's are, so tests never touch the
+/// real folder or state dir.
+async fn run_thumbnail_pass(
+    catalogue: Catalogue,
+    retention_days: u16,
+    live: &wallpaper::CurrentWallpaper,
+    current: Option<PathBuf>,
+    download_dir: &Path,
+    state_dir: &Path,
+) {
+    backfill_thumbnails(
+        &catalogue,
+        &HashSet::new(),
+        download_dir,
+        state_dir,
+        &Backfill::new(live, retention_days, current.as_deref()),
+    )
+    .await;
+}
+
+/// Policy for the out-of-window thumbnail backfill in [`fetch_and_download`]:
+/// how much decoding one refresh may do, and which entries are worth it.
+struct Backfill<'a> {
+    /// Decode attempts this refresh may spend (see
+    /// [`MAX_THUMBNAIL_BACKFILL`]).
+    budget: usize,
+    /// The *effective* retention in days the prune after this refresh will
+    /// apply (`0` = keep forever) — [`wallpaper::prune_retention`] of the
+    /// configured value, never the configured value itself.
+    retention_days: u16,
+    /// The currently applied wallpaper, if known — protected from the
+    /// retention skip just as the prune protects it from deletion.
+    current: Option<&'a Path>,
+    /// Reference time for the retention cutoff (injected for tests).
+    now: DateTime<Utc>,
+}
+
+impl<'a> Backfill<'a> {
+    /// The retention is derived here, from the same live cosmic-bg state the
+    /// prune will consult, so the two predicates cannot be handed different
+    /// numbers by a caller.
+    fn new(
+        live: &wallpaper::CurrentWallpaper,
+        configured_days: u16,
+        current: Option<&'a Path>,
+    ) -> Self {
+        Self {
+            budget: MAX_THUMBNAIL_BACKFILL,
+            retention_days: wallpaper::prune_retention(live, configured_days),
+            current,
+            now: Utc::now(),
+        }
+    }
+
+    /// Whether `entry` will still exist after the prune that follows this
+    /// refresh ([`Catalogue::prune`], run by `finish_refresh`) — the same age
+    /// test, protected file included.
+    ///
+    /// The backfill runs *before* that prune, on the pipeline's snapshot, so
+    /// without this check the default 8-day retention would spend the whole
+    /// budget reading ~5 MB apiece for thumbnails the same refresh unlinks
+    /// minutes later — worst on the very first refresh over a folder migrated
+    /// from the GNOME extension, which is exactly the case the budget is
+    /// sized for.
+    ///
+    /// There is no divergence from the prune to reason about: `retention_days`
+    /// *is* what the prune will use ([`Backfill::new`]). In particular a
+    /// per-output cosmic-bg setup — a steady state, not a transient one —
+    /// disables age deletion for both, so nothing is skipped as doomed that
+    /// the refresh then keeps.
+    fn worth_decoding(&self, entry: &ImageEntry) -> bool {
+        entry.within_retention(self.retention_days, self.now)
+            || self.current == Some(entry.filename.as_path())
+    }
+
+    /// Whether `entry` earns a real `image::open` from this refresh's budget:
+    /// it must be a file we own inside `download_dir`, still be there after
+    /// the imminent prune, and have no usable slot in the `state_dir` cache
+    /// yet.
+    ///
+    /// The three free skips come in the order that costs least — what the
+    /// prune is about to delete anyway, what is already cached, and what
+    /// already failed to decode (a `stat` each, and none of them work).
+    /// Weakening any of them re-opens a starvation or unbounded-retry bug.
+    fn should_decode(&self, entry: &ImageEntry, download_dir: &Path, state_dir: &Path) -> bool {
+        // Same containment gate the prune and the download lookup apply: a
+        // hand-edited `catalogue.json` must not make us decode (and cache a
+        // copy of) an arbitrary readable image.
+        if entry.filename.parent() != Some(download_dir)
+            || !entry.names_own_file()
+            || !entry.filename.is_file()
+        {
+            return false;
+        }
+        self.worth_decoding(entry)
+            && !thumbs::is_cached(&entry.filename, state_dir)
+            && !thumbs::decode_failed(&entry.filename, state_dir)
+    }
+}
+
+/// How many out-of-window thumbnails one refresh may decode (see the
+/// backfill loop in [`fetch_and_download`]).
+///
+/// Sized for the migrated-folder case: the decode runs on the blocking pool
+/// (see [`ensure_thumbnail_logged`]) rather than on the applet's single async
+/// worker, so the cap no longer has to keep that thread responsive — it only
+/// bounds the one-time burst so a manual refresh cannot turn into a long CPU
+/// hog. 256 covers roughly eight months of daily images in the *first*
+/// refresh, so the folder the reference GNOME extension leaves behind is done
+/// in one pass (retention "forever"; under a finite retention the pass stops
+/// at the cutoff long before the budget runs out); even a years-deep library
+/// converges in a handful of refreshes instead of the months a single-digit
+/// budget would need against the ~24 h refresh cadence.
+const MAX_THUMBNAIL_BACKFILL: usize = 256;
+
+/// Generate the thumbnail for `path`; a failure is logged, never fatal — a
+/// corrupt file must not abort the refresh.
+///
+/// Whether the failure is *remembered* is decided inside
+/// [`thumbs::ensure_thumbnail`], which alone can tell a source that will not
+/// decode (remember it, or the backfill pays for the same doomed
+/// `image::open` on every later refresh) from a state-dir write failure (say
+/// nothing — an ENOSPC blip must not condemn a decodable wallpaper). All this
+/// end sees is "something went wrong", which is not a verdict about the file.
+///
+/// The decode goes to tokio's blocking pool: libcosmic's
+/// `SingleThreadExecutor` is a *one-worker* runtime shared with reqwest I/O
+/// and both one-shot timers, and a full UHD JPEG is a multi-hundred-
+/// millisecond CPU burst that would otherwise stall all of it.
+async fn ensure_thumbnail_logged(path: &Path, state_dir: &Path) {
+    let (image, state) = (path.to_path_buf(), state_dir.to_path_buf());
+    match tokio::task::spawn_blocking(move || thumbs::ensure_thumbnail(&image, &state)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(
+                "thumbnail generation failed for {}: {error}",
+                path.display()
+            );
+        }
+        Err(error) => {
+            tracing::warn!("thumbnail task for {} failed: {error}", path.display());
+        }
     }
 }
 
 /// Pure decisions after a successful fetch (tested): whether to auto-apply
-/// the newest image, whether the cold-start flag is spent, and when the
-/// next refresh is due.
+/// the newest image, and when the next refresh is due.
 struct RefreshSuccessPlan {
     auto_apply: bool,
-    clear_cold_start: bool,
     delay: Duration,
 }
 
@@ -568,31 +913,12 @@ fn refresh_success_plan(
     let has_images = newest_fullstartdate.is_some();
     RefreshSuccessPlan {
         auto_apply: has_images && wallpaper::should_auto_apply(cold_start_pending, live_current),
-        // The one-shot cold-start auto-apply is spent only once images
-        // actually arrived; a success that somehow yielded none keeps it
-        // armed for the fetch that finally delivers.
-        clear_cold_start: has_images,
         delay: match newest_fullstartdate {
             Some(date) => schedule::next_refresh(Some(date), now),
             // A success that leaves the catalogue empty must not reuse the
             // 5 s cold-start delay — that would tight-loop against Bing.
             None => schedule::ERROR_RETRY_DELAY,
         },
-    }
-}
-
-/// Pure diff of an incoming (externally edited or echoed-back) config
-/// against the current one — which reactions the update handler owes.
-struct ConfigDiff {
-    shuffle_changed: bool,
-    retention_reduced: bool,
-}
-
-fn config_diff(old: &AppletConfig, new: &AppletConfig) -> ConfigDiff {
-    ConfigDiff {
-        shuffle_changed: new.shuffle_enabled != old.shuffle_enabled
-            || new.shuffle_interval_secs != old.shuffle_interval_secs,
-        retention_reduced: schedule::retention_reduced(old.retention_days, new.retention_days),
     }
 }
 
@@ -631,7 +957,10 @@ impl cosmic::Application for Window {
         // hollow catalogue still counts as a cold start.
         let catalogue =
             restore_catalogue(&catalogue_path(), &wallpaper::download_dir(), state_dir());
-        let current = wallpaper::current_source();
+        // Read once and handed to the thumbnail pass below: it must protect
+        // the applied file's preview exactly as the prune protects its file.
+        let live = wallpaper::current_wallpaper();
+        let current = live.clone().into_file();
         let cold_start = if catalogue.images.is_empty() {
             ColdStart::Pending
         } else {
@@ -653,6 +982,7 @@ impl cosmic::Application for Window {
             catalogue,
             current,
             refresh_pending: false,
+            thumbnail_pass_pending: false,
             cold_start,
             timer_generation: 0,
             shuffle_generation: 0,
@@ -663,7 +993,11 @@ impl cosmic::Application for Window {
         let timer = window.schedule_refresh(delay);
         // Shuffle restored as enabled starts a fresh full-interval cycle.
         let shuffle = window.sync_shuffle(false);
-        (window, Task::batch([timer, shuffle]))
+        // Previews come from the cache, so the cache is filled *now*, from
+        // the files already on disk — not by a refresh that may be ~24 h out
+        // (or never, offline).
+        let thumbnails = window.start_thumbnail_pass_over(live);
+        (window, Task::batch([timer, shuffle, thumbnails]))
     }
 
     fn on_close_requested(&self, id: window::Id) -> Option<Message> {
@@ -709,13 +1043,16 @@ impl cosmic::Application for Window {
                 // so a hand-edited retention outside the dropdown's
                 // choices never drives prune/fetch.
                 let config = config.normalize();
-                let diff = config_diff(&self.config, &config);
+                let shuffle_changed = config.shuffle_enabled != self.config.shuffle_enabled
+                    || config.shuffle_interval_secs != self.config.shuffle_interval_secs;
+                let retention_reduced =
+                    schedule::retention_reduced(self.config.retention_days, config.retention_days);
                 self.config = config;
                 let mut tasks = Vec::new();
-                if diff.retention_reduced {
+                if retention_reduced {
                     tasks.push(self.prune_immediately());
                 }
-                if diff.shuffle_changed {
+                if shuffle_changed {
                     tasks.push(self.sync_shuffle(true));
                 }
                 if !tasks.is_empty() {
@@ -736,7 +1073,7 @@ impl cosmic::Application for Window {
                 // fulfills its purpose; see `on_apply_success`).
                 match wallpaper::apply(&path) {
                     Ok(()) => {
-                        on_apply_success(&mut self.current, &mut self.cold_start, path);
+                        self.on_apply_success(path);
                         return self.sync_shuffle(true);
                     }
                     Err(error) => {
@@ -752,8 +1089,20 @@ impl cosmic::Application for Window {
                     }
                 }
             }
-            Message::OpenUrl(url) => open_detached(url.into()),
-            Message::OpenFile(path) => open_detached(path.into_os_string()),
+            Message::OpenUrl(url) => match web_url(&url) {
+                Some(url) => open_detached(url.into()),
+                None => tracing::warn!("refusing to open non-web link {url:?}"),
+            },
+            // Same reasoning as `web_url`: the path comes from the
+            // user-editable catalogue and `xdg-open` reads a leading `-` as a
+            // flag. Every path the applet stores is absolute, which rejects
+            // both that and a relative path resolved against the process CWD.
+            Message::OpenFile(path) if path.is_absolute() => {
+                open_detached(path.into_os_string());
+            }
+            Message::OpenFile(path) => {
+                tracing::warn!("refusing to open non-absolute path {}", path.display());
+            }
             Message::ShuffleDue(generation) => {
                 // Stale ticks (replaced by a newer re-arm) are ignored.
                 if generation != self.shuffle_generation {
@@ -766,7 +1115,7 @@ impl cosmic::Application for Window {
                 if let Some(pick) = self.catalogue.random_other(self.current.as_deref()) {
                     let path = pick.filename.clone();
                     match wallpaper::apply(&path) {
-                        Ok(()) => on_apply_success(&mut self.current, &mut self.cold_start, path),
+                        Ok(()) => self.on_apply_success(path),
                         Err(error) => {
                             tracing::warn!("shuffle failed to apply {}: {error}", path.display());
                             // A vanished file gets dropped from the
@@ -816,6 +1165,9 @@ impl cosmic::Application for Window {
                 return cosmic::surface::surface_task(action);
             }
             Message::RefreshFinished(result) => return self.finish_refresh(result),
+            // Returning to the message loop re-renders the popup, so a
+            // preview generated while it was open shows up by itself.
+            Message::ThumbnailsReady => self.finish_thumbnail_pass(state_dir()),
         }
         Task::none()
     }
@@ -841,7 +1193,7 @@ impl cosmic::Application for Window {
             .applet
             .applet_tooltip::<Message>(
                 button,
-                panel_tooltip(),
+                fl!("panel-tooltip"),
                 self.popup.is_some(),
                 Message::Surface,
                 None,
@@ -882,15 +1234,13 @@ mod tests {
     fn panel_tooltip_names_the_applet() {
         // Guards the English copy of the one string the panel shows on
         // hover (the test loader is pinned to `en` — see `localize.rs`).
-        assert_eq!(panel_tooltip(), "Bing Wallpaper of the Day");
+        assert_eq!(fl!("panel-tooltip"), "Bing Wallpaper of the Day");
     }
 
     #[test]
     fn state_paths_live_under_the_app_id() {
-        if dirs::home_dir().is_none() {
-            eprintln!("skipping: no home dir in this environment");
-            return;
-        }
+        // No self-skip: `state_dir` falls back to the temp dir when there is
+        // no home, so it is absolute in every environment.
         let state = state_dir();
         assert!(state.ends_with(APP_ID));
         assert!(state.is_absolute());
@@ -906,36 +1256,6 @@ mod tests {
     }
 
     #[test]
-    fn config_diff_detects_shuffle_and_retention_changes() {
-        let base = AppletConfig::default();
-
-        // Echoed-back identical config: nothing owed.
-        let diff = config_diff(&base, &base.clone());
-        assert!(!diff.shuffle_changed);
-        assert!(!diff.retention_reduced);
-
-        // Shuffle toggled.
-        let mut toggled = base.clone();
-        toggled.shuffle_enabled = true;
-        assert!(config_diff(&base, &toggled).shuffle_changed);
-
-        // Interval changed.
-        let mut interval = base.clone();
-        interval.shuffle_interval_secs = 1_800;
-        assert!(config_diff(&base, &interval).shuffle_changed);
-
-        // Retention reduced (8 → 3) prunes; loosened (8 → 30) does not.
-        let mut reduced = base.clone();
-        reduced.retention_days = 3;
-        let diff = config_diff(&base, &reduced);
-        assert!(diff.retention_reduced);
-        assert!(!diff.shuffle_changed);
-        let mut loosened = base.clone();
-        loosened.retention_days = 30;
-        assert!(!config_diff(&base, &loosened).retention_reduced);
-    }
-
-    #[test]
     fn refresh_success_plan_with_images_applies_and_reschedules() {
         let now = Utc::now();
         // Cold start: auto-apply regardless of the live wallpaper, spend
@@ -947,13 +1267,12 @@ mod tests {
             now,
         );
         assert!(plan.auto_apply);
-        assert!(plan.clear_cold_start);
         assert_eq!(
             plan.delay,
             schedule::next_refresh(Some("202608070700"), now)
         );
 
-        // Warm, foreign wallpaper: never clobber, but the flag is spent.
+        // Warm, foreign wallpaper: never clobber.
         let plan = refresh_success_plan(
             false,
             Some(std::path::Path::new("/usr/share/backgrounds/x.jpg")),
@@ -961,48 +1280,46 @@ mod tests {
             now,
         );
         assert!(!plan.auto_apply);
-        assert!(plan.clear_cold_start);
     }
 
     #[test]
-    fn refresh_success_plan_without_images_backs_off_and_keeps_cold_start() {
+    fn refresh_success_plan_without_images_backs_off() {
         // A "successful" fetch that still leaves no images: no 5 s
-        // cold-start delay (tight loop against Bing), no auto-apply, and
-        // the cold-start flag stays armed for the fetch that delivers.
+        // cold-start delay (that would tight-loop against Bing) and no
+        // auto-apply. `finish_refresh` also keeps the cold-start flag armed
+        // for the fetch that finally delivers (it only spends the flag on a
+        // successful apply — see `any_successful_apply_spends_the_cold_start_flag`).
         let plan = refresh_success_plan(true, None, None, Utc::now());
         assert!(!plan.auto_apply);
-        assert!(!plan.clear_cold_start);
         assert_eq!(plan.delay, schedule::ERROR_RETRY_DELAY);
     }
 
     #[test]
     fn any_successful_apply_spends_the_cold_start_flag() {
-        // Scenario from review: cold start stays armed after the first
-        // fetch's auto-apply *failed*; the user then navigates (or a
+        // The cold start stays armed after the first fetch's auto-apply
+        // *failed*; the user then navigates (or a
         // shuffle tick fires) and an apply succeeds. That apply fulfills
         // the cold-start purpose — the flag must be spent, or the next
         // refresh's unconditional cold-start branch would clobber a
         // wallpaper the user picked in COSMIC Settings in between.
-        let mut current = None;
-        let mut cold_start = ColdStart::Pending;
+        let mut window = Window {
+            cold_start: ColdStart::Pending,
+            ..Window::default()
+        };
 
-        on_apply_success(
-            &mut current,
-            &mut cold_start,
-            PathBuf::from("/imgs/20260807-Foo_ROW1_UHD.jpg"),
-        );
+        window.on_apply_success(PathBuf::from("/imgs/20260807-Foo_ROW1_UHD.jpg"));
 
         assert_eq!(
-            current.as_deref(),
+            window.current.as_deref(),
             Some(Path::new("/imgs/20260807-Foo_ROW1_UHD.jpg"))
         );
-        assert_eq!(cold_start, ColdStart::Done);
+        assert_eq!(window.cold_start, ColdStart::Done);
 
         // With the flag spent, a later refresh over a foreign (user-picked)
         // wallpaper no longer auto-applies.
         let user_choice = Path::new("/usr/share/backgrounds/user-choice.jpg");
         let plan = refresh_success_plan(
-            cold_start.applies_over(Some(user_choice)),
+            window.cold_start.applies_over(Some(user_choice)),
             Some(user_choice),
             Some("202608070700"),
             Utc::now(),
@@ -1011,9 +1328,35 @@ mod tests {
     }
 
     #[test]
+    fn a_refresh_syncs_the_applied_wallpaper_before_handing_it_to_the_backfill() {
+        // `self.current` only ever records the applet's *own* applies, so it
+        // goes stale the moment the user picks another Bing image in COSMIC
+        // Settings. The prune that follows this refresh reads the live state
+        // and protects that file from age deletion; the backfill is handed
+        // the same file so it protects its thumbnail — from the stale field
+        // it would instead skip the one out-of-window entry guaranteed to
+        // survive, leaving it on the placeholder until some later refresh.
+        let live = PathBuf::from("/imgs/20250101-Picked_ROW0_UHD.jpg");
+        let mut window = Window {
+            current: Some(PathBuf::from("/imgs/20260807-Ours_ROW1_UHD.jpg")),
+            ..Window::default()
+        };
+
+        drop(window.start_refresh_over(wallpaper::CurrentWallpaper::File(live.clone())));
+
+        assert_eq!(window.current.as_deref(), Some(live.as_path()));
+
+        // And the other direction: cosmic-bg displaying no file at all
+        // clears the stale path rather than presenting it as applied.
+        window.refresh_pending = false;
+        drop(window.start_refresh_over(wallpaper::CurrentWallpaper::NoFile));
+        assert_eq!(window.current, None);
+    }
+
+    #[test]
     fn cold_start_retry_never_clobbers_a_wallpaper_picked_after_the_failure() {
-        // Iteration-5 scenario: the cold-start auto-apply failed while the
-        // system default was displayed; before the retry the user picks a
+        // The cold-start auto-apply failed while the system default was
+        // displayed; before the retry the user picks a
         // different (foreign) wallpaper in COSMIC Settings. The retry must
         // not fire — the user's choice wins.
         let default_bg = Path::new("/usr/share/backgrounds/cosmic/default.jpg");
@@ -1022,7 +1365,7 @@ mod tests {
 
         // Display unchanged since the failure: the retry still fires (a
         // fresh install with a transient failure must not end up
-        // wallpaper-less — the iteration-3 retry decision).
+        // wallpaper-less).
         assert!(retry.applies_over(Some(default_bg)));
         // The user picked something else meanwhile: the retry yields.
         assert!(!retry.applies_over(Some(user_choice)));
@@ -1050,7 +1393,6 @@ mod tests {
             Utc::now(),
         );
         assert!(!plan.auto_apply);
-        assert!(plan.clear_cold_start);
     }
 
     /// A catalogue entry whose file really exists under `dir`.
@@ -1083,7 +1425,7 @@ mod tests {
         .save(&cat_path)
         .unwrap();
         // A cached thumbnail for the file about to vanish must go too.
-        let orphan_thumb = thumbs::thumbnail_path(&gone.filename, &state);
+        let orphan_thumb = thumbs::thumbnail_path(&gone.filename, &state).unwrap();
         std::fs::create_dir_all(orphan_thumb.parent().unwrap()).unwrap();
         std::fs::write(&orphan_thumb, b"thumb").unwrap();
         std::fs::remove_file(&gone.filename).unwrap();
@@ -1100,9 +1442,61 @@ mod tests {
     }
 
     #[test]
+    fn restore_catalogue_sweeps_cache_leftovers_no_prune_can_name() {
+        // The prune only ever walks the entries it still holds, so anything
+        // written for a path the catalogue lost — a backfill that finished
+        // after the prune that dropped its entry, or every entry a rebuild
+        // from the folder scan silently forgot — is orphaned for good unless
+        // startup sweeps the directory itself.
+        let dir = tempfile::tempdir().unwrap();
+        let images = dir.path().join("images");
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&images).unwrap();
+        let kept = entry_on_disk(&images, "20260807", "Kept_ROW1");
+        let cat_path = state.join(catalogue::CATALOGUE_FILENAME);
+        Catalogue {
+            images: vec![kept.clone()],
+        }
+        .save(&cat_path)
+        .unwrap();
+
+        let live_thumb = thumbs::thumbnail_path(&kept.filename, &state).unwrap();
+        let thumbs_dir = live_thumb.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&thumbs_dir).unwrap();
+        std::fs::write(&live_thumb, b"thumb").unwrap();
+        std::fs::write(
+            thumbs_dir.join("20260807-Kept_ROW1_UHD.jpg.meta"),
+            b"ok 1 2",
+        )
+        .unwrap();
+        for orphan in [
+            "20250101-Forgotten_ROW9_UHD.jpg",
+            "20250101-Forgotten_ROW9_UHD.jpg.meta",
+            "20260807-Kept_ROW1_UHD.jpg.part",
+        ] {
+            std::fs::write(thumbs_dir.join(orphan), b"leftover").unwrap();
+        }
+
+        let restored = restore_catalogue(&cat_path, &images, &state);
+
+        assert_eq!(restored.images, vec![kept]);
+        let survivors: Vec<_> = std::fs::read_dir(&thumbs_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(
+            survivors.len(),
+            2,
+            "only the live slot and its sidecar survive: {survivors:?}"
+        );
+        assert!(live_thumb.is_file());
+    }
+
+    #[test]
     fn restore_catalogue_of_valid_json_pointing_at_nothing_is_empty() {
-        // The cold-start case codex flagged: valid catalogue JSON, every
-        // file gone. Startup must see an *empty* catalogue (so the cold
+        // The cold-start case of a valid catalogue JSON whose files are
+        // all gone. Startup must see an *empty* catalogue (so the cold
         // start arms and no UI action trusts dead paths).
         let dir = tempfile::tempdir().unwrap();
         let images = dir.path().join("images");
@@ -1120,6 +1514,50 @@ mod tests {
         let restored = restore_catalogue(&cat_path, &images, &state);
 
         assert!(restored.images.is_empty());
+    }
+
+    #[test]
+    fn restore_catalogue_survives_a_download_folder_that_is_not_there() {
+        // The folder can be missing for reasons that have nothing to do with
+        // its contents: an unmounted or slow-mounting drive, a user rename, a
+        // symlink target not yet present. Every entry then looks vanished —
+        // and the startup sweep *persists* what it concludes, so treating
+        // that as evidence destroys the whole history permanently (a
+        // valid-but-empty catalogue loads fine and never rescans).
+        let dir = tempfile::tempdir().unwrap();
+        let images = dir.path().join("images");
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&images).unwrap();
+        let older = entry_on_disk(&images, "20260806", "One_ROW1");
+        let newer = entry_on_disk(&images, "20260807", "Two_ROW2");
+        let cat_path = state.join(catalogue::CATALOGUE_FILENAME);
+        let stored = Catalogue {
+            images: vec![older, newer.clone()],
+        };
+        stored.save(&cat_path).unwrap();
+        let thumb = thumbs::thumbnail_path(&newer.filename, &state).unwrap();
+        std::fs::create_dir_all(thumb.parent().unwrap()).unwrap();
+        std::fs::write(&thumb, b"thumb").unwrap();
+
+        std::fs::rename(&images, dir.path().join("moved")).unwrap();
+        let restored = restore_catalogue(&cat_path, &images, &state);
+
+        assert_eq!(restored, stored, "an absent folder is not a hollow one");
+        assert_eq!(
+            Catalogue::load(&cat_path).unwrap(),
+            stored,
+            "nothing empty may be persisted over the history"
+        );
+        assert!(thumb.is_file(), "and no preview is thrown away either");
+
+        // Recovery for a catalogue an older build already emptied this way:
+        // with the folder back, an empty catalogue rescans it.
+        std::fs::rename(dir.path().join("moved"), &images).unwrap();
+        Catalogue::default().save(&cat_path).unwrap();
+
+        let restored = restore_catalogue(&cat_path, &images, &state);
+
+        assert_eq!(restored.images.len(), 2, "the folder is rescanned");
     }
 
     #[test]
@@ -1185,6 +1623,7 @@ mod tests {
             1,
             &download_dir,
             &state,
+            &test_backfill(),
         )
         .await
         .unwrap();
@@ -1194,7 +1633,7 @@ mod tests {
         assert_eq!(path, &download_dir.join("20260807-Foo_ROW1_UHD.jpg"));
         assert_eq!(std::fs::read(path).unwrap(), expected);
         assert_eq!(fetched[0].title, "Foo place");
-        assert!(thumbs::thumbnail_path(path, &state).is_file());
+        assert!(thumbs::thumbnail_path(path, &state).unwrap().is_file());
         assert!(!stale_part.exists(), "orphaned .part must be swept");
     }
 
@@ -1222,15 +1661,66 @@ mod tests {
         });
 
         let client = bing::http_client().unwrap();
-        let fetched = fetch_and_download(&client, &base, &catalogue, 1, &download_dir, &state)
-            .await
-            .expect("existing file must be reused, not re-downloaded");
+        let fetched = fetch_and_download(
+            &client,
+            &base,
+            &catalogue,
+            1,
+            &download_dir,
+            &state,
+            &test_backfill(),
+        )
+        .await
+        .expect("existing file must be reused, not re-downloaded");
 
         assert_eq!(fetched.len(), 1);
         assert_eq!(fetched[0].filename, existing);
         assert!(!download_dir.join("20260807-Foo_ROW1_UHD.jpg").exists());
         // The thumbnail backfill covered the pre-existing entry too.
-        assert!(thumbs::thumbnail_path(&existing, &state).is_file());
+        assert!(thumbs::thumbnail_path(&existing, &state).unwrap().is_file());
+    }
+
+    #[tokio::test]
+    async fn pipeline_replaces_a_catalogued_file_that_is_not_an_image() {
+        // The lookup above skips the download permanently, so what it hands
+        // back *is* the wallpaper from now on. A folder migrated from the
+        // reference GNOME extension (no magic-byte check on its downloads)
+        // can hold a saved error page under a perfectly valid Bing name:
+        // reusing it would leave the entry pointing at a file that never
+        // renders, with every later refresh skipping the download again.
+        let dir = tempfile::tempdir().unwrap();
+        let download_dir = dir.path().join("images");
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&download_dir).unwrap();
+        let corrupt = download_dir.join("20260807-Foo_ROW1_1920x1080.jpg");
+        std::fs::write(&corrupt, b"<html>login here</html>").unwrap();
+        let catalogue = Catalogue::rebuild_from_folder(&download_dir);
+        assert_eq!(catalogue.images.len(), 1, "the bad file is catalogued");
+
+        let base = spawn_list_and_jpeg_mock();
+        let client = bing::http_client().unwrap();
+        let fetched = fetch_and_download(
+            &client,
+            &base,
+            &catalogue,
+            1,
+            &download_dir,
+            &state,
+            &test_backfill(),
+        )
+        .await
+        .unwrap();
+
+        let fresh = download_dir.join("20260807-Foo_ROW1_UHD.jpg");
+        assert_eq!(fetched[0].filename, fresh);
+        assert!(bing::is_jpeg_file(&fresh));
+        assert!(thumbs::thumbnail_path(&fresh, &state).unwrap().is_file());
+        // …and the merge adopts the replacement, which it only does for an
+        // entry whose file claim is dead — hence the unlink.
+        assert!(!corrupt.exists(), "the dead file must not survive");
+        let mut healed = catalogue.clone();
+        healed.merge(fetched);
+        assert_eq!(healed.images[0].filename, fresh);
     }
 
     #[tokio::test]
@@ -1246,7 +1736,10 @@ mod tests {
         let state = dir.path().join("state");
         std::fs::create_dir_all(&download_dir).unwrap();
         let old = download_dir.join("20250101-Old_ROW0_UHD.jpg");
-        std::fs::write(&old, crate::testutil::tiny_jpeg(64, 36)).unwrap();
+        // Deliberately *not* the bytes the mock serves: if the backfill were
+        // a re-download in disguise, the file's content would change.
+        let old_bytes = crate::testutil::tiny_jpeg(48, 27);
+        std::fs::write(&old, &old_bytes).unwrap();
         // A foreign file in the folder is not catalogued and gets no thumb.
         let foreign = download_dir.join("holiday.jpg");
         std::fs::write(&foreign, crate::testutil::tiny_jpeg(32, 18)).unwrap();
@@ -1265,18 +1758,898 @@ mod tests {
         });
 
         let client = bing::http_client().unwrap();
-        let fetched = fetch_and_download(&client, &base, &catalogue, 1, &download_dir, &state)
-            .await
-            .unwrap();
+        let fetched = fetch_and_download(
+            &client,
+            &base,
+            &catalogue,
+            1,
+            &download_dir,
+            &state,
+            &test_backfill(),
+        )
+        .await
+        .unwrap();
 
         // The fetch window holds only the new image…
         assert_eq!(fetched.len(), 1);
-        assert!(thumbs::thumbnail_path(&fetched[0].filename, &state).is_file());
-        // …yet the older catalogue entry got a thumbnail all the same.
         assert!(
-            thumbs::thumbnail_path(&old, &state).is_file(),
+            thumbs::thumbnail_path(&fetched[0].filename, &state)
+                .unwrap()
+                .is_file()
+        );
+        // …yet the older catalogue entry got a thumbnail all the same —
+        // generated from the file already on disk, not re-fetched.
+        assert!(
+            thumbs::thumbnail_path(&old, &state).unwrap().is_file(),
             "out-of-window entry must be backfilled"
         );
-        assert!(!thumbs::thumbnail_path(&foreign, &state).exists());
+        assert_eq!(
+            std::fs::read(&old).unwrap(),
+            old_bytes,
+            "the backfill must not re-download the image it thumbnails"
+        );
+        assert!(!thumbs::thumbnail_path(&foreign, &state).unwrap().exists());
+    }
+
+    #[tokio::test]
+    async fn thumbnails_are_generated_at_startup_before_any_fetch() {
+        // The first open after `just install` over a folder migrated from the
+        // reference GNOME extension. The catalogue is non-empty, so this is
+        // *not* a cold start: the first refresh is due off the newest
+        // `fullstartdate`, up to ~24 h away — and on an offline machine it
+        // never lands at all. Previews therefore cannot wait for a fetch;
+        // they come from the files already on disk, which is what the startup
+        // pass ([`run_thumbnail_pass`]) runs. No mock server here on purpose:
+        // nothing in this path may touch the network.
+        let dir = tempfile::tempdir().unwrap();
+        let download_dir = dir.path().join("images");
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&download_dir).unwrap();
+        // The reference extension's own resolution suffix, i.e. a file no
+        // fetch of ours ever wrote.
+        let migrated = download_dir.join("20260807-Foo_ROW1_1920x1080.jpg");
+        std::fs::write(&migrated, crate::testutil::tiny_jpeg(64, 36)).unwrap();
+        let older = download_dir.join("20250101-Old_ROW0_UHD.jpg");
+        std::fs::write(&older, crate::testutil::tiny_jpeg(48, 27)).unwrap();
+        // A foreign file in the folder is not catalogued and gets no preview.
+        let foreign = download_dir.join("holiday.jpg");
+        std::fs::write(&foreign, crate::testutil::tiny_jpeg(32, 18)).unwrap();
+        let catalogue = Catalogue::rebuild_from_folder(&download_dir);
+        assert_eq!(catalogue.images.len(), 2, "only wallpapers are tracked");
+
+        // Exactly what `Window::start_thumbnail_pass_over` runs at startup,
+        // with the roots injected: retention "forever", nothing applied.
+        run_thumbnail_pass(
+            catalogue,
+            0,
+            &wallpaper::CurrentWallpaper::NoFile,
+            None,
+            &download_dir,
+            &state,
+        )
+        .await;
+
+        for image in [&migrated, &older] {
+            assert!(
+                thumbs::thumbnail_path(image, &state).unwrap().is_file(),
+                "{} must have a preview before the first fetch",
+                image.display()
+            );
+        }
+        assert!(!thumbs::thumbnail_path(&foreign, &state).unwrap().exists());
+        assert_eq!(thumb_count(&state), 2);
+    }
+
+    /// A catalogue of `count` decodable images inside `download_dir`,
+    /// oldest first (the order `Catalogue` keeps).
+    fn catalogue_of_decodable_images(download_dir: &Path, count: usize) -> Catalogue {
+        let mut catalogue = Catalogue::default();
+        for i in 0..count {
+            let entry = entry_on_disk(download_dir, &format!("2025{:04}", 101 + i), "Old_ROW0");
+            // `entry_on_disk` writes placeholder bytes; a decodable image is
+            // needed for the thumbnail to actually be produced.
+            std::fs::write(&entry.filename, crate::testutil::tiny_jpeg(64, 36)).unwrap();
+            catalogue.images.push(entry);
+        }
+        catalogue
+    }
+
+    /// Mock serving the one-image list plus a decodable JPEG for anything else.
+    fn spawn_list_and_jpeg_mock() -> String {
+        crate::testutil::spawn_mock(move |path| {
+            if path.starts_with("/HPImageArchive.aspx") {
+                (200, LIST_JSON.as_bytes().to_vec())
+            } else {
+                (200, crate::testutil::tiny_jpeg(64, 36))
+            }
+        })
+    }
+
+    /// Cached thumbnails only — the thumbs dir also holds each slot's
+    /// `.meta` sidecar (including those of files that failed to decode).
+    fn thumb_count(state: &Path) -> usize {
+        std::fs::read_dir(state.join("thumbs"))
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                !name.ends_with(".meta") && !name.ends_with(".part")
+            })
+            .count()
+    }
+
+    /// Backfill policy for the pipeline tests, with `budget` decode attempts:
+    /// retention "forever" (nothing is skipped as doomed) and no applied file.
+    /// A lowered budget lets the cap and the progression across refreshes be
+    /// exercised with a handful of files instead of `MAX_THUMBNAIL_BACKFILL`
+    /// of them.
+    fn capped(budget: usize) -> Backfill<'static> {
+        Backfill {
+            budget,
+            retention_days: 0,
+            current: None,
+            now: Utc::now(),
+        }
+    }
+
+    /// [`capped`] at the production budget, which no test staging a handful
+    /// of files can reach — i.e. "backfill everything".
+    fn test_backfill() -> Backfill<'static> {
+        capped(MAX_THUMBNAIL_BACKFILL)
+    }
+
+    #[test]
+    fn backfill_retention_is_the_one_the_prune_will_use() {
+        // The backfill skips what the following prune deletes, so the two
+        // must never be handed different numbers — `Backfill::new` derives
+        // its cutoff from the live cosmic-bg state exactly as the prune does.
+        // A per-output setup (`Unknown`) is the case that used to diverge
+        // *permanently*: the prune keeps everything, so the backfill must
+        // thumbnail everything too.
+        let dir = tempfile::tempdir().unwrap();
+        let old = entry_on_disk(dir.path(), "20200101", "Ancient_ROW0");
+        for (live, wanted) in [
+            (wallpaper::CurrentWallpaper::Unknown, true),
+            (wallpaper::CurrentWallpaper::NoFile, false),
+            (
+                wallpaper::CurrentWallpaper::File(old.filename.clone()),
+                false,
+            ),
+        ] {
+            let backfill = Backfill::new(&live, 8, None);
+            assert_eq!(
+                backfill.retention_days,
+                wallpaper::prune_retention(&live, 8),
+                "{live:?}"
+            );
+            assert_eq!(backfill.worth_decoding(&old), wanted, "{live:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pipeline_backfill_is_capped_and_advances_on_later_refreshes() {
+        // Each backfilled thumbnail fully decodes a UHD JPEG, so the pass is
+        // capped per refresh, newest first — but the cap must buy *progress*:
+        // each refresh has to spend it on entries that still lack a thumbnail,
+        // or a folder migrated from the GNOME extension would never get past
+        // the first batch. The budget is injected here so the test needs a
+        // handful of files rather than `MAX_THUMBNAIL_BACKFILL` of them.
+        const CAP: usize = 4;
+        let dir = tempfile::tempdir().unwrap();
+        let download_dir = dir.path().join("images");
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&download_dir).unwrap();
+
+        let catalogue = catalogue_of_decodable_images(&download_dir, 2 * CAP + 2);
+        let base = spawn_list_and_jpeg_mock();
+        let client = bing::http_client().unwrap();
+
+        fetch_and_download(
+            &client,
+            &base,
+            &catalogue,
+            1,
+            &download_dir,
+            &state,
+            &capped(CAP),
+        )
+        .await
+        .unwrap();
+        // The downloaded image plus exactly the capped number of backfills.
+        assert_eq!(thumb_count(&state), CAP + 1);
+
+        // Second refresh over the same catalogue: the newest entries are
+        // cached now, so the budget reaches the next batch down.
+        fetch_and_download(
+            &client,
+            &base,
+            &catalogue,
+            1,
+            &download_dir,
+            &state,
+            &capped(CAP),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            thumb_count(&state),
+            2 * CAP + 1,
+            "a later refresh must not burn its budget on already-cached entries"
+        );
+
+        // Third: only the two stragglers are left.
+        fetch_and_download(
+            &client,
+            &base,
+            &catalogue,
+            1,
+            &download_dir,
+            &state,
+            &capped(CAP),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            thumb_count(&state),
+            catalogue.images.len() + 1,
+            "every catalogue entry is reached eventually"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_backfill_pays_for_a_failed_decode_once_and_then_moves_on() {
+        // A permanently undecodable file (truncated download, or a non-JPEG
+        // saved under a wallpaper name in a folder migrated from the GNOME
+        // extension, which had no magic-byte check) never becomes `is_cached`.
+        // Both bounds have to hold at once:
+        //   * the attempt costs budget — `image::open` is real work, so a
+        //     catalogue full of corrupt files must not turn one refresh into
+        //     an unbounded scan;
+        //   * it costs it exactly once — the failure is remembered, so the
+        //     next refresh skips it for free and the budget moves down to the
+        //     healthy entries instead of being pinned to the corrupt newest
+        //     end forever.
+        const CAP: usize = 4;
+        let dir = tempfile::tempdir().unwrap();
+        let download_dir = dir.path().join("images");
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&download_dir).unwrap();
+
+        // Oldest first, the order `Catalogue` keeps: one healthy entry, then a
+        // full cap's worth of corrupt ones sitting at the newest end.
+        let mut catalogue = catalogue_of_decodable_images(&download_dir, 1);
+        let healthy = catalogue.images[0].filename.clone();
+        let corrupt: Vec<PathBuf> = (0..CAP)
+            .map(|i| {
+                let entry =
+                    entry_on_disk(&download_dir, &format!("2026{:04}", 101 + i), "Bad_ROW0");
+                std::fs::write(&entry.filename, b"not actually a jpeg").unwrap();
+                let path = entry.filename.clone();
+                catalogue.images.push(entry);
+                path
+            })
+            .collect();
+
+        let base = spawn_list_and_jpeg_mock();
+        let client = bing::http_client().unwrap();
+        fetch_and_download(
+            &client,
+            &base,
+            &catalogue,
+            1,
+            &download_dir,
+            &state,
+            &capped(CAP),
+        )
+        .await
+        .expect("undecodable files must not fail the pipeline");
+
+        // Refresh 1 spent the whole budget on the four doomed decodes…
+        assert_eq!(thumb_count(&state), 1, "only the fetched image thumbnailed");
+        for path in &corrupt {
+            assert!(
+                thumbs::decode_failed(path, &state),
+                "a failed decode must be remembered, not retried forever"
+            );
+        }
+
+        // …and refresh 2 gets them for free, so the healthy entry is reached.
+        fetch_and_download(
+            &client,
+            &base,
+            &catalogue,
+            1,
+            &download_dir,
+            &state,
+            &capped(CAP),
+        )
+        .await
+        .unwrap();
+        assert!(
+            thumbs::thumbnail_path(&healthy, &state).unwrap().is_file(),
+            "a healthy older entry must not be starved by undecodable newer ones"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_backfill_retries_a_repaired_file() {
+        // The negative cache is keyed on the file's identity, so replacing a
+        // corrupt download with a good one must not leave it on the
+        // placeholder until the state dir is cleared by hand.
+        let dir = tempfile::tempdir().unwrap();
+        let download_dir = dir.path().join("images");
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&download_dir).unwrap();
+
+        let mut catalogue = Catalogue::default();
+        let entry = entry_on_disk(&download_dir, "20250101", "Old_ROW0");
+        let path = entry.filename.clone();
+        std::fs::write(&path, b"not actually a jpeg").unwrap();
+        catalogue.images.push(entry);
+
+        let base = spawn_list_and_jpeg_mock();
+        let client = bing::http_client().unwrap();
+        fetch_and_download(
+            &client,
+            &base,
+            &catalogue,
+            1,
+            &download_dir,
+            &state,
+            &test_backfill(),
+        )
+        .await
+        .unwrap();
+        assert!(thumbs::decode_failed(&path, &state));
+
+        std::fs::write(&path, crate::testutil::tiny_jpeg(64, 36)).unwrap();
+        assert!(
+            !thumbs::decode_failed(&path, &state),
+            "a rewritten file invalidates the recorded verdict"
+        );
+        fetch_and_download(
+            &client,
+            &base,
+            &catalogue,
+            1,
+            &download_dir,
+            &state,
+            &test_backfill(),
+        )
+        .await
+        .unwrap();
+        assert!(thumbs::thumbnail_path(&path, &state).unwrap().is_file());
+    }
+
+    #[tokio::test]
+    async fn pipeline_backfill_skips_what_the_prune_is_about_to_delete() {
+        // The backfill runs inside the pipeline, i.e. *before* `finish_refresh`
+        // prunes. Decoding an entry the same refresh then deletes costs ~5 MB
+        // of I/O for a thumbnail unlinked minutes later — at the default 8-day
+        // retention over a migrated folder, that is the whole budget wasted.
+        // The applied wallpaper is exempt, exactly as it is in the prune.
+        let dir = tempfile::tempdir().unwrap();
+        let download_dir = dir.path().join("images");
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&download_dir).unwrap();
+
+        let now = Utc::now();
+        let day = |ago: i64| {
+            (now - chrono::Duration::days(ago))
+                .format("%Y%m%d")
+                .to_string()
+        };
+        let mut catalogue = Catalogue::default();
+        let mut on_disk = |startdate: String, name: &str| {
+            let entry = entry_on_disk(&download_dir, &startdate, name);
+            std::fs::write(&entry.filename, crate::testutil::tiny_jpeg(64, 36)).unwrap();
+            let path = entry.filename.clone();
+            catalogue.images.push(entry);
+            path
+        };
+        let doomed = on_disk(day(40), "Doomed_ROW0");
+        let applied = on_disk(day(30), "Applied_ROW1");
+        let kept = on_disk(day(2), "Kept_ROW2");
+
+        let base = spawn_list_and_jpeg_mock();
+        let client = bing::http_client().unwrap();
+        let backfill = Backfill {
+            budget: MAX_THUMBNAIL_BACKFILL,
+            retention_days: 8,
+            current: Some(&applied),
+            now,
+        };
+        fetch_and_download(
+            &client,
+            &base,
+            &catalogue,
+            1,
+            &download_dir,
+            &state,
+            &backfill,
+        )
+        .await
+        .unwrap();
+
+        assert!(thumbs::thumbnail_path(&kept, &state).unwrap().is_file());
+        assert!(
+            thumbs::thumbnail_path(&applied, &state).unwrap().is_file(),
+            "the applied wallpaper survives the prune, so it needs its preview"
+        );
+        assert!(
+            !thumbs::thumbnail_path(&doomed, &state).unwrap().exists(),
+            "no decode for an entry this very refresh deletes"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_backfill_skips_tampered_entries() {
+        // The same containment gate the prune applies: a hand-edited
+        // `catalogue.json` must not make us decode (and cache a copy of) an
+        // arbitrary readable image. Both halves of the gate get their own
+        // victim, and both sit at the *newest* end so the cap cannot hide
+        // them.
+        let dir = tempfile::tempdir().unwrap();
+        let download_dir = dir.path().join("images");
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&download_dir).unwrap();
+
+        let mut catalogue = catalogue_of_decodable_images(&download_dir, 2);
+        assert!(catalogue.images.len() < MAX_THUMBNAIL_BACKFILL);
+
+        // (a) Outside the download dir — perfectly named for its own urlbase,
+        //     so only the `parent()` check stops it.
+        let outside = dir.path().join("private");
+        std::fs::create_dir_all(&outside).unwrap();
+        // A date no catalogue entry uses, so its cache slot is its own.
+        let outside_victim = outside.join("20240101-Old_ROW0_UHD.jpg");
+        std::fs::write(&outside_victim, crate::testutil::tiny_jpeg(32, 18)).unwrap();
+        let mut hostile = catalogue.images[0].clone();
+        hostile.filename = outside_victim.clone();
+        catalogue.images.push(hostile);
+
+        // (b) Inside the download dir but naming a *different* image's file,
+        //     so only `names_own_file` stops it.
+        let renamed_victim = download_dir.join("20250101-Other_ROW9_UHD.jpg");
+        std::fs::write(&renamed_victim, crate::testutil::tiny_jpeg(32, 18)).unwrap();
+        let mut hostile = catalogue.images[0].clone();
+        hostile.filename = renamed_victim.clone();
+        catalogue.images.push(hostile);
+
+        let base = spawn_list_and_jpeg_mock();
+        let client = bing::http_client().unwrap();
+        fetch_and_download(
+            &client,
+            &base,
+            &catalogue,
+            1,
+            &download_dir,
+            &state,
+            &test_backfill(),
+        )
+        .await
+        .unwrap();
+
+        // The downloaded image plus the two legitimate entries — nothing else.
+        assert_eq!(thumb_count(&state), 3);
+        for victim in [&outside_victim, &renamed_victim] {
+            assert!(
+                !thumbs::thumbnail_path(victim, &state).unwrap().exists(),
+                "a tampered entry must not get {} decoded and cached",
+                victim.display()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pipeline_aborts_on_a_failed_download_but_keeps_what_it_got() {
+        // The documented partial-failure contract: any HTTP failure aborts
+        // the refresh (→ 1 h backoff), and whatever landed before it stays on
+        // disk so the next run skips it instead of re-fetching.
+        const TWO_IMAGES: &str = r#"{"images":[
+            {"urlbase":"/th?id=OHR.Foo_ROW1","startdate":"20260806","fullstartdate":"202608060700","copyright":"Foo (© Bar)","copyrightlink":"https://example.com/foo"},
+            {"urlbase":"/th?id=OHR.Bad_ROW2","startdate":"20260807","fullstartdate":"202608070700","copyright":"Bad (© Bar)","copyrightlink":"https://example.com/bad"}
+        ]}"#;
+        let dir = tempfile::tempdir().unwrap();
+        let download_dir = dir.path().join("images");
+        let state = dir.path().join("state");
+
+        let jpeg = crate::testutil::tiny_jpeg(64, 36);
+        let base = crate::testutil::spawn_mock(move |path| {
+            if path.starts_with("/HPImageArchive.aspx") {
+                (200, TWO_IMAGES.as_bytes().to_vec())
+            } else if path.starts_with("/th?id=OHR.Foo_ROW1") {
+                (200, jpeg.clone())
+            } else {
+                (500, Vec::new())
+            }
+        });
+
+        let client = bing::http_client().unwrap();
+        let error = fetch_and_download(
+            &client,
+            &base,
+            &Catalogue::default(),
+            2,
+            &download_dir,
+            &state,
+            &test_backfill(),
+        )
+        .await
+        .expect_err("a failed download must abort the refresh");
+        assert!(matches!(error, bing::FetchError::Status(s) if s.as_u16() == 500));
+
+        // The image fetched before the failure survives; the failed one left
+        // nothing behind, not even a `.part`.
+        assert!(download_dir.join("20260806-Foo_ROW1_UHD.jpg").is_file());
+        assert!(!download_dir.join("20260807-Bad_ROW2_UHD.jpg").exists());
+        assert!(!download_dir.join("20260807-Bad_ROW2_UHD.jpg.part").exists());
+    }
+
+    #[tokio::test]
+    async fn pipeline_survives_an_undecodable_catalogue_file() {
+        // Thumbnailing is deliberately non-fatal: a corrupt or truncated
+        // file in the folder must not abort the whole refresh (and leave the
+        // user without new wallpapers until it is deleted by hand).
+        let dir = tempfile::tempdir().unwrap();
+        let download_dir = dir.path().join("images");
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&download_dir).unwrap();
+        let corrupt = download_dir.join("20250101-Old_ROW0_UHD.jpg");
+        std::fs::write(&corrupt, b"not actually a jpeg").unwrap();
+        let catalogue = Catalogue::rebuild_from_folder(&download_dir);
+        assert_eq!(catalogue.images.len(), 1);
+
+        let jpeg = crate::testutil::tiny_jpeg(64, 36);
+        let base = crate::testutil::spawn_mock(move |path| {
+            if path.starts_with("/HPImageArchive.aspx") {
+                (200, LIST_JSON.as_bytes().to_vec())
+            } else {
+                (200, jpeg.clone())
+            }
+        });
+
+        let client = bing::http_client().unwrap();
+        let fetched = fetch_and_download(
+            &client,
+            &base,
+            &catalogue,
+            1,
+            &download_dir,
+            &state,
+            &test_backfill(),
+        )
+        .await
+        .expect("an undecodable file must not fail the pipeline");
+
+        assert_eq!(fetched.len(), 1);
+        assert!(
+            thumbs::thumbnail_path(&fetched[0].filename, &state)
+                .unwrap()
+                .is_file()
+        );
+        assert!(!thumbs::thumbnail_path(&corrupt, &state).unwrap().exists());
+    }
+
+    #[test]
+    fn only_web_links_reach_xdg_open() {
+        // The value comes from Bing's JSON and survives in the user-editable
+        // catalogue; `xdg-open` treats a leading `-` as a flag and happily
+        // launches the handler for a local path or `file:` URL.
+        assert_eq!(
+            web_url("https://www.bing.com/x"),
+            Some("https://www.bing.com/x")
+        );
+        assert_eq!(web_url("http://example.com"), Some("http://example.com"));
+        assert_eq!(web_url("file:///etc/passwd"), None);
+        assert_eq!(web_url("/home/u/.ssh/id_ed25519"), None);
+        assert_eq!(web_url("--version"), None);
+        assert_eq!(web_url(""), None);
+    }
+
+    #[test]
+    fn desktop_entry_stays_in_sync_with_the_app_id() {
+        // The desktop entry is hand-maintained and never compiled; these are
+        // the properties `desktop-file-validate` does not check for us.
+        const DESKTOP: &str = include_str!("../data/io.github.ercling.CosmicBingWallpaper.desktop");
+        let mut comment_tags = std::collections::BTreeSet::new();
+        let mut has_icon = false;
+        for line in DESKTOP.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            if key == "Icon" {
+                assert_eq!(value, format!("{APP_ID}-symbolic"));
+                has_icon = true;
+            }
+            let Some(tag) = key
+                .strip_prefix("Comment[")
+                .and_then(|rest| rest.strip_suffix(']'))
+            else {
+                continue;
+            };
+            // Desktop-entry locale tags are POSIX (`pt_BR`, `zh_CN`), not the
+            // BCP-47 spelling the Fluent catalogues use (`pt-BR`).
+            assert!(
+                !tag.contains('-'),
+                "`Comment[{tag}]` is not a POSIX locale tag"
+            );
+            assert!(!value.trim().is_empty(), "`Comment[{tag}]` is empty");
+            assert!(comment_tags.insert(tag), "`Comment[{tag}]` is duplicated");
+        }
+        assert!(has_icon, "the desktop entry must name an icon");
+        assert!(!comment_tags.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // `Window::update` — the message loop's state transitions. Only the
+    // branches that touch neither cosmic-bg's real config nor the real
+    // state dir are exercised here (`wallpaper::apply` and the post-fetch
+    // prune both write the *user's* files — see the note on
+    // `wallpaper::apply`).
+    // -----------------------------------------------------------------
+
+    /// A catalogue entry that needs no file on disk (shuffle arming only
+    /// counts entries).
+    fn entry_in_memory(startdate: &str, name: &str) -> ImageEntry {
+        ImageEntry {
+            urlbase: format!("/th?id=OHR.{name}"),
+            startdate: startdate.to_owned(),
+            fullstartdate: format!("{startdate}0700"),
+            title: format!("Title {name}"),
+            copyright: "© Someone".to_owned(),
+            copyrightlink: "https://example.com".to_owned(),
+            filename: PathBuf::from(format!("/imgs/{startdate}-{name}_UHD.jpg")),
+        }
+    }
+
+    fn window_with_images(count: usize) -> Window {
+        let mut window = Window::default();
+        for i in 0..count {
+            window.catalogue.images.push(entry_in_memory(
+                &format!("2026080{i}"),
+                &format!("N{i}_ROW1"),
+            ));
+        }
+        window
+    }
+
+    #[test]
+    fn stale_refresh_ticks_are_ignored() {
+        use cosmic::Application as _;
+
+        let mut window = Window::default();
+        // Arm once: the pending timer now carries generation 1.
+        drop(window.schedule_refresh(Duration::from_secs(3600)));
+        let armed = window.timer_generation;
+
+        // A tick from a timer that a reschedule already replaced must not
+        // start a fetch — otherwise every reschedule leaks a duplicate.
+        drop(window.update(Message::RefreshDue(armed - 1)));
+        assert!(!window.refresh_pending);
+
+        drop(window.update(Message::RefreshDue(armed)));
+        assert!(window.refresh_pending);
+
+        // And a second trigger while one is in flight is debounced.
+        window.timer_generation = armed;
+        drop(window.update(Message::RefreshNow));
+        assert!(window.refresh_pending);
+    }
+
+    #[test]
+    fn stale_shuffle_ticks_are_ignored() {
+        use cosmic::Application as _;
+
+        let mut window = window_with_images(2);
+        window.config.shuffle_enabled = true;
+        drop(window.arm_shuffle());
+        let armed = window.shuffle_generation;
+        assert!(window.shuffle_armed);
+
+        // A tick from a re-armed-over timer leaves the pending one alone;
+        // consuming it would let a manual navigation's countdown reset be
+        // undone by the timer it replaced.
+        drop(window.update(Message::ShuffleDue(armed - 1)));
+        assert!(window.shuffle_armed);
+        assert_eq!(window.shuffle_generation, armed);
+    }
+
+    #[test]
+    fn shuffle_runs_only_while_enabled_and_with_two_images() {
+        use cosmic::Application as _;
+
+        // Enabled but nothing to rotate through: nothing armed.
+        let mut window = Window::default();
+        drop(window.update(Message::SetShuffleEnabled(true)));
+        assert!(window.config.shuffle_enabled, "the setting is adopted");
+        assert!(!window.shuffle_armed);
+
+        // Two images: the countdown starts.
+        let mut window = window_with_images(2);
+        drop(window.update(Message::SetShuffleEnabled(true)));
+        assert!(window.shuffle_armed);
+
+        // Picking an interval restarts it at the new length.
+        let generation = window.shuffle_generation;
+        drop(window.update(Message::SetShuffleInterval(0)));
+        assert_eq!(window.config.shuffle_interval_secs, 1_800);
+        assert!(window.shuffle_armed);
+        assert!(window.shuffle_generation > generation);
+
+        // Switching off disarms (and invalidates the pending tick).
+        let generation = window.shuffle_generation;
+        drop(window.update(Message::SetShuffleEnabled(false)));
+        assert!(!window.shuffle_armed);
+        assert!(window.shuffle_generation > generation);
+    }
+
+    #[test]
+    fn config_updates_normalize_and_restart_the_shuffle_countdown() {
+        use cosmic::Application as _;
+
+        let mut window = window_with_images(2);
+        window.config.shuffle_enabled = true;
+        drop(window.arm_shuffle());
+        let generation = window.shuffle_generation;
+
+        // An external edit arrives raw: an unsupported retention must be
+        // snapped before it can drive prune/fetch, and a changed interval
+        // restarts the countdown at the new length.
+        let external = AppletConfig {
+            shuffle_enabled: true,
+            shuffle_interval_secs: 3_600,
+            retention_days: 1,
+        };
+        drop(window.update(Message::ConfigUpdated(external)));
+
+        assert_eq!(
+            window.config.retention_days,
+            AppletConfig::default().retention_days,
+            "a hand-edited retention must normalize before it is adopted"
+        );
+        assert_eq!(window.config.shuffle_interval_secs, 3_600);
+        assert!(window.shuffle_generation > generation);
+
+        // The same config echoed back (our own write) changes nothing.
+        let generation = window.shuffle_generation;
+        let echoed = window.config.clone();
+        drop(window.update(Message::ConfigUpdated(echoed)));
+        assert_eq!(window.shuffle_generation, generation);
+    }
+
+    #[test]
+    fn a_failed_refresh_records_the_error_and_backs_off() {
+        use cosmic::Application as _;
+
+        let mut window = Window::default();
+        drop(window.update(Message::RefreshNow));
+        assert!(window.refresh_pending);
+        let generation = window.timer_generation;
+
+        drop(
+            window.update(Message::RefreshFinished(Err(RefreshError::Network(
+                "boom".to_owned(),
+            )))),
+        );
+
+        assert!(!window.refresh_pending, "the pipeline is no longer running");
+        assert!(matches!(window.last_error, Some(RefreshError::Network(_))));
+        assert!(window.last_updated.is_none(), "no successful fetch yet");
+        assert!(
+            window.timer_generation > generation,
+            "the retry timer replaces the pending one"
+        );
+    }
+
+    #[test]
+    fn a_prune_landing_mid_pass_keeps_what_that_pass_is_writing() {
+        // `SetRetention`, an external retention edit and a failed apply all
+        // prune on the UI thread — which sweeps the thumbnail cache down to
+        // the *live* catalogue. A pass writing into that cache is always
+        // ahead of the catalogue: the pipeline's downloads join it only when
+        // `RefreshFinished` merges them, and the startup pass runs on a
+        // blocking pool. Sweeping inside either window deletes the preview of
+        // the image that is about to be applied, and nothing regenerates it
+        // until the next successful refresh.
+        let dir = tempfile::tempdir().unwrap();
+        let images = dir.path().join("images");
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&images).unwrap();
+        let kept = entry_on_disk(&images, "20260807", "Kept_ROW1");
+        let cat_path = state.join(catalogue::CATALOGUE_FILENAME);
+
+        let mut window = Window::default();
+        // Retention "forever": this is about the sweep, not about age.
+        window.config.retention_days = 0;
+        window.catalogue.images.push(kept);
+
+        let in_flight = images.join("20260808-Fresh_ROW2_UHD.jpg");
+        let fresh_thumb = thumbs::thumbnail_path(&in_flight, &state).unwrap();
+        std::fs::create_dir_all(fresh_thumb.parent().unwrap()).unwrap();
+        std::fs::write(&fresh_thumb, b"thumb").unwrap();
+
+        let prune = |window: &mut Window| {
+            drop(window.prune_over(
+                wallpaper::CurrentWallpaper::NoFile,
+                &images,
+                &state,
+                &cat_path,
+            ));
+        };
+
+        window.refresh_pending = true;
+        prune(&mut window);
+        assert!(
+            fresh_thumb.is_file(),
+            "a fetch's fresh thumbnail must survive a concurrent prune"
+        );
+
+        window.refresh_pending = false;
+        window.thumbnail_pass_pending = true;
+        prune(&mut window);
+        assert!(
+            fresh_thumb.is_file(),
+            "so must the startup pass's — same race, other producer"
+        );
+
+        // With nothing in flight the sweep works exactly as before: an
+        // artefact no live entry names is collected.
+        window.thumbnail_pass_pending = false;
+        prune(&mut window);
+        assert!(!fresh_thumb.exists(), "the orphan is still collected");
+    }
+
+    #[test]
+    fn the_startup_thumbnail_pass_defers_the_sweep_until_it_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+
+        let mut window = Window::default();
+        assert!(window.may_sweep_thumbnails(), "nothing in flight at rest");
+
+        drop(window.start_thumbnail_pass_over(wallpaper::CurrentWallpaper::NoFile));
+        assert!(window.thumbnail_pass_pending);
+        assert!(!window.may_sweep_thumbnails());
+
+        // Whatever a prune skipped meanwhile is collected when the pass ends,
+        // so deferring never leaks an orphan.
+        let orphan = state.join("thumbs").join("20250101-Gone_ROW9_UHD.jpg");
+        std::fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+        std::fs::write(&orphan, b"thumb").unwrap();
+
+        window.finish_thumbnail_pass(&state);
+
+        assert!(window.may_sweep_thumbnails());
+        assert!(!orphan.exists(), "the deferred sweep runs at the end");
+    }
+
+    #[test]
+    fn popup_closed_only_clears_the_matching_surface() {
+        use cosmic::Application as _;
+
+        let mut window = Window::default();
+        let ours = window::Id::unique();
+        window.popup = Some(ours);
+
+        drop(window.update(Message::PopupClosed(window::Id::unique())));
+        assert_eq!(window.popup, Some(ours), "another surface is not ours");
+
+        drop(window.update(Message::PopupClosed(ours)));
+        assert_eq!(window.popup, None);
+    }
+
+    #[test]
+    fn set_config_adopts_only_real_changes() {
+        let mut window = Window::default();
+        let same = window.config.clone();
+        window.set_config(same.clone());
+        assert_eq!(window.config, same);
+
+        let mut changed = same.clone();
+        changed.shuffle_interval_secs = 1_800;
+        window.set_config(changed.clone());
+        assert_eq!(window.config, changed);
     }
 }

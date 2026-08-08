@@ -100,9 +100,12 @@ Bing's UHD images are roughly **5 MB each**. Expect about:
   is off at refresh time catches up at next login (same trade-off as the GNOME
   extension). Timers also don't advance during suspend, so a refresh that came
   due while the machine slept fires late after resume rather than immediately.
-- **The login screen keeps its own background.** The *lock* screen follows along
-  (it runs as you, watches cosmic-bg's state file, and picks up an applet-applied
-  wallpaper within milliseconds — verified live). The *login* greeter runs as the
+- **The login screen keeps its own background.** The *lock* screen follows along:
+  it runs as you and watches cosmic-bg's state file. Every link of that chain was
+  verified live — the applet's config write, cosmic-bg's inotify watch on it, the
+  state file rewritten 42 ms later with the applied path, and cosmic-greeter's own
+  watch on that state file — though the lock screen itself was not photographed.
+  The *login* greeter runs as the
   unprivileged `cosmic-greeter` user, which cannot traverse a standard
   `drwxr-x---` home directory to read `~/Pictures/BingWallpaper/*.jpg`, so it
   falls back to its own default. Nothing the applet can fix — it is the same gap
@@ -127,6 +130,14 @@ green: keep every message id from `i18n/en/…`, and keep each message's `{ $tim
 / `{ $date }` placeables (reordering them within the sentence is fine and
 expected). Dates themselves are formatted as English month abbreviations
 ("Aug 5") in every locale — only the sentence frame around them is translated.
+
+The language is taken from the desktop's `LANG`/`LC_MESSAGES` once at startup;
+there is no in-app language setting. **To get the English UI back** — because
+your locale's machine translation reads poorly, or to report what it says —
+launch the applet with `LC_MESSAGES=C`, e.g. by adding `Env=LC_MESSAGES=C` to
+the panel's launcher or running
+`LC_MESSAGES=C cosmic-bing-wallpaper` from a terminal. Corrections are welcome
+either way.
 
 ## Development
 

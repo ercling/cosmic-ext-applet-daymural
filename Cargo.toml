@@ -43,7 +43,11 @@ i18n-embed = { version = "0.16", features = [
     "desktop-requester",
 ] }
 i18n-embed-fl = "0.10"
-rust-embed = "8"
+# `debug-embed`: without it a debug build reads `i18n/` from the compile-time
+# `CARGO_MANIFEST_DIR` at runtime, so a moved checkout panics on the loader's
+# `expect` — and the README's "no runtime data files" claim would hold for
+# release builds only.
+rust-embed = { version = "8", features = ["debug-embed"] }
 # Only what the applet itself touches: `time::sleep` for the one-shot
 # timers, plus `rt` + `macros` for the `#[tokio::test]` harness. Everything
 # else tokio-ish (reqwest I/O, libcosmic's executor) enables its own

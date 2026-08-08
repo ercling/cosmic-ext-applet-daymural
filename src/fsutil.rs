@@ -6,6 +6,16 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// Temporary-sibling suffix for a *partially fetched* file: downloaded
+/// images and cached thumbnails. Orphans carrying it are swept by
+/// `bing::sweep_part_files` and `thumbs::reconcile`.
+pub const PART_SUFFIX: &str = ".part";
+
+/// Temporary-sibling suffix for a whole-file rewrite of something already
+/// on disk (the catalogue JSON) — nothing "partial" ever existed at the
+/// destination, so it reads as a temp file rather than a fragment.
+pub const TMP_SUFFIX: &str = ".tmp";
+
 /// `<dest><suffix>` — the temporary sibling path a write goes to before
 /// the atomic rename.
 pub fn temp_sibling(dest: &Path, suffix: &str) -> PathBuf {
@@ -35,11 +45,11 @@ mod tests {
     #[test]
     fn temp_sibling_appends_suffix() {
         assert_eq!(
-            temp_sibling(Path::new("/x/20260807-Foo_UHD.jpg"), ".part"),
+            temp_sibling(Path::new("/x/20260807-Foo_UHD.jpg"), PART_SUFFIX),
             Path::new("/x/20260807-Foo_UHD.jpg.part")
         );
         assert_eq!(
-            temp_sibling(Path::new("/x/catalogue.json"), ".tmp"),
+            temp_sibling(Path::new("/x/catalogue.json"), TMP_SUFFIX),
             Path::new("/x/catalogue.json.tmp")
         );
     }
@@ -49,11 +59,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("20260807-Foo_UHD.jpg");
 
-        write_atomic::<io::Error>(&dest, ".part", |p| std::fs::write(p, b"jpeg bytes")).unwrap();
+        write_atomic::<io::Error>(&dest, PART_SUFFIX, |p| std::fs::write(p, b"jpeg bytes"))
+            .unwrap();
 
         assert_eq!(std::fs::read(&dest).unwrap(), b"jpeg bytes");
         assert!(
-            !temp_sibling(&dest, ".part").exists(),
+            !temp_sibling(&dest, PART_SUFFIX).exists(),
             ".part must not survive"
         );
         // Only the final file remains in the dir.
@@ -65,7 +76,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("f.jpg");
         std::fs::write(&dest, b"old").unwrap();
-        write_atomic::<io::Error>(&dest, ".tmp", |p| std::fs::write(p, b"new")).unwrap();
+        write_atomic::<io::Error>(&dest, TMP_SUFFIX, |p| std::fs::write(p, b"new")).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"new");
     }
 
@@ -75,7 +86,7 @@ mod tests {
         let dest = dir.path().join("f.jpg");
         std::fs::write(&dest, b"old").unwrap();
 
-        let err = write_atomic(&dest, ".part", |_| {
+        let err = write_atomic(&dest, PART_SUFFIX, |_| {
             Err::<(), io::Error>(io::Error::other("encode failed"))
         })
         .unwrap_err();

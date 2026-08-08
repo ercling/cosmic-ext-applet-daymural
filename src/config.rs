@@ -5,8 +5,7 @@
 // `set_<field>(&mut self, &Config, value) -> Result<bool>` setters that write
 // to disk only when the value actually changed. The applet itself persists
 // whole configs via `write_entry` (`Window::set_config`), so the generated
-// setters are exercised only by the tests below (hence the module-level
-// `#[allow(dead_code)]` in main.rs).
+// setters are exercised only by the tests below.
 
 use cosmic::cosmic_config::{
     self, Config, CosmicConfigEntry, cosmic_config_derive::CosmicConfigEntry,
@@ -17,7 +16,7 @@ use crate::app::APP_ID;
 
 /// The retention values the applet supports (the "Keep images" dropdown's
 /// choices; 0 = forever). Loaded values outside this set normalize to the
-/// default — `view::RETENTION_DAYS` is built from this array so the UI can
+/// default — `view`'s dropdown reads this array directly so the UI can
 /// never drift from it.
 pub const RETENTION_CHOICES: [u16; 4] = [3, 8, 30, 0];
 
