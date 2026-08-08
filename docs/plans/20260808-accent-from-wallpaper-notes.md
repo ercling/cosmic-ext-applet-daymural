@@ -66,6 +66,36 @@ rebuilds. Propagation is then automatic — every libcosmic app watches
 `com.system76.CosmicTheme.{Light,Dark}`, so the repaint is live and includes our
 own popup and the panel.
 
+⚠️ **Superseded (2026-08-08, plan review — the recipe above is unsafe as
+written; the shipped implementation is `src/accent.rs`, per the plan's "Theme
+write" section in `20260808-accent-from-wallpaper.md`).** Two faults, both
+found before any code was written; the "both writes are required" and
+propagation facts above still hold:
+
+- `builder.write_entry(&builder_cfg)` writes **every** builder field in one
+  transaction, materialising keys the user never set user-locally — pinning
+  them there and cutting the user off from future COSMIC default changes. The
+  `CosmicConfigEntry` derive also generates single-key setters, so the shipped
+  write is `builder.set_accent(&builder_cfg, Some(srgb))` — only the `accent`
+  key ever changes on the builder. (`set_accent` serialises the bare
+  `Option<Srgb>` as exact-f32 RON, matching what is on disk in §1.) The
+  derived `Theme`'s full-entry `write_entry` stays exactly as above — that one
+  is correct and matches cosmic-settings.
+- The `unwrap_or_else(|(_errs, partial)| partial)` read is not enough, and the
+  code comment's `dark()`/`light()` advice covers only the `Err` arm:
+  `get_entry` starts from `Self::default()` — whose palette is
+  **`DARK_PALETTE`** — and silently skips `NoConfigDirectory` errors, so a
+  light builder with no `palette` key on disk comes back with the dark palette
+  on the **Ok** path. The palette must be probed directly
+  (`ConfigGet::get::<CosmicPalette>(cfg, "palette")`) and the mode's own
+  default substituted on failure; never fall back to
+  `ThemeBuilder::default()`.
+
+Also correcting §1's observation while here: `ThemeBuilder` and `Theme` are
+`#[version = 2]`, so reads prefer and writes land under `…/v2/` — the `v1/`
+paths and values quoted above are stale leftovers; don't debug accent values
+seen there.
+
 ## 3. What an accent repaints
 
 Not just "highlights". In `build()` the accent feeds `accent` itself,

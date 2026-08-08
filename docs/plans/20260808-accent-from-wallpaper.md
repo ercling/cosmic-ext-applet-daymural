@@ -491,15 +491,18 @@ Types live in `src/accent.rs`; all colours are `[u8; 3]` (keeps `Eq` on
 - Modify: `docs/plans/20260808-accent-from-wallpaper-notes.md`
 - Move: this plan and the notes file → `docs/plans/completed/`
 
-- [ ] update README.md (feature blurb, off-by-default note, and: turn the
+- [x] update README.md (feature blurb, off-by-default note, and: turn the
       feature off before uninstalling — the derived accent stays and the
       snapshot dies with the applet config)
-- [ ] update CLAUDE.md architecture section (`src/accent.rs` entry: what it
+- [x] update CLAUDE.md architecture section (`src/accent.rs` entry: what it
       owns, the hue-transplant rule, the single-key builder write, the
       don't-clobber/disarm + snapshot lifecycle invariants)
-- [ ] fold corrections into the notes file (§2's write recipe is superseded —
-      mark it in place the way the lock-screen corrections were)
-- [ ] move this plan and the notes file to `docs/plans/completed/`
+- [x] fold corrections into the notes file (§2's write recipe is superseded —
+      mark it in place the way the lock-screen corrections were; also
+      reconciled §1's stale `v1/` path observation with the `#[version = 2]`
+      fact)
+- [x] move this plan and the notes file to `docs/plans/completed/` (move
+      deferred to orchestration completion)
 
 ## Post-Completion
 

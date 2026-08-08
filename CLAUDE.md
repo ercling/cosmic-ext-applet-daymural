@@ -121,7 +121,9 @@ the pinned rev before coding against remembered names.
   looks vanished and the startup sweep *persists* that), and `load_or_rebuild`
   rescans the folder for an **empty** catalogue as well as an unusable one (a
   valid-but-empty JSON would otherwise load fine forever).
-- `src/config.rs` — `AppletConfig` (shuffle on/off, interval, retention) via
+- `src/config.rs` — `AppletConfig` (shuffle on/off, interval, retention, and
+  the accent feature's `accent_enabled` / `accent_snapshot` /
+  `accent_last_written` — colour types imported from `accent.rs`) via
   cosmic-config under app ID `io.github.ercling.CosmicBingWallpaper`, version 1,
   write-on-change setters, watch subscription for external edits.
 - `src/wallpaper.rs` — cosmic-bg config writer: `updated_entry` mutates only
@@ -131,6 +133,52 @@ the pinned rev before coding against remembered names.
   `apply`/`current_wallpaper` is uncovered (the context cannot be rooted in a
   tempdir from this crate — see the comment on `apply`); the three-way state
   mapping is the pure, tested `classify`.
+- `src/accent.rs` — opt-in accent-from-wallpaper, **off by default** (a stopgap
+  until COSMIC ships [cosmic-settings#343](https://github.com/pop-os/cosmic-settings/issues/343)
+  natively; the restore path is the exit strategy). The whole colour domain
+  lives here — `wallpaper.rs` stays cosmic-bg-only, and `config.rs` imports the
+  persisted `[u8; 3]` types `AccentPair`/`AccentSnapshot` from here (arrays keep
+  `AppletConfig: Eq` and every comparison exact, no float epsilon). Owns:
+  `dominant_hue` (chroma-weighted Oklch hue histogram over the cached 480×270
+  thumbnail; `None` = effectively grey), the transplant + gamut map + WCAG
+  guard (`tone_band`/`accent_for`), the theme reader/writer (`ThemeHandles`,
+  four injectable `Config`s: light/dark × builder/theme), snapshot/restore,
+  and the pure tested decision `accent_plan` (analogue of
+  `refresh_success_plan`). Invariants:
+  - **Hue transplant**: the wallpaper contributes *only* its hue. Tone (Oklch
+    L, C) is the mean of the builder's own 8 chromatic palette accents, so the
+    mid-luminance legibility trap is avoided by construction and a customised
+    palette is respected; then gamut-map by chroma reduction at fixed (L, h)
+    (never per-channel clamping — it shifts hue) and a ≥ 6.0 WCAG check
+    against the better of white/black. Guard failure and grey wallpapers both
+    resolve to the palette's own `accent_warm_grey`.
+  - **Single-key builder write**: `set_accent` on each mode's builder — only
+    the `accent` key; `write_entry` on a builder would materialise every field
+    and pin the user against future COSMIC default changes — then
+    `.build().write_entry` on the derived theme (that one *is* a full write,
+    same as cosmic-settings; nothing else on the system rebuilds the theme
+    from the builder, so both writes are required). Reading a builder must
+    probe the `palette` key directly and substitute the mode's own default on
+    failure: `get_entry`'s **Ok** path silently leaks the dark default palette
+    when the key is absent.
+  - **Don't-clobber / disarm**: before each write, current builder accents are
+    compared to `accent_last_written` in exact `[u8; 3]` space (we quantise,
+    write the `u8/255` f32 via `set_accent` — exact-f32 RON round-trip — and
+    persist the same array); any mismatch means the user intervened →
+    **Disarm**: flip the toggle off through the config setter, clear snapshot
+    + last-written, **no restore** — the user's manual choice stands.
+  - **Snapshot lifecycle**: enable always re-snapshots the *live* accents
+    (even over a stale snapshot) and clears any stale last-written; disable
+    restores the snapshot verbatim — including `None` = palette default — then
+    clears both.
+  - Recompute runs on every successful apply (`app.rs`'s `on_apply_success`,
+    all three runtime paths) *and* as a startup reconciliation from `init`
+    (startup does not pass through `on_apply_success`). Extraction is async
+    with the source path as staleness guard, decodes only `thumbs::is_cached`
+    slots (never `ensure_thumbnail` here — a `Failed` slot would re-decode the
+    full UHD file on every apply), and every failure path (missing/failed
+    thumbnail, unwritable config) logs via `tracing` and leaves the user's
+    accent untouched.
 - `src/schedule.rs` — pure timing math: `next_refresh` (reference-exact,
   including the out-of-range reset to 60 s and the +300 s fudge),
   `shuffle_interval` (sanitizes hand-edited values — `0`/tiny must never
@@ -142,7 +190,8 @@ the pinned rev before coding against remembered names.
 Design decisions, live-verified Bing/cosmic-bg facts, and per-task
 implementation notes live in `docs/plans/` (`20260807-cosmic-bing-wallpaper-applet.md`
 for the applet itself, `20260808-ux-polish-lockscreen-i18n.md` for tooltips /
-disabled styling / i18n / theme conformance — each in `docs/plans/` or, once
+disabled styling / i18n / theme conformance, `20260808-accent-from-wallpaper.md`
+plus its `-notes.md` for the accent feature — each in `docs/plans/` or, once
 archived, `docs/plans/completed/`). Gotchas recorded there worth knowing: the
 `zune-jpeg` `log`-feature workaround in `Cargo.toml`, the transitive
 `cosmic-config` pin living only in `Cargo.lock`, and the live-verified

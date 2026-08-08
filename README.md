@@ -22,6 +22,12 @@ from the GNOME extension is picked up as-is — no re-downloads.
   ("Bing unreachable — retrying in 1 h") and retry automatically.
 - **Shuffle** — rotate among downloaded images every 30 min / 1 h / 6 h / daily.
 - **Retention** — keep 3 / 8 / 30 days of images, or forever.
+- **Match accent to wallpaper** — opt-in (off by default): derives the COSMIC
+  accent colour from the applied wallpaper's dominant hue and keeps it in step
+  across browsing, shuffle, and daily refreshes. Legibility-guarded, with
+  separate light- and dark-mode tones. Switching it off restores the accent you
+  had when you switched it on; picking an accent yourself in COSMIC Settings
+  switches it off and keeps your choice.
 - **Image details** — click the thumbnail to open the full-size image in your
   default viewer, or use "About this image" to open Bing's info page in the
   browser (both launched via `xdg-open`, so `xdg-utils` is needed at runtime).
@@ -57,6 +63,12 @@ catalogue/thumbnails (`~/.local/state/io.github.ercling.CosmicBingWallpaper/`),
 and settings (`~/.config/cosmic/io.github.ercling.CosmicBingWallpaper/`) are
 left behind — delete them by hand if you want a clean sweep.
 
+If **Match accent to wallpaper** is on, switch it off *before* uninstalling:
+the derived accent is written into the system theme and outlives the applet,
+while the snapshot needed to restore your previous accent lives in the
+applet's settings — delete those and the only way back is picking an accent by
+hand in COSMIC Settings.
+
 `just install` needs no sudo (per-user install). For a system-wide or packaged
 install, override the prefix: `just prefix=/usr/local install` or
 `just rootdir=$PKGDIR prefix=/usr install`.
@@ -72,6 +84,7 @@ Everything lives in the panel popup; there is no separate settings window.
 |---|---|---|---|
 | Shuffle | on / off | off | Rotates the wallpaper among downloaded images. Manual browsing resets the countdown. |
 | Shuffle interval | 30 min / 1 h / 6 h / daily | daily | Shown only while shuffle is on. |
+| Match accent to wallpaper | on / off | off | Recomputes the system accent from each applied wallpaper (a grey wallpaper falls back to the palette's warm grey). Off restores the accent from enable time; changing the accent in COSMIC Settings turns the toggle off and leaves your choice alone. |
 | Keep images | 3 / 8 / 30 days / forever | 8 days | Older images are deleted after each fetch and immediately when you reduce the setting. The currently applied image is never deleted. |
 
 Settings persist via `cosmic-config` under the app ID
