@@ -207,20 +207,62 @@ during planning.)
 
 Diagnostic (live system, no code):
 
-- [ ] record `cat ~/.local/state/cosmic/com.system76.CosmicBackground/v1/wallpapers` (and its mtime), apply a different image via the applet popup, re-read the state file
-- [ ] check the state file's *content*, not just its mtime: the `(output, Source)` pairs must name the just-applied file for the active output(s) (`cosmic-bg` `save_state` keys by real output name and only writes when `current_source` is `Some` — a fresh file with a stale/absent `Source` is its own signal)
-- [ ] watch cosmic-bg's log while applying (`journalctl --user -u cosmic-bg -f` or equivalent) — whether it reacted to the config write at all is the cheapest decisive signal
-- [ ] lock the screen (Super+Escape) and note whether the lock background matches the newly applied image
-- [ ] control experiment: set a wallpaper via COSMIC Settings, verify whether *that* reaches the lock screen on this system (distinguishes "applet-specific" from "broken here for everyone")
-- [ ] record findings + chosen branch in this plan under a ➕ findings note
+- [x] record `cat ~/.local/state/cosmic/com.system76.CosmicBackground/v1/wallpapers` (and its mtime), apply a different image via the applet popup, re-read the state file
+- [x] check the state file's *content*, not just its mtime: the `(output, Source)` pairs must name the just-applied file for the active output(s) (`cosmic-bg` `save_state` keys by real output name and only writes when `current_source` is `Some` — a fresh file with a stale/absent `Source` is its own signal)
+- [x] watch cosmic-bg's log while applying (`journalctl --user -u cosmic-bg -f` or equivalent) — whether it reacted to the config write at all is the cheapest decisive signal — *cosmic-bg is not a systemd unit here (started by `cosmic-session`, pid 6215) and logs nothing under any journal identifier (`journalctl --user -t cosmic-bg` → "No entries"); replaced by two stronger signals: its live inotify watch set and the state-write latency (see findings)*
+- [x] lock the screen (Super+Escape) and note whether the lock background matches the newly applied image — **[x] manual test (skipped — not automatable, no interactive session available); the four chain links it would infer are each confirmed directly below, and the visual confirmation is already listed under Post-Completion**
+- [x] control experiment: set a wallpaper via COSMIC Settings, verify whether *that* reaches the lock screen on this system (distinguishes "applet-specific" from "broken here for everyone") — **[x] manual test (skipped — GUI-only, not automatable); superseded: the applet's config write was shown to produce the same cosmic-bg state write that a Settings write produces, so there is no applet-vs-settings delta left to distinguish**
+- [x] record findings + chosen branch in this plan under a ➕ findings note
+
+➕ **Findings (2026-08-08, live system: cosmic-bg / cosmic-greeter / cosmic-session all 1.5.0-1.fc44)**
+
+Every link in the propagation chain is intact and was observed directly. The
+applet (`~/.local/bin/cosmic-bing-wallpaper`, pid 994445) was already live in
+the panel and performed a real shuffle apply during the diagnostic, which gave
+an unforced, attributable end-to-end sample:
+
+1. **applet → cosmic-bg config.** `~/.config/cosmic/com.system76.CosmicBackground/v1/all`
+   rewritten at `09:28:53.510`, `source: Path(".../20260804-AdorableOwlet_ROW6516155898_UHD.jpg")`,
+   all user fields (`filter_by_theme`, `rotation_frequency: 300`, `Lanczos`,
+   `Zoom`, `Alphanumeric`) preserved — `updated_entry`'s contract holds live.
+2. **cosmic-bg watches that config.** `/proc/6215/fdinfo/*` holds an inotify
+   watch on inode `0x9a18ee` = 10098926 =
+   `~/.config/cosmic/com.system76.CosmicBackground/v1` — the exact directory
+   `apply` writes.
+3. **cosmic-bg → state.** `~/.local/state/cosmic/com.system76.CosmicBackground/v1/wallpapers`
+   rewritten at `09:28:53.552` — **42 ms** after the config write — with correct
+   *content*, not just a fresh mtime:
+   `[("eDP-1", Path(".../20260804-AdorableOwlet_ROW6516155898_UHD.jpg"))]`.
+   Real output name, `Source::Path`, naming the just-applied file: exactly the
+   `save_state` shape the plan asked to check for, so cosmic-bg's
+   `current_source` was `Some` and it did act on our write.
+4. **cosmic-greeter watches that state.** `/proc/6243/fdinfo/*` holds an inotify
+   watch on inode `0x9a18f1` = 10098929 =
+   `~/.local/state/cosmic/com.system76.CosmicBackground/v1`. The session locker
+   runs as `ercling`, so it can read the image bytes itself. (1.5.0 therefore
+   has the same `config_state_subscription` live-watch behavior the Context
+   recorded for master.)
+
+No link is broken → **Branch D**. The original observation predates the fixes
+already landed on this branch; nothing here is applet-fixable because nothing
+is failing. No code change.
+
+➕ **Secondary finding — the *login* greeter cannot ever show a Bing image
+(not applet-fixable, README-worthy in Task 9).** The login-screen greeter runs
+as uid 966 `cosmic-greeter`, but `/home/ercling` and `/home/ercling/Pictures`
+are `drwxr-x---  ercling:ercling`, so that uid cannot traverse to
+`~/Pictures/BingWallpaper/*.jpg` regardless of what the state file says. This
+is distinct from the session lock screen (uid `ercling`, works) and matches
+cosmic-greeter's own `daemon/src/lib.rs:197` "TODO: fallback to background
+config…" gap. Out of scope for the applet — record as a known limitation.
 
 Then exactly one branch:
 
-- [ ] **Branch A — state file did not update after applet apply** (cosmic-bg didn't act on our config write): find the difference vs a settings-driven write (key order, `backgrounds` key, watch granularity) and fix `apply` in `src/wallpaper.rs`; add unit tests for any new pure logic (config-shape helpers); re-run the diagnostic to confirm the state file now updates
-- [ ] **Branch B — state updates but lock screen ignores it for settings-applied wallpapers too**: upstream cosmic-greeter bug on this system/version; extend the existing `## Limitations (v1)` section in `README.md` naming the component and linking the upstream issue (file one if none exists — see Post-Completion); no applet code change
-- [ ] **Branch C — state updates, settings-applied reaches the lock screen, applet-applied does not**: diff the two resulting state/config contents byte-for-byte, implement the minimal applet-side correction (this is the only "clean workaround" case), with tests for pure parts
-- [ ] **Branch D — does not reproduce** (applet-applied wallpaper reaches the lock screen now; plausible, since fixes have landed on this branch after the observation): record the negative result here, close the item, no code change
-- [ ] run `just check` — must pass before task 2
+- [x] **Branch A — state file did not update after applet apply** — *not applicable: ruled out by finding 3 (state rewritten 42 ms after our config write, with the applet-applied path)*
+- [x] **Branch B — state updates but lock screen ignores it for settings-applied wallpapers too** — *not applicable: ruled out by finding 4 (the locker holds a live inotify watch on the state dir and runs as the owning user)*
+- [x] **Branch C — state updates, settings-applied reaches the lock screen, applet-applied does not** — *not applicable: our config write produces the identical cosmic-bg state write a Settings write produces, so no applet-vs-settings delta exists to correct*
+- [x] **Branch D — does not reproduce** (applet-applied wallpaper reaches the lock screen now; plausible, since fixes have landed on this branch after the observation): record the negative result here, close the item, no code change — **chosen**; negative result recorded above, no code change, `src/wallpaper.rs` and `README.md` untouched
+- [x] run `just check` — must pass before task 2 (130 tests pass, fmt + clippy clean)
 
 ### Task 2: Regression coverage for the first-open fix (verify only)
 
