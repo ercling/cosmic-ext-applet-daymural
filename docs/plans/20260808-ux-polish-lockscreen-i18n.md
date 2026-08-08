@@ -308,12 +308,23 @@ No behavior change — test-only.
 - Modify: `src/view.rs`
 - Modify: `src/app.rs`
 
-- [ ] wrap the nav/refresh buttons in `core.applet.applet_tooltip(...)` (NOT the plain `widget::tooltip` overlay — it clips to the popup surface; see Context): "Previous wallpaper", "Next wallpaper", "Skip to newest", "Check for new images now"; inside the popup pass `has_popup: false` and `parent_id: window.popup`, with `Message::Surface` as the forwarder
-- [ ] add a tooltip to the thumbnail button ("Open image in viewer"), same idiom
-- [ ] add a tooltip to the panel button in `app.rs` (`view()`, `icon_button(PANEL_ICON)`) — "Bing Wallpaper of the Day" — with `has_popup: self.popup.is_some()` (suppressed while the popup is open) and `parent_id: None`, per libcosmic's `examples/applet/src/window.rs:149`
-- [ ] verify hover behavior in the panel: tooltip appears (~100 ms delay), not clipped, one at a time; note outcome here
-- [ ] tests: view-code exempt (no new pure logic introduced; tooltip strings enter the tested inventory in Task 5)
-- [ ] run `just check` — must pass before task 4
+- [x] wrap the nav/refresh buttons in `core.applet.applet_tooltip(...)` (NOT the plain `widget::tooltip` overlay — it clips to the popup surface; see Context): "Previous wallpaper", "Next wallpaper", "Skip to newest", "Check for new images now"; inside the popup pass `has_popup: false` and `parent_id: window.popup`, with `Message::Surface` as the forwarder
+- [x] add a tooltip to the thumbnail button ("Open image in viewer"), same idiom
+- [x] add a tooltip to the panel button in `app.rs` (`view()`, `icon_button(PANEL_ICON)`) — "Bing Wallpaper of the Day" — with `has_popup: self.popup.is_some()` (suppressed while the popup is open) and `parent_id: None`, per libcosmic's `examples/applet/src/window.rs:149`
+- [x] manual test (skipped — not automatable, no interactive wayland session): verify hover behavior in the panel — tooltip appears (~100 ms delay), not clipped, one at a time; already listed under Post-Completion ("Tooltip hover feel")
+- [x] tests: view-code exempt (no new pure logic introduced; tooltip strings enter the tested inventory in Task 5) — added one non-view guard, `panel_tooltip_names_the_applet` (`src/app.rs`), pinning the English panel string
+- [x] run `just check` — must pass before task 4 (132 tests pass, fmt + clippy clean)
+
+➕ **Notes (2026-08-08)**
+
+- New helper `view::popup_tooltip(window, content, text)` centralizes the
+  in-popup idiom (`has_popup: false`, `parent_id: window.popup`,
+  `Message::Surface` forwarder) so every popup control shares one call site;
+  `nav_button` gained `window` + `tooltip` parameters and `thumbnail` gained
+  `window`.
+- The panel string lives in a new `PANEL_TOOLTIP` const in `src/app.rs` next to
+  `PANEL_ICON` — a named anchor for the Task-5 `fl!` conversion.
+- Tooltip texts are plain English literals per the plan (Task 5 converts them).
 
 ### Task 4: Visibly dimmed disabled icon buttons
 

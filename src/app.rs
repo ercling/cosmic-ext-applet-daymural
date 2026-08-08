@@ -31,6 +31,9 @@ pub const APP_ID: &str = "io.github.ercling.CosmicBingWallpaper";
 /// Symbolic icon shown in the panel.
 const PANEL_ICON: &str = "preferences-desktop-wallpaper-symbolic";
 
+/// Hover tooltip on the panel button.
+const PANEL_TOOLTIP: &str = "Bing Wallpaper of the Day";
+
 pub fn run() -> cosmic::iced::Result {
     cosmic::applet::run::<Window>(())
 }
@@ -822,10 +825,23 @@ impl cosmic::Application for Window {
     }
 
     fn view(&self) -> Element<'_, Self::Message> {
-        self.core
+        let button = self
+            .core
             .applet
             .icon_button(PANEL_ICON)
-            .on_press_down(Message::TogglePopup)
+            .on_press_down(Message::TogglePopup);
+        // Panel-level tooltip: parented to the panel (`parent_id: None`) and
+        // suppressed while our popup is open (`has_popup`), per libcosmic's
+        // own applet example.
+        self.core
+            .applet
+            .applet_tooltip::<Message>(
+                button,
+                PANEL_TOOLTIP,
+                self.popup.is_some(),
+                Message::Surface,
+                None,
+            )
             .into()
     }
 
@@ -856,6 +872,13 @@ mod tests {
     #[test]
     fn panel_icon_is_symbolic() {
         assert!(PANEL_ICON.ends_with("-symbolic"));
+    }
+
+    #[test]
+    fn panel_tooltip_names_the_applet() {
+        // Guards the English copy of the one string the panel shows on
+        // hover (it joins the translated inventory in task 5).
+        assert_eq!(PANEL_TOOLTIP, "Bing Wallpaper of the Day");
     }
 
     #[test]

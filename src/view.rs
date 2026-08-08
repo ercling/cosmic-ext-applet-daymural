@@ -191,7 +191,7 @@ pub fn popup_view(window: &Window) -> Element<'_, Message> {
 
     if let Some(entry) = displayed(&window.catalogue, window.current.as_deref()) {
         content = content
-            .push(padded_control(thumbnail(entry)))
+            .push(padded_control(thumbnail(window, entry)))
             .push(padded_control(header(entry)));
         if !entry.copyrightlink.is_empty() {
             content = content.push(
@@ -225,7 +225,7 @@ pub fn popup_view(window: &Window) -> Element<'_, Message> {
 /// Clickable thumbnail of the displayed wallpaper (cached 480×270 — the UI
 /// never decodes the full ~5 MB UHD file). Click opens the full image in
 /// the default viewer.
-fn thumbnail(entry: &ImageEntry) -> Element<'_, Message> {
+fn thumbnail<'a>(window: &'a Window, entry: &'a ImageEntry) -> Element<'a, Message> {
     let thumb = thumbs::thumbnail_path(&entry.filename, app::state_dir());
     let inner: Element<'_, Message> = if thumb.is_file() {
         widget::image(widget::image::Handle::from_path(thumb))
@@ -239,10 +239,10 @@ fn thumbnail(entry: &ImageEntry) -> Element<'_, Message> {
             .align_y(Alignment::Center)
             .into()
     };
-    widget::button::custom_image_button(inner, None)
+    let button = widget::button::custom_image_button(inner, None)
         .class(cosmic::theme::Button::Image)
-        .on_press(Message::OpenFile(entry.filename.clone()))
-        .into()
+        .on_press(Message::OpenFile(entry.filename.clone()));
+    popup_tooltip(window, button, "Open image in viewer")
 }
 
 /// Title heading + dimmed copyright caption.
@@ -266,15 +266,21 @@ fn controls(window: &Window) -> Element<'_, Message> {
 
     widget::Row::new()
         .push(nav_button(
+            window,
             "go-previous-symbolic",
+            "Previous wallpaper",
             apply(prev_target(catalogue, current)),
         ))
         .push(nav_button(
+            window,
             "go-next-symbolic",
+            "Next wallpaper",
             apply(next_target(catalogue, current)),
         ))
         .push(nav_button(
+            window,
             "go-last-symbolic",
+            "Skip to newest",
             apply(newest_target(catalogue, current)),
         ))
         .push(refresh_button(window))
@@ -331,15 +337,41 @@ fn retention_row(window: &Window) -> Element<'_, Message> {
 /// Refresh-now button, disabled (no message) while a fetch is running.
 fn refresh_button(window: &Window) -> Element<'_, Message> {
     nav_button(
+        window,
         "view-refresh-symbolic",
+        "Check for new images now",
         (!window.refresh_pending).then_some(Message::RefreshNow),
     )
 }
 
-/// One icon button; `None` renders it disabled.
-fn nav_button<'a>(icon: &'static str, on_press: Option<Message>) -> Element<'a, Message> {
-    widget::button::icon(widget::icon::from_name(icon))
-        .on_press_maybe(on_press)
+/// One icon button with a hover tooltip; `None` renders it disabled.
+fn nav_button<'a>(
+    window: &Window,
+    icon: &'static str,
+    tooltip: &'static str,
+    on_press: Option<Message>,
+) -> Element<'a, Message> {
+    let button = widget::button::icon(widget::icon::from_name(icon)).on_press_maybe(on_press);
+    popup_tooltip(window, button, tooltip)
+}
+
+/// Wrap a control living *inside* the applet popup in a hover tooltip.
+///
+/// Uses `applet_tooltip` (a real wayland popup) rather than the plain
+/// `widget::tooltip` overlay, which would clip to the popup surface — the
+/// same reason the dropdowns use `popup_dropdown` (see CLAUDE.md).
+/// `has_popup: false` is required: `applet_tooltip` only builds the tooltip
+/// surface when it is `false`, and `parent_id` must be *our* popup so the
+/// tooltip parents to it instead of the panel.
+fn popup_tooltip<'a>(
+    window: &Window,
+    content: impl Into<Element<'a, Message>>,
+    tooltip: &'static str,
+) -> Element<'a, Message> {
+    window
+        .core
+        .applet
+        .applet_tooltip::<Message>(content, tooltip, false, Message::Surface, window.popup)
         .into()
 }
 
