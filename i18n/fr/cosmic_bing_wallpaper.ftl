@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = Fond d'écran Bing du jour
-
 about-this-image = À propos de cette image
 bing-wallpaper = Fond d'écran Bing
 
@@ -17,6 +15,7 @@ tooltip-open-image = Ouvrir l'image dans la visionneuse
 shuffle = Aléatoire
 shuffle-every = Fréquence
 keep-images = Conserver les images
+match-accent-to-wallpaper = Adapter la couleur d'accentuation au fond d'écran
 
 interval-30-minutes = 30 minutes
 interval-1-hour = 1 heure

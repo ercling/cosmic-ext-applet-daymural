@@ -261,6 +261,92 @@ is distinct from the session lock screen (uid `ercling`, works) and matches
 cosmic-greeter's own `daemon/src/lib.rs:197` "TODO: fallback to background
 config…" gap. Out of scope for the applet — record as a known limitation.
 
+⚠️ **Correction (2026-08-08, same day, read against the installed
+cosmic-greeter 1.5.0 sources — the reasoning above is wrong).** The greeter
+process never opens the wallpaper file, so its uid is irrelevant:
+
+- `cosmic-greeter-daemon` runs as **root** (`daemon/src/main.rs`, unit has no
+  `User=`; only root may own `com.system76.CosmicGreeter` per the D-Bus policy)
+  and serves `get_user_data`.
+- For each user it calls `run_as_user` (`daemon/src/main.rs:17-58`, whose own
+  comment says "this function is critical to the security of this proxy… must
+  ensure that the callback is executed with the permissions of the specified
+  user id"): it swaps `HOME` to the user's home, `initgroups`, `setegid`,
+  `seteuid`, then runs `load_config_as_user`.
+- Inside that, `load_wallpapers_as_user` (`daemon/src/lib.rs:76-101`) does the
+  `fs::read(path)` **as the user** and stores the bytes in
+  `bg_path_data: BTreeMap<PathBuf, Vec<u8>>`; the whole `UserData` is
+  serialised to RON and handed over the system bus.
+- The greeter renders from those bytes — `Common::update_wallpapers`
+  (`src/common.rs:142-185`) looks the path up in `bg_path_data` and builds
+  `image::Handle::from_bytes`, falling back to the bundled
+  `res/background.jpg` when it is missing. No filesystem access at uid 966.
+
+So a `drwxr-x---` home is **not** a barrier and loosening home permissions is
+**not** a workaround to suggest. What actually decides the login screen is
+which display manager runs it: on this machine `gdm.service` is the DM while
+`cosmic-greeter.service`, `greetd.service` *and* `cosmic-greeter-daemon.service`
+are all `disabled`, so the login screen is GDM's and cosmic-bg state can never
+reach it. The `daemon/src/lib.rs:199` TODO is about a *missing state file*
+(fall back to the bg config), not about permissions.
+
+⚠️⚠️ **Second correction (2026-08-08, later the same day — the user looked at
+the actual lock screen and reported "it shows the default background", which
+falsifies Branch D and the paragraph below).** The chain up to the state file is
+still exactly as recorded; the loss is inside cosmic-greeter's locker, in its
+image cache:
+
+1. cosmic-bg's rotation timer calls `save_state()` on every tick, even when the
+   source is one file and the "queue" rotates back to the same path
+   (`cosmic-bg/src/wallpaper.rs:320-352`). Our entry carries the user's
+   `rotation_frequency: 300`, and the state file's mtime duly advances every
+   5 minutes (observed: …:07:13, :12:13, :22:13, identical content).
+2. Each state write reaches the locker's subscription →
+   `Message::BackgroundState` clears **all** cached images and rebuilds
+   (`src/locker.rs:1023-1027`).
+3. The rebuild, `Common::update_wallpapers`, skips any surface whose id is not
+   in `surface_names` — `let Some(output_name) = … else { continue }`
+   (`src/common.rs:148-150`). **Silently**: no warning, which is why the clean
+   journal in the first correction was read as success. That inference was
+   wrong; only the *bytes-missing* branch warns.
+4. Unlocking removed precisely those ids from `surface_names`
+   (`src/locker.rs:1004` in `SessionLockEvent::Unlocked`, `1133` in
+   `Message::Unlock`).
+5. `SessionLockEvent::Locked` re-inserts the names (`src/locker.rs:968`) but
+   never calls `update_wallpapers` — the only callers are `init`,
+   `OutputEvent::Created` (`src/locker.rs:753`) and the state handler.
+6. So `surface_images` is empty and `view_window` falls back to the bundled
+   `res/background.jpg` (`src/locker.rs:1167-1172`) — "the default background".
+
+Predictions this makes, all consistent with what the user sees: the **first**
+lock after login is correct (names still present from `OutputEvent::Created`);
+every lock after an unlock-plus-state-write is the default; and a lock screen
+left up across a state write flips to the real wallpaper mid-lock (the names are
+back by then). Upstream fix is one line — call `update_wallpapers` after
+re-inserting the names on lock, or stop removing them on unlock — filed as
+[pop-os/cosmic-greeter#511](https://github.com/pop-os/cosmic-greeter/issues/511)
+with this trace and that patch, cross-linked from their #460 and #497 (same
+symptom, no reproduction until now; their #184 is a different gap —
+`BgSource::Color` is unsupported). **Nothing here is applet-fixable**:
+`wallpaper.rs` already produces the state cosmic-greeter reads. Setting `rotation_frequency: 0` would only stop the 5-minute churn (the
+first apply after an unlock still empties the cache) and means overwriting a
+user's cosmic-bg field, which `updated_entry` deliberately preserves — not a fix
+to ship.
+
+The paragraph below is retained for the record; read it as "the code path is
+capable of following, and the watches are in place", not as "it does follow":
+`locker::main`
+builds its own `UserData` and calls `load_config_as_user()` directly as the
+user (`src/locker.rs:78-87`), subscribes to the cosmic-bg **state**
+(`src/locker.rs:1187-1198`), and on every change re-reads the bytes, clears
+`surface_images` and re-renders (`src/locker.rs:1023-1027`). Re-verified live:
+pid 6243 (`cosmic-greeter`, uid `ercling`) holds an inotify watch on inode
+10098929 = `~/.local/state/cosmic/com.system76.CosmicBackground/v1`, and no
+`failed to find wallpaper data` / `failed to read wallpaper` / `no output name`
+warning has ever been logged by it this boot — while other warnings from the
+same process are in the journal, so that log level is visible. Every path that
+would silently fall back is therefore ruled out.
+
 Then exactly one branch:
 
 - [x] **Branch A — state file did not update after applet apply** — *not applicable: ruled out by finding 3 (state rewritten 42 ms after our config write, with the applet-applied path)*
@@ -359,6 +445,16 @@ Two further defects found in the same review round and fixed here:
 - [x] wrap the nav/refresh buttons in `core.applet.applet_tooltip(...)` (NOT the plain `widget::tooltip` overlay — it clips to the popup surface; see Context): "Previous wallpaper", "Next wallpaper", "Skip to newest", "Check for new images now"; inside the popup pass `has_popup: false` and `parent_id: window.popup`, with `Message::Surface` as the forwarder
 - [x] add a tooltip to the thumbnail button ("Open image in viewer"), same idiom
 - [x] add a tooltip to the panel button in `app.rs` (`view()`, `icon_button(PANEL_ICON)`) — "Bing Wallpaper of the Day" — with `has_popup: self.popup.is_some()` (suppressed while the popup is open) and `parent_id: None`, per libcosmic's `examples/applet/src/window.rs:149`
+  - ⚠️ **Reverted 2026-08-08 on user feedback**: in a real panel this made the
+    applet the only tray icon announcing its own name on hover. COSMIC's status
+    applets (audio, battery, network, notifications, time) don't, and the
+    first-party applets that *do* use `applet_tooltip` on a panel button put
+    dynamic content in it — window titles in cosmic-app-list and
+    cosmic-applet-minimize, the label in cosmic-panel-button. The panel button
+    is now bare, the `panel-tooltip` id is deleted from all 73 catalogues, and
+    `panel_tooltip_names_the_applet` is gone with it. Following libcosmic's
+    applet *example* was the mistake here; it is a demo, not a convention.
+    The popup tooltips (below) stay — those name icon-only controls.
 - [x] manual test (skipped — not automatable, no interactive wayland session): verify hover behavior in the panel — tooltip appears (~100 ms delay), not clipped, one at a time; already listed under Post-Completion ("Tooltip hover feel")
 - [x] tests: view-code exempt (no new pure logic introduced; tooltip strings enter the tested inventory in Task 5) — added one non-view guard, `panel_tooltip_names_the_applet` (`src/app.rs`), pinning the English panel string
 - [x] run `just check` — must pass before task 4 (132 tests pass, fmt + clippy clean)

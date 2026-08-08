@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = Bing-fonde del die
-
 about-this-image = Pri ti-ci image
 bing-wallpaper = Bing-fonde
 
@@ -17,6 +15,7 @@ tooltip-open-image = Aperter li image in li vider
 shuffle = Mixtar
 shuffle-every = Chascun
 keep-images = Retener images
+match-accent-to-wallpaper = Adaptar li accentu al fonde
 
 interval-30-minutes = 30 minutes
 interval-1-hour = 1 hor

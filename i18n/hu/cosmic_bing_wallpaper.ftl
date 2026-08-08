@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = A nap Bing háttérképe
-
 about-this-image = A képről
 bing-wallpaper = Bing háttérkép
 
@@ -17,6 +15,7 @@ tooltip-open-image = Kép megnyitása a megjelenítőben
 shuffle = Keverés
 shuffle-every = Gyakoriság
 keep-images = Képek megőrzése
+match-accent-to-wallpaper = Kiemelőszín igazítása a háttérképhez
 
 interval-30-minutes = 30 perc
 interval-1-hour = 1 óra

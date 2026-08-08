@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = Dienos „Bing“ darbalaukio fonas
-
 about-this-image = Apie šį paveikslėlį
 bing-wallpaper = „Bing“ fonas
 
@@ -17,6 +15,7 @@ tooltip-open-image = Atverti paveikslėlį žiūryklėje
 shuffle = Maišyti
 shuffle-every = Kas
 keep-images = Laikyti paveikslėlius
+match-accent-to-wallpaper = Derinti akcentą prie fono
 
 interval-30-minutes = 30 minučių
 interval-1-hour = 1 valanda

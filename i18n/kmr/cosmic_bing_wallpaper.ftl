@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = Kaxeza dîwêr a rojê ya Bing
-
 about-this-image = Derbarê vê wêneyê de
 bing-wallpaper = Kaxeza dîwêr a Bing
 
@@ -17,6 +15,7 @@ tooltip-open-image = Wêneyê di nîşanderê de veke
 shuffle = Tevlihev
 shuffle-every = Her
 keep-images = Wêneyan biparêze
+match-accent-to-wallpaper = Rengê balkêş bi kaxeza dîwêr re biguncîne
 
 interval-30-minutes = 30 deqîqe
 interval-1-hour = 1 saet

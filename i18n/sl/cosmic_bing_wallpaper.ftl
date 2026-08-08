@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = Bingovo ozadje dneva
-
 about-this-image = O tej sliki
 bing-wallpaper = Ozadje Bing
 
@@ -17,6 +15,7 @@ tooltip-open-image = Odpri sliko v pregledovalniku
 shuffle = Naključno
 shuffle-every = Vsakih
 keep-images = Obdrži slike
+match-accent-to-wallpaper = Uskladi poudarek z ozadjem
 
 interval-30-minutes = 30 minut
 interval-1-hour = 1 ura

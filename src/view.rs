@@ -259,6 +259,7 @@ pub fn popup_view(window: &Window) -> Element<'_, Message> {
             content = content.push(padded_control(interval_row(window)));
         }
         content = content
+            .push(padded_control(accent_toggler(window)))
             .push(divider())
             .push(padded_control(retention_row(window)));
     } else {
@@ -378,6 +379,19 @@ fn shuffle_toggler(window: &Window) -> Element<'_, Message> {
         .into()
 }
 
+/// Accent-from-wallpaper toggler row (same idiom as [`shuffle_toggler`],
+/// including the hardcoded label size — see that function's comment). Bound
+/// to [`Message::SetAccentEnabled`]; the enable/disable/disarm lifecycle
+/// lives in `app.rs`, this row only reflects `config.accent_enabled`.
+fn accent_toggler(window: &Window) -> Element<'_, Message> {
+    widget::toggler(window.config.accent_enabled)
+        .on_toggle(Message::SetAccentEnabled)
+        .text_size(14)
+        .width(Length::Fill)
+        .label(fl!("match-accent-to-wallpaper"))
+        .into()
+}
+
 /// "Every <interval>" dropdown row, shown while shuffle is on. Uses
 /// `popup_dropdown` (as in libcosmic's own applet example) so the menu
 /// opens as its own wayland popup instead of an overlay clipped to the
@@ -455,22 +469,17 @@ fn nav_button<'a>(
 
 /// Wrap a control living *inside* the applet popup in a hover tooltip.
 ///
-/// Uses `applet_tooltip` (a real wayland popup) rather than the plain
-/// `widget::tooltip` overlay, which would clip to the popup surface — the
-/// same reason the dropdowns use `popup_dropdown` (see CLAUDE.md).
-/// `has_popup: false` is required: `applet_tooltip` only builds the tooltip
-/// surface when it is `false`, and `parent_id` must be *our* popup so the
-/// tooltip parents to it instead of the panel.
+/// Goes through [`crate::tooltip`] (a real wayland popup) rather than the
+/// plain `widget::tooltip` overlay, which would clip to the popup surface —
+/// the same reason the dropdowns use `popup_dropdown` (see CLAUDE.md). It pins
+/// the one non-obvious argument: `parent_id` is *our* popup, so the tooltip
+/// parents to that rather than to the panel.
 fn popup_tooltip<'a>(
     window: &'a Window,
     content: impl Into<Element<'a, Message>>,
-    tooltip: impl Into<Cow<'static, str>>,
+    text: impl Into<Cow<'static, str>>,
 ) -> Element<'a, Message> {
-    window
-        .core
-        .applet
-        .applet_tooltip::<Message>(content, tooltip, false, Message::Surface, window.popup)
-        .into()
+    crate::tooltip::tooltip(&window.core, content, text, window.popup)
 }
 
 #[cfg(test)]

@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = Ταπετσαρία της ημέρας από το Bing
-
 about-this-image = Σχετικά με αυτήν την εικόνα
 bing-wallpaper = Ταπετσαρία Bing
 
@@ -17,6 +15,7 @@ tooltip-open-image = Άνοιγμα της εικόνας στην προβολ�
 shuffle = Τυχαία εναλλαγή
 shuffle-every = Κάθε
 keep-images = Διατήρηση εικόνων
+match-accent-to-wallpaper = Ταίριασμα χρώματος έμφασης με την ταπετσαρία
 
 interval-30-minutes = 30 λεπτά
 interval-1-hour = 1 ώρα

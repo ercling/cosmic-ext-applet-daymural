@@ -85,6 +85,11 @@ the pinned rev before coding against remembered names.
   display helpers (`displayed`/`prev_target`/`next_target`/`newest_target`,
   `format_updated`, dropdown index↔value mappings) which *are* unit-tested; iced
   view code itself is exempt from tests.
+- `src/tooltip.rs` — the hover tooltip, as its own wayland popup: upstream's
+  `Core::applet_tooltip` plumbing (positioner, 100 ms delay, one shared surface
+  id) re-implemented so the tooltip *surface* can be styled — upstream paints it
+  in the popup's own background colour, which made the label unreadable over the
+  popup. Both `view.rs` and `app.rs` build their tooltips through it.
 - `src/bing.rs` — Bing API types + parsing (fixture:
   `tests/fixtures/hpimagearchive.json`), title/copyright derivation
   (`split_copyright` — Bing's own `title` field is the literal `"Info"`), pure
@@ -142,8 +147,38 @@ archived, `docs/plans/completed/`). Gotchas recorded there worth knowing: the
 `zune-jpeg` `log`-feature workaround in `Cargo.toml`, the transitive
 `cosmic-config` pin living only in `Cargo.lock`, and the live-verified
 lock-screen propagation chain (applet → cosmic-bg config → cosmic-bg state →
-greeter state-watch — intact; only the *login* greeter can't read `~/Pictures`,
-a uid/permissions gap, not an applet bug).
+greeter state-watch — our end is intact and stays that way).
+
+⚠️ **Both of that plan's lock-screen conclusions were wrong; corrected in place
+there (2026-08-08, read against the installed cosmic-greeter 1.5.0 sources).**
+Two independent facts, worth knowing before anyone "fixes" `wallpaper.rs` over
+a lock-screen report:
+
+- **The lock screen genuinely does not follow (observed by the user, then
+  traced).** Not our chain — cosmic-greeter's locker cache. Each cosmic-bg state
+  write clears `surface_images` and rebuilds (`src/locker.rs:1023-1027`); the
+  rebuild silently `continue`s past any surface missing from `surface_names`
+  (`src/common.rs:148-150`); unlocking removed those ids
+  (`src/locker.rs:1004`, `1133`); locking re-inserts the names
+  (`src/locker.rs:968`) but never rebuilds — so `view_window` serves the bundled
+  `res/background.jpg` (`src/locker.rs:1167-1172`). First lock after login is
+  right; later locks are the default; a lock that is up when a state write lands
+  flips to the real wallpaper. cosmic-bg rewrites state every
+  `rotation_frequency` seconds even for a single-file source
+  (`cosmic-bg/src/wallpaper.rs:320-352`), so the churn is constant. Note the
+  skip is **silent** — an empty journal is not evidence the wallpaper arrived,
+  which is exactly the wrong inference made once already. Filed upstream as
+  [cosmic-greeter#511](https://github.com/pop-os/cosmic-greeter/issues/511)
+  (their #460/#497 are the same symptom without a repro). Don't "fix" this here.
+- **Permissions are not the login-screen gate; the display manager is.** The
+  greeter process never opens the image: `cosmic-greeter-daemon` runs as root and
+  reads each user's cosmic-bg state *and* the bytes inside `run_as_user`
+  (`daemon/src/main.rs` — HOME swap + `initgroups`/`setegid`/`seteuid`), then
+  ships them as RON over the system bus for the greeter to render from memory
+  (`bg_path_data`, `src/common.rs`). So a `drwxr-x---` home is no barrier and
+  loosening home permissions is not a workaround to suggest. What decides it is
+  greetd + `cosmic-greeter.service` + `cosmic-greeter-daemon.service` being the
+  login path (on this machine all three are disabled and GDM is the DM).
 
 ## UI conventions
 
@@ -154,13 +189,17 @@ surface. Two cases, same rule:
 - **Dropdowns** use `widget::dropdown::popup_dropdown(..)` with the
   `Message::Surface(cosmic::surface::Action)` forwarder (see the
   interval/retention rows in `view.rs`).
-- **Tooltips** use `Core::applet_tooltip(..)`, not `widget::tooltip`. Inside the
-  popup go through `view::popup_tooltip(window, content, text)`, which pins the
-  two non-obvious arguments: `has_popup: false` (the tooltip surface is only
-  created when that is `false`) and `parent_id: window.popup` (parent to the
-  popup, not the panel). The panel button in `app.rs` is the mirror image:
-  `has_popup: self.popup.is_some()` (suppressed while the popup is open) and
-  `parent_id: None`.
+- **Tooltips** go through `crate::tooltip::tooltip(..)`, never `widget::tooltip`
+  (an overlay) and no longer `Core::applet_tooltip` — see `src/tooltip.rs` for
+  why upstream's copy is unusable here (its surface is painted in the *same*
+  colour as the popup, so the label had no readable background). Inside the
+  popup call `view::popup_tooltip(window, content, text)`, which pins
+  `parent_id: window.popup` (parent to the popup, not the panel).
+  **The panel button deliberately has no tooltip** (`app::Window::view`):
+  status applets don't announce their own name on hover, and ours was the only
+  tray icon doing it. libcosmic's applet example does wrap the panel button —
+  don't "restore" it from there, and don't reintroduce a `panel-tooltip`
+  message id.
 
 Disabled icon buttons: the theme's own disabled styling is a **no-op** for
 `Button::Icon` — `on_disabled` differs from `on` in alpha only, and the SVG

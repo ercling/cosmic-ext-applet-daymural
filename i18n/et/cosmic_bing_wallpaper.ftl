@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = Bingi päeva taustapilt
-
 about-this-image = Teave selle pildi kohta
 bing-wallpaper = Bingi taustapilt
 
@@ -17,6 +15,7 @@ tooltip-open-image = Ava pilt vaaturis
 shuffle = Juhuslik vahetus
 shuffle-every = Iga
 keep-images = Säilita pilte
+match-accent-to-wallpaper = Sobita rõhuvärv taustapildiga
 
 interval-30-minutes = 30 minutit
 interval-1-hour = 1 tund

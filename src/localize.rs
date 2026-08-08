@@ -336,8 +336,9 @@ mod tests {
         // defined — is a compile error, `fl!` resolves at build time.)
         //
         // Each source is cut at its own `#[cfg(test)]` module: a `fl!` that
-        // only appears in an assertion (`panel_tooltip_names_the_applet`)
-        // must not count as "rendered by the UI".
+        // only appears in an assertion (the dropdown-label and
+        // `display_title` tests in `view.rs` are full of them) must not count
+        // as "rendered by the UI".
         const SOURCES: [&str; 2] = [include_str!("app.rs"), include_str!("view.rs")];
         let production: Vec<&str> = SOURCES
             .iter()

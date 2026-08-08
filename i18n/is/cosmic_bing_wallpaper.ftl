@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = Bing-bakgrunnsmynd dagsins
-
 about-this-image = Um þessa mynd
 bing-wallpaper = Bing-bakgrunnsmynd
 
@@ -17,6 +15,7 @@ tooltip-open-image = Opna myndina í myndskoðara
 shuffle = Stokka
 shuffle-every = Á
 keep-images = Geyma myndir
+match-accent-to-wallpaper = Samræma áherslulit við bakgrunnsmynd
 
 interval-30-minutes = 30 mínútur
 interval-1-hour = 1 klukkustund

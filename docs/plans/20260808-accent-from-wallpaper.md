@@ -453,16 +453,18 @@ Types live in `src/accent.rs`; all colours are `[u8; 3]` (keeps `Eq` on
 - Modify: `i18n/en/cosmic_bing_wallpaper.ftl` and the 72 other
   `i18n/*/cosmic_bing_wallpaper.ftl`
 
-- [ ] add `accent_toggler` row after the shuffle row in `src/view.rs`
+- [x] add `accent_toggler` row after the shuffle row in `src/view.rs`
       (copy the `shuffle_toggler` idiom, `src/view.rs:372`), bound to
-      `Message::SetAccentEnabled`
-- [ ] add the new message id(s) (e.g. `match-accent-to-wallpaper`) to
+      `Message::SetAccentEnabled` (placed after the shuffle *block* — toggler
+      plus its interval row — so the interval dropdown stays attached to
+      shuffle)
+- [x] add the new message id(s) (e.g. `match-accent-to-wallpaper`) to
       `i18n/en/cosmic_bing_wallpaper.ftl`
-- [ ] machine-translate the id(s) into the 72 remaining catalogues (pattern of
+- [x] machine-translate the id(s) into the 72 remaining catalogues (pattern of
       commit `dc38450`) — the guard tests fail on any miss
-- [ ] confirm `every_message_id_is_referenced_by_the_ui` passes (no orphaned
+- [x] confirm `every_message_id_is_referenced_by_the_ui` passes (no orphaned
       ids) and `loader_is_pinned_to_english` still holds
-- [ ] run `just check` - must pass before task 8
+- [x] run `just check` - must pass before task 8
 
 ### Task 8: Verify acceptance criteria
 

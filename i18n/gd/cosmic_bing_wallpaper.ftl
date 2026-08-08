@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = Pàipear-balla Bing an latha
-
 about-this-image = Mun dealbh seo
 bing-wallpaper = Pàipear-balla Bing
 
@@ -17,6 +15,7 @@ tooltip-open-image = Fosgail an dealbh san t-sealladair
 shuffle = Air thuaiream
 shuffle-every = Gach
 keep-images = Cùm dealbhan
+match-accent-to-wallpaper = Maidsich an dath sònraichte ris a' phàipear-balla
 
 interval-30-minutes = 30 mionaid
 interval-1-hour = 1 uair

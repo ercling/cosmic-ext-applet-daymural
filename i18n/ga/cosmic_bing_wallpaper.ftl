@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = Cúlbhrat Bing an lae
-
 about-this-image = Maidir leis an íomhá seo
 bing-wallpaper = Cúlbhrat Bing
 
@@ -17,6 +15,7 @@ tooltip-open-image = Oscail an íomhá san amharcán
 shuffle = Suaitheadh
 shuffle-every = Gach
 keep-images = Coinnigh íomhánna
+match-accent-to-wallpaper = Meaitseáil an t-aiceann leis an gcúlbhrat
 
 interval-30-minutes = 30 nóiméad
 interval-1-hour = 1 uair

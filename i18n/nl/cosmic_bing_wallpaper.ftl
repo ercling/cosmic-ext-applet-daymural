@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = Bing-achtergrond van de dag
-
 about-this-image = Over deze afbeelding
 bing-wallpaper = Bing-achtergrond
 
@@ -17,6 +15,7 @@ tooltip-open-image = Afbeelding openen in viewer
 shuffle = Willekeurig
 shuffle-every = Elke
 keep-images = Afbeeldingen bewaren
+match-accent-to-wallpaper = Accentkleur afstemmen op achtergrond
 
 interval-30-minutes = 30 minuten
 interval-1-hour = 1 uur

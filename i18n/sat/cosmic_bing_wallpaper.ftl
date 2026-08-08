@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = ᱫᱤᱱ ᱨᱮᱭᱟᱜ Bing ᱣᱟᱞᱯᱮᱯᱟᱨ
-
 about-this-image = ᱱᱚᱶᱟ ᱪᱤᱛᱟᱹᱨ ᱵᱟᱵᱚᱛ
 bing-wallpaper = Bing ᱣᱟᱞᱯᱮᱯᱟᱨ
 
@@ -17,6 +15,7 @@ tooltip-open-image = ᱪᱤᱛᱟᱹᱨ ᱧᱮᱞᱤᱡ ᱨᱮ ᱡᱷᱤᱡ ᱢ�
 shuffle = ᱢᱤᱥᱟᱹᱣ
 shuffle-every = ᱡᱚᱛᱚ
 keep-images = ᱪᱤᱛᱟᱹᱨ ᱫᱚᱦᱚᱭ ᱢᱮ
+match-accent-to-wallpaper = ᱣᱟᱞᱯᱮᱯᱟᱨ ᱥᱟᱶ ᱟᱠᱥᱮᱱᱴ ᱢᱮᱲᱟᱣ
 
 interval-30-minutes = 30 ᱴᱤᱯᱤᱡ
 interval-1-hour = 1 ᱴᱟᱲᱟᱝ

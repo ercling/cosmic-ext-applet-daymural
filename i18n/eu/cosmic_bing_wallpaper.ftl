@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = Eguneko Bing horma-papera
-
 about-this-image = Irudi honi buruz
 bing-wallpaper = Bing horma-papera
 
@@ -17,6 +15,7 @@ tooltip-open-image = Ireki irudia ikustailean
 shuffle = Ausaz
 shuffle-every = Maiztasuna
 keep-images = Gorde irudiak
+match-accent-to-wallpaper = Egokitu azentua horma-paperera
 
 interval-30-minutes = 30 minutu
 interval-1-hour = Ordu 1

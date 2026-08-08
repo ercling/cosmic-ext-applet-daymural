@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = Imaginea de fundal Bing a zilei
-
 about-this-image = Despre această imagine
 bing-wallpaper = Imagine de fundal Bing
 
@@ -17,6 +15,7 @@ tooltip-open-image = Deschide imaginea în vizualizator
 shuffle = Amestecare
 shuffle-every = La fiecare
 keep-images = Păstrează imaginile
+match-accent-to-wallpaper = Potrivește accentul cu imaginea de fundal
 
 interval-30-minutes = 30 de minute
 interval-1-hour = 1 oră

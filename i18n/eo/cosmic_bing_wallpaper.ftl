@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = Bing-ekranfono de la tago
-
 about-this-image = Pri ĉi tiu bildo
 bing-wallpaper = Bing-ekranfono
 
@@ -17,6 +15,7 @@ tooltip-open-image = Malfermi la bildon en rigardilo
 shuffle = Miksi
 shuffle-every = Ĉiun
 keep-images = Konservi bildojn
+match-accent-to-wallpaper = Akordigi akcenton kun ekranfono
 
 interval-30-minutes = 30 minutoj
 interval-1-hour = 1 horo

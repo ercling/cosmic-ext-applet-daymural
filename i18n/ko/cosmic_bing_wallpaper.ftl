@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = 오늘의 Bing 배경화면
-
 about-this-image = 이 이미지 정보
 bing-wallpaper = Bing 배경화면
 
@@ -17,6 +15,7 @@ tooltip-open-image = 뷰어에서 이미지 열기
 shuffle = 셔플
 shuffle-every = 간격
 keep-images = 이미지 보관
+match-accent-to-wallpaper = 강조 색을 배경화면에 맞추기
 
 interval-30-minutes = 30분
 interval-1-hour = 1시간

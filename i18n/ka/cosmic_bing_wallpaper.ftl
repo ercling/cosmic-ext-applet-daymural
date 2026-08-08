@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = დღის Bing-ის ფონი
-
 about-this-image = ამ სურათის შესახებ
 bing-wallpaper = Bing-ის ფონი
 
@@ -17,6 +15,7 @@ tooltip-open-image = სურათის გახსნა დამთვა
 shuffle = არევა
 shuffle-every = ყოველ
 keep-images = სურათების შენახვა
+match-accent-to-wallpaper = აქცენტის შეხამება ფონთან
 
 interval-30-minutes = 30 წუთი
 interval-1-hour = 1 საათი

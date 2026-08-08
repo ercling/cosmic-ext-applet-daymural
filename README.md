@@ -28,8 +28,9 @@ from the GNOME extension is picked up as-is — no re-downloads.
 - **Respects your choices** — if you set a different wallpaper in COSMIC
   Settings, the applet keeps downloading but stops auto-applying until you act
   (prev/next/newest/shuffle).
-- **Tooltips** — every icon-only control (panel button, prev/next/newest/refresh,
+- **Tooltips** — every icon-only control in the popup (prev/next/newest/refresh,
   thumbnail) names what it does on hover; unavailable buttons are visibly dimmed.
+  The panel button itself stays silent, like COSMIC's own status applets.
 - **Localized** — the UI follows your desktop language, with catalogues for the
   73 locales COSMIC itself ships (see [Translations](#translations)).
 
@@ -100,18 +101,36 @@ Bing's UHD images are roughly **5 MB each**. Expect about:
   is off at refresh time catches up at next login (same trade-off as the GNOME
   extension). Timers also don't advance during suspend, so a refresh that came
   due while the machine slept fires late after resume rather than immediately.
-- **The login screen keeps its own background.** The *lock* screen follows along:
-  it runs as you and watches cosmic-bg's state file. Every link of that chain was
-  verified live — the applet's config write, cosmic-bg's inotify watch on it, the
-  state file rewritten 42 ms later with the applied path, and cosmic-greeter's own
-  watch on that state file — though the lock screen itself was not photographed.
-  The *login* greeter runs as the
-  unprivileged `cosmic-greeter` user, which cannot traverse a standard
-  `drwxr-x---` home directory to read `~/Pictures/BingWallpaper/*.jpg`, so it
-  falls back to its own default. Nothing the applet can fix — it is the same gap
-  as cosmic-greeter's "TODO: fallback to background config if background state is
-  not set". Loosening the permissions on your home directory would work around
-  it; that trade is yours to make, not ours to ship.
+- **The lock screen usually shows its own default — an upstream cosmic-greeter
+  bug, not something the applet can reach.** The applet writes nothing
+  lock-screen-specific: it writes cosmic-bg's config, cosmic-bg records the
+  applied path in its state file, and cosmic-greeter reads that. Our side of the
+  chain is verified live (config write → cosmic-bg's inotify watch → state file
+  rewritten 42 ms later with the applied path → the locker's own watch on that
+  state file). What breaks is cosmic-greeter 1.5.0's own image cache: every
+  cosmic-bg state write makes the locker clear `surface_images` and rebuild it
+  (`src/locker.rs:1023-1027`), but the rebuild silently skips any surface whose
+  id is no longer in `surface_names` (`src/common.rs:148-150`) — and unlocking
+  removed exactly those ids (`src/locker.rs:1004`, `1133`). Locking re-inserts
+  the names (`src/locker.rs:968`) without rebuilding, so from the second lock
+  onward `view_window` falls back to the bundled `res/background.jpg`
+  (`src/locker.rs:1167-1172`). Consequences: the first lock after login is
+  correct; a lock that is up when a state write lands switches to the real
+  wallpaper mid-lock; every other lock is the default. cosmic-bg rewrites that
+  state file every `rotation_frequency` seconds even for a single-file source
+  (`cosmic-bg/src/wallpaper.rs:320-352`), so on a typical config the window
+  closes within minutes. Nothing here is applet-fixable — upstream needs one
+  `update_wallpapers` call on lock, or to stop dropping the names on unlock:
+  [pop-os/cosmic-greeter#511](https://github.com/pop-os/cosmic-greeter/issues/511),
+  filed from this trace (same symptom as its #460 / #497, which had no
+  reproduction).
+- **The login screen needs cosmic-greeter to *be* your display manager.** It
+  shows your wallpaper only under greetd + `cosmic-greeter.service` with
+  `cosmic-greeter-daemon.service` running: that daemon reads your cosmic-bg
+  state and the image bytes — as you, via `seteuid`, so a standard `drwxr-x---`
+  home is no obstacle — and hands the bytes to the unprivileged greeter over
+  D-Bus. Under any other display manager (GDM, SDDM, …) the login screen keeps
+  its own background and nothing the applet does can reach it.
 - Market is auto-detected, resolution is fixed at UHD, and the download folder
   is fixed at `~/Pictures/BingWallpaper`.
 

@@ -31,6 +31,10 @@ install: build
     install -Dm0644 data/{{appid}}.desktop {{desktop-dst}}
     sed -i 's|^Exec=.*|Exec={{bin-dst}}|' {{desktop-dst}}
     install -Dm0644 data/icons/{{appid}}-symbolic.svg {{icon-dst}}
+    @echo
+    @echo 'Installed. Run `pkill -x cosmic-panel` to load the new binary (cosmic-session'
+    @echo 'restarts the panel and its applets right away), or log out and back in;'
+    @echo 'then add "Bing Wallpaper" in Settings → Desktop → Panel → Configure applets.'
 
 uninstall:
     rm -f {{bin-dst}} {{desktop-dst}} {{icon-dst}}

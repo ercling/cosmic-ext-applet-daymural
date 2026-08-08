@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = Ảnh nền Bing trong ngày
-
 about-this-image = Giới thiệu về ảnh này
 bing-wallpaper = Ảnh nền Bing
 
@@ -17,6 +15,7 @@ tooltip-open-image = Mở ảnh trong trình xem
 shuffle = Xáo trộn
 shuffle-every = Mỗi
 keep-images = Giữ ảnh
+match-accent-to-wallpaper = Đồng bộ màu nhấn với ảnh nền
 
 interval-30-minutes = 30 phút
 interval-1-hour = 1 giờ

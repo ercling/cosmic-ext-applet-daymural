@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = Bing позадина дана
-
 about-this-image = О овој слици
 bing-wallpaper = Bing позадина
 
@@ -17,6 +15,7 @@ tooltip-open-image = Отвори слику у прегледачу
 shuffle = Насумично
 shuffle-every = Сваких
 keep-images = Задржи слике
+match-accent-to-wallpaper = Усклади акценат са позадином
 
 interval-30-minutes = 30 минута
 interval-1-hour = 1 сат

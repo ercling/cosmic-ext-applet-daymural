@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = দিনের Bing ওয়ালপেপার
-
 about-this-image = এই ছবি সম্পর্কে
 bing-wallpaper = Bing ওয়ালপেপার
 
@@ -17,6 +15,7 @@ tooltip-open-image = দর্শকে ছবি খুলুন
 shuffle = এলোমেলো
 shuffle-every = প্রতি
 keep-images = ছবি রাখুন
+match-accent-to-wallpaper = ওয়ালপেপারের সাথে অ্যাকসেন্ট মেলান
 
 interval-30-minutes = 30 মিনিট
 interval-1-hour = 1 ঘণ্টা

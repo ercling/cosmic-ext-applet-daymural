@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = Bing 每日桌布
-
 about-this-image = 關於此圖片
 bing-wallpaper = Bing 桌布
 
@@ -17,6 +15,7 @@ tooltip-open-image = 在檢視器中開啟圖片
 shuffle = 隨機切換
 shuffle-every = 每隔
 keep-images = 保留圖片
+match-accent-to-wallpaper = 強調色配合桌布
 
 interval-30-minutes = 30 分鐘
 interval-1-hour = 1 小時

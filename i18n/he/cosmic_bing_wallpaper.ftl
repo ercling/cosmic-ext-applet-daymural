@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = תמונת הרקע היומית של Bing
-
 about-this-image = על אודות התמונה הזאת
 bing-wallpaper = תמונת רקע של Bing
 
@@ -17,6 +15,7 @@ tooltip-open-image = פתיחת התמונה במציג
 shuffle = ערבוב
 shuffle-every = כל
 keep-images = שמירת תמונות
+match-accent-to-wallpaper = התאמת צבע ההדגשה לתמונת הרקע
 
 interval-30-minutes = 30 דקות
 interval-1-hour = שעה אחת

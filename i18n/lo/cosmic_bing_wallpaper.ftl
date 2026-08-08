@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = ພາບພື້ນຫຼັງ Bing ປະຈຳວັນ
-
 about-this-image = ກ່ຽວກັບຮູບນີ້
 bing-wallpaper = ພາບພື້ນຫຼັງ Bing
 
@@ -17,6 +15,7 @@ tooltip-open-image = ເປີດຮູບໃນຕົວເບິ່ງ
 shuffle = ສຸ່ມ
 shuffle-every = ທຸກ
 keep-images = ເກັບຮູບໄວ້
+match-accent-to-wallpaper = ຈັບຄູ່ສີເນັ້ນກັບພາບພື້ນຫຼັງ
 
 interval-30-minutes = 30 ນາທີ
 interval-1-hour = 1 ຊົ່ວໂມງ

@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = Kunning Bing fon rasmi
-
 about-this-image = Ushbu rasm haqida
 bing-wallpaper = Bing fon rasmi
 
@@ -17,6 +15,7 @@ tooltip-open-image = Rasmni ko'ruvchida ochish
 shuffle = Aralashtirish
 shuffle-every = Har
 keep-images = Rasmlarni saqlash
+match-accent-to-wallpaper = Aksentni fon rasmiga moslashtirish
 
 interval-30-minutes = 30 daqiqa
 interval-1-hour = 1 soat

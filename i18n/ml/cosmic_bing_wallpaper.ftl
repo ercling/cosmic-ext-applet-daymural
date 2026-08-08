@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = ഇന്നത്തെ Bing വാൾപേപ്പർ
-
 about-this-image = ഈ ചിത്രത്തെക്കുറിച്ച്
 bing-wallpaper = Bing വാൾപേപ്പർ
 
@@ -17,6 +15,7 @@ tooltip-open-image = ചിത്രം വ്യൂവറിൽ തുറക്
 shuffle = ഷഫിൾ
 shuffle-every = ഓരോ
 keep-images = ചിത്രങ്ങൾ സൂക്ഷിക്കുക
+match-accent-to-wallpaper = വാൾപേപ്പറിനൊപ്പം ആക്സന്റ് പൊരുത്തപ്പെടുത്തുക
 
 interval-30-minutes = 30 മിനിറ്റ്
 interval-1-hour = 1 മണിക്കൂർ

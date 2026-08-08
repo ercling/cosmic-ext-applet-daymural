@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = Bing-muurpapier van die dag
-
 about-this-image = Meer oor hierdie beeld
 bing-wallpaper = Bing-muurpapier
 
@@ -17,6 +15,7 @@ tooltip-open-image = Open beeld in kyker
 shuffle = Skommel
 shuffle-every = Elke
 keep-images = Hou beelde
+match-accent-to-wallpaper = Pas aksent by muurpapier aan
 
 interval-30-minutes = 30 minute
 interval-1-hour = 1 uur

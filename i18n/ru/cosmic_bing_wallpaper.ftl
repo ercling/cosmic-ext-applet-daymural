@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = Обои дня от Bing
-
 about-this-image = Об этом изображении
 bing-wallpaper = Обои Bing
 
@@ -17,6 +15,7 @@ tooltip-open-image = Открыть изображение в просмотрщ
 shuffle = Перемешивание
 shuffle-every = Интервал
 keep-images = Хранить изображения
+match-accent-to-wallpaper = Подбирать акцент под обои
 
 interval-30-minutes = 30 минут
 interval-1-hour = 1 час

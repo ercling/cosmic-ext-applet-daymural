@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = Bing の今日の壁紙
-
 about-this-image = この画像について
 bing-wallpaper = Bing の壁紙
 
@@ -17,6 +15,7 @@ tooltip-open-image = ビューアーで画像を開く
 shuffle = シャッフル
 shuffle-every = 間隔
 keep-images = 画像の保持
+match-accent-to-wallpaper = アクセントカラーを壁紙に合わせる
 
 interval-30-minutes = 30 分
 interval-1-hour = 1 時間

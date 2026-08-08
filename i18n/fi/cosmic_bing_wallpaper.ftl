@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = Päivän Bing-taustakuva
-
 about-this-image = Tietoja tästä kuvasta
 bing-wallpaper = Bing-taustakuva
 
@@ -17,6 +15,7 @@ tooltip-open-image = Avaa kuva katselimessa
 shuffle = Sekoita
 shuffle-every = Joka
 keep-images = Säilytä kuvia
+match-accent-to-wallpaper = Sovita korostusväri taustakuvaan
 
 interval-30-minutes = 30 minuuttia
 interval-1-hour = 1 tunti

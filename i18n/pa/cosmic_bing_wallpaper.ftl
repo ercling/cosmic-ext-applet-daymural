@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = ਦਿਨ ਦਾ Bing ਵਾਲਪੇਪਰ
-
 about-this-image = ਇਸ ਤਸਵੀਰ ਬਾਰੇ
 bing-wallpaper = Bing ਵਾਲਪੇਪਰ
 
@@ -17,6 +15,7 @@ tooltip-open-image = ਦਰਸ਼ਕ ਵਿੱਚ ਤਸਵੀਰ ਖੋਲ੍�
 shuffle = ਬਦਲਵੀਂ ਤਰਤੀਬ
 shuffle-every = ਹਰ
 keep-images = ਤਸਵੀਰਾਂ ਰੱਖੋ
+match-accent-to-wallpaper = ਵਾਲਪੇਪਰ ਨਾਲ ਐਕਸੈਂਟ ਮਿਲਾਓ
 
 interval-30-minutes = 30 ਮਿੰਟ
 interval-1-hour = 1 ਘੰਟਾ

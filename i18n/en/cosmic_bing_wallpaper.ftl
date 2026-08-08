@@ -2,18 +2,13 @@
 # `fl!` macro, which fails the *compile* if an id is missing here — so this
 # file is the authoritative inventory.
 
-## Panel
-
-# Hover tooltip on the panel button.
-panel-tooltip = Bing Wallpaper of the Day
-
 ## Popup
 
 # Opens Bing's own page about the displayed image in the browser.
 about-this-image = About this image
 # Heading fallback for images that carry no title yet (folder-scan rebuilds).
-# English spells it as the product name (same casing as `panel-tooltip` and the
-# desktop entry's `Name=`); translations may use a descriptive phrase instead.
+# English spells it as the product name (same casing as the desktop entry's
+# `Name=`); translations may use a descriptive phrase instead.
 bing-wallpaper = Bing Wallpaper
 
 ## Tooltips on the icon-only controls
@@ -32,6 +27,9 @@ shuffle = Shuffle
 shuffle-every = Every
 # Precedes the retention dropdown, reading "Keep images  8 days".
 keep-images = Keep images
+# Label of the opt-in "derive the COSMIC accent colour from the current
+# wallpaper" toggle; switching it off restores the previous accent.
+match-accent-to-wallpaper = Match accent to wallpaper
 
 ## Shuffle interval dropdown
 

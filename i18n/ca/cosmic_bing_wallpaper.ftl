@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = Fons de pantalla de Bing del dia
-
 about-this-image = Quant a aquesta imatge
 bing-wallpaper = Fons de pantalla de Bing
 
@@ -17,6 +15,7 @@ tooltip-open-image = Obre la imatge al visualitzador
 shuffle = Aleatori
 shuffle-every = Cada
 keep-images = Conserva les imatges
+match-accent-to-wallpaper = Ajusta l'accent al fons
 
 interval-30-minutes = 30 minuts
 interval-1-hour = 1 hora

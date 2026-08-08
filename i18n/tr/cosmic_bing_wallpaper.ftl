@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = Günün Bing duvar kâğıdı
-
 about-this-image = Bu görsel hakkında
 bing-wallpaper = Bing duvar kâğıdı
 
@@ -17,6 +15,7 @@ tooltip-open-image = Görseli görüntüleyicide aç
 shuffle = Karıştır
 shuffle-every = Her
 keep-images = Görselleri sakla
+match-accent-to-wallpaper = Vurgu rengini duvar kâğıdıyla eşleştir
 
 interval-30-minutes = 30 dakika
 interval-1-hour = 1 saat

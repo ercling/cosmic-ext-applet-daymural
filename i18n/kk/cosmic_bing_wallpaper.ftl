@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = Күннің Bing тұсқағазы
-
 about-this-image = Осы сурет туралы
 bing-wallpaper = Bing тұсқағазы
 
@@ -17,6 +15,7 @@ tooltip-open-image = Суретті көрсеткіште ашу
 shuffle = Араластыру
 shuffle-every = Әр
 keep-images = Суреттерді сақтау
+match-accent-to-wallpaper = Акцентті тұсқағазға сәйкестендіру
 
 interval-30-minutes = 30 минут
 interval-1-hour = 1 сағат

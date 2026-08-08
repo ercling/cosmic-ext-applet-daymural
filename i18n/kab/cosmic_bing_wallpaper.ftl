@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = Ugdil n wass n Bing
-
 about-this-image = Ɣef tugna-a
 bing-wallpaper = Ugdil n Bing
 
@@ -17,6 +15,7 @@ tooltip-open-image = Ldi tugna deg umeskan
 shuffle = Asexleḍ
 shuffle-every = Yal
 keep-images = Eǧǧ tugniwin
+match-accent-to-wallpaper = Semṣada ini n usenṭeḍ d ugdil
 
 interval-30-minutes = 30 n tesdatin
 interval-1-hour = 1 n usrag

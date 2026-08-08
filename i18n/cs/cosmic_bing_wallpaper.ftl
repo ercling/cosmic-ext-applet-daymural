@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = Tapeta dne od Bingu
-
 about-this-image = O tomto obrázku
 bing-wallpaper = Tapeta Bing
 
@@ -17,6 +15,7 @@ tooltip-open-image = Otevřít obrázek v prohlížeči
 shuffle = Náhodné střídání
 shuffle-every = Každých
 keep-images = Uchovávat obrázky
+match-accent-to-wallpaper = Sladit akcent s tapetou
 
 interval-30-minutes = 30 minut
 interval-1-hour = 1 hodina

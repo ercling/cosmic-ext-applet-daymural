@@ -3,8 +3,6 @@
 # as it appears in `en`; the locale guard test compares them per message.
 
 
-panel-tooltip = ናይ መዓልቲ Bing መንደቕ ስእሊ
-
 about-this-image = ብዛዕባ እዚ ስእሊ
 bing-wallpaper = Bing መንደቕ ስእሊ
 
@@ -17,6 +15,7 @@ tooltip-open-image = ስእሊ ብመርኣዪ ክፈት
 shuffle = ምሕዋስ
 shuffle-every = ኩሉ
 keep-images = ስእልታት ኣቐምጥ
+match-accent-to-wallpaper = ኣክሰንት ምስ ስእሊ ኣሰማምዕ
 
 interval-30-minutes = 30 ደቓይቕ
 interval-1-hour = 1 ሰዓት
