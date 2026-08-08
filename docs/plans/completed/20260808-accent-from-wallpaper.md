@@ -11,7 +11,7 @@ restoring the user's previous accent exactly when switched off.
   this applet already knows every wallpaper change, so it is the natural stopgap.
 - The colour must stay legible: cosmic-theme protects accent *text* but not
   accent *fills* — a mid-luminance free colour is the documented failure case
-  (see `docs/plans/20260808-accent-from-wallpaper-notes.md` §4).
+  (see `docs/plans/completed/20260808-accent-from-wallpaper-notes.md` §4).
 - Must be cheap to retire once COSMIC ships it natively: off by default,
   reversible (snapshot/restore), self-contained in one new module, and writing
   **only the `accent` key** of the user's builder config (never pinning other
@@ -54,7 +54,7 @@ we drop: full-image decode (we use the 480×270 thumbnail), the subprocess
 ## Context (from discovery)
 
 - Notes file with the legibility analysis, reversibility rules and testability
-  notes: `docs/plans/20260808-accent-from-wallpaper-notes.md`. ⚠️ Its §2 write
+  notes: `docs/plans/completed/20260808-accent-from-wallpaper-notes.md`. ⚠️ Its §2 write
   recipe is superseded by "Theme write" below (plan review 2026-08-08 found the
   whole-entry `write_entry` on the builder unsafe — palette flip + key pinning).
 - `src/app.rs:563` `on_apply_success` — the choke point for the three
@@ -543,7 +543,7 @@ Types live in `src/accent.rs`; all colours are `[u8; 3]` (keeps `Eq` on
 **Files:**
 - Modify: `README.md`
 - Modify: `CLAUDE.md`
-- Modify: `docs/plans/20260808-accent-from-wallpaper-notes.md`
+- Modify: `docs/plans/completed/20260808-accent-from-wallpaper-notes.md`
 - Move: this plan and the notes file → `docs/plans/completed/`
 
 - [x] update README.md (feature blurb, off-by-default note, and: turn the
@@ -556,8 +556,8 @@ Types live in `src/accent.rs`; all colours are `[u8; 3]` (keeps `Eq` on
       mark it in place the way the lock-screen corrections were; also
       reconciled §1's stale `v1/` path observation with the `#[version = 2]`
       fact)
-- [x] move this plan and the notes file to `docs/plans/completed/` (move
-      deferred to orchestration completion)
+- [x] move this plan and the notes file to `docs/plans/completed/` (done at
+      finalize, matching the previous plan's archival)
 
 ## Post-Completion
 
