@@ -578,14 +578,40 @@ the image edge.
 
 Criteria reference tasks, not the Overview's item numbers:
 
-- [ ] Task 1: lock-screen behavior resolved per its recorded branch (fix verified live, or README limitation documented with upstream link, or does-not-reproduce recorded)
-- [ ] Task 2: regression coverage confirmed (or gap test added)
-- [ ] Task 3: every icon-only control — prev, next, newest, refresh, thumbnail, panel button — has a descriptive tooltip
-- [ ] Task 4: disabled buttons visually distinct in the panel (all four disabled cases checked)
-- [ ] Tasks 5–6: 73 locale dirs present, guard test green, applet launches localized under `LANG=uk_UA.UTF-8` (spot check)
-- [ ] Task 7: popup visually consistent with first-party applet popups
-- [ ] run full suite: `just check`
-- [ ] `just install` and verify the applet in the panel (popup opens, tooltips show, no clipping)
+- [x] Task 1: lock-screen behavior resolved per its recorded branch (fix verified live, or README limitation documented with upstream link, or does-not-reproduce recorded) — **branch D recorded** (all four chain links observed live, no code change); the login-greeter permission limitation is queued for README in Task 9
+- [x] Task 2: regression coverage confirmed (or gap test added) — both named tests green, plus the added `pipeline_backfills_thumbnails_outside_the_fetch_window` (`src/app.rs:1237`)
+- [x] Task 3: every icon-only control — prev, next, newest, refresh, thumbnail, panel button — has a descriptive tooltip — all six confirmed in source (`view.rs:319/348/354/360/419` via `popup_tooltip`, `app.rs:842` for the panel)
+- [x] Task 4: disabled buttons visually distinct in the panel (all four disabled cases checked) — **[x] manual test (skipped — GUI-only, not automatable)**; verified structurally instead: all four buttons (prev/next/newest *and* refresh, which routes through `refresh_button` → `nav_button`, `view.rs:415-422`) share the single `icon_opacity(on_press.is_some())` call at `view.rs:440`, so there is no per-button case that can miss the dimming
+- [x] Tasks 5–6: 73 locale dirs present, guard test green, applet launches localized under `LANG=uk_UA.UTF-8` (spot check) — 73 dirs, all three `localize::tests` guards green, and the release binary ran a full 3 s under `LANG=LC_MESSAGES=uk_UA.UTF-8` without crashing or logging `localize`'s "falling back to English" warning (see findings)
+- [x] Task 7: popup visually consistent with first-party applet popups — **[x] manual test (skipped — GUI-only, not automatable)**; every changed value was derived from cosmic-applet-tiling's source rather than eyeballing (Task 7 findings), which is the check the side-by-side would approximate
+- [x] run full suite: `just check` — 139 tests pass, `cargo fmt --check` and `clippy -D warnings` clean
+- [x] `just install` and verify the applet in the panel (popup opens, tooltips show, no clipping) — `just install` run, all three artifacts in place under `~/.local`; **[x] in-panel visual verification (skipped — GUI-only, not automatable)**, retained under Post-Completion
+
+➕ **Findings (2026-08-08) — acceptance verification**
+
+- `just check`: 139 passed, 0 failed; fmt and clippy clean.
+- Locales: `ls i18n | wc -l` → 73, and `every_cosmic_locale_ships_a_catalogue` /
+  `every_locale_defines_and_renders_every_english_message` /
+  `every_locale_preserves_the_english_placeables` all pass.
+- `just install`: binary → `~/.local/bin/cosmic-bing-wallpaper`, desktop entry
+  (with `Exec=` rewritten to the absolute path) and symbolic icon installed.
+
+[decision] The `LANG=uk_UA.UTF-8` spot check was run headlessly instead of by
+eye. The release binary was launched against the live wayland socket but with
+`HOME` and all four `XDG_*_HOME` vars redirected into a scratch dir, so it could
+touch no real config, state or wallpaper, and killed at 3 s — inside the ~5 s
+cold-start fetch delay, so it also made no network request. It exited 143
+(SIGTERM from `timeout`), i.e. it was still alive at 3 s rather than having died
+during startup, and `RUST_LOG=cosmic_bing_wallpaper=debug` printed nothing —
+notably not `localize`'s `"falling back to English: could not load desktop
+languages"` warning (`src/localize.rs:67`), which is the observable failure mode
+for locale selection. Combined with the guard tests proving the `uk` catalogue
+loads and renders every id, that covers "launches localized" without a GUI.
+
+[deviation] Four of the eight criteria are GUI-only and were marked skipped per
+the standing rule; none of them gates code. Each is already listed under
+Post-Completion for the user's own smoke test, and each was replaced above with
+the strongest structural evidence available.
 
 ### Task 9: [Final] Update documentation and desktop entry
 
