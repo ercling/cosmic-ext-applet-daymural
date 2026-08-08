@@ -619,10 +619,50 @@ the strongest structural evidence available.
 - Modify: `README.md`, `CLAUDE.md`
 - Modify: `data/io.github.ercling.CosmicBingWallpaper.desktop`
 
-- [ ] add `Comment[<locale>]=` translations to the `.desktop` file for the major locales (de es fr it ja ko pl pt-BR ru uk zh-CN zh-TW); `Name=` stays untranslated (product name)
-- [ ] update `README.md`: tooltips + localized UI in features; lock-screen outcome (fix or known limitation); mention that the 72 non-English locales are machine-generated and native-speaker review is welcome
-- [ ] update `CLAUDE.md`: i18n conventions (fluent domain, `fl!`, `en`-pinned test loader, locale guard test, "all user-facing strings go through FTL"), the `applet_tooltip` idiom (extends the existing `popup_dropdown` UI convention), and the Task-4 disabled-styling gotcha if one was found
-- [ ] move this plan to `docs/plans/completed/`
+- [x] add `Comment[<locale>]=` translations to the `.desktop` file for the major locales (de es fr it ja ko pl pt-BR ru uk zh-CN zh-TW); `Name=` stays untranslated (product name) — 12 lines added, POSIX locale tags (`pt_BR`/`zh_CN`/`zh_TW`), `desktop-file-validate` clean
+- [x] update `README.md`: tooltips + localized UI in features; lock-screen outcome (fix or known limitation); mention that the 72 non-English locales are machine-generated and native-speaker review is welcome
+- [x] update `CLAUDE.md`: i18n conventions (fluent domain, `fl!`, `en`-pinned test loader, locale guard test, "all user-facing strings go through FTL"), the `applet_tooltip` idiom (extends the existing `popup_dropdown` UI convention), and the Task-4 disabled-styling gotcha if one was found
+- [x] move this plan to `docs/plans/completed/` — (performed by the exec orchestrator at completion)
+
+➕ **Notes (2026-08-08)**
+
+- `.desktop`: the desktop-entry spec uses POSIX locale tags, so the keys are
+  `Comment[pt_BR]`/`[zh_CN]`/`[zh_TW]`, **not** the BCP-47 directory names used
+  under `i18n/`. A comment in the file records that, plus why `Comment` is
+  translated there rather than in Fluent (the launcher reads the file without
+  running us) and that `Name` is a product name. Validated with
+  `desktop-file-validate` — exit 0, only the pre-existing `Categories=COSMIC;`
+  hint.
+- `README.md`: two new feature bullets (tooltips + dimmed disabled buttons;
+  localized UI), a new **Translations** section (machine-generated caveat, how to
+  contribute a fix, the two invariants the guard tests enforce — keep every `en`
+  id, keep each message's placeables — and the English-month-abbreviation date
+  limitation), and a new limitation covering the Task-1 outcome: the *lock*
+  screen follows along (verified live), the *login* greeter cannot, because uid
+  `cosmic-greeter` cannot traverse a `drwxr-x---` home to reach
+  `~/Pictures/BingWallpaper`.
+- `CLAUDE.md`: `src/localize.rs` added to the architecture list; the single-line
+  "UI convention" note grew into a **UI conventions** section stating the
+  underlying rule (anything rendering outside its parent's bounds must be a real
+  wayland popup, never an iced overlay) with dropdowns and tooltips as its two
+  instances, plus the disabled-icon gotcha (theme styling is a no-op for
+  `Button::Icon`; use `icon_opacity`, and don't reach for
+  `.class(theme::Button::Icon)`); and a new **i18n** section.
+
+[decision] No upstream issue filed. Task 1 landed on branch D (nothing broken)
+and the login-greeter finding is a local file-permission consequence of a
+standard `drwxr-x---` home, not a cosmic-greeter defect — cosmic-greeter's own
+`daemon/src/lib.rs:197` TODO already tracks the config-fallback gap. The README
+states the workaround (loosen home permissions) and declines to recommend it.
+
+[decision] Docs-only task, so no new tests. Validation is `just check` (139
+tests, fmt, clippy — unchanged, since no code changed) plus
+`desktop-file-validate` on the edited desktop entry.
+
+[deviation] The "Design decisions … live in `docs/plans/`" paragraph in
+`CLAUDE.md` moved up to close the Architecture section (the new `##` headings
+would otherwise have orphaned it under **i18n**) and now names both plan files
+and records the lock-screen chain as a verified fact.
 
 ## Post-Completion
 

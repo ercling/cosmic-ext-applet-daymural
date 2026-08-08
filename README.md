@@ -28,6 +28,10 @@ from the GNOME extension is picked up as-is — no re-downloads.
 - **Respects your choices** — if you set a different wallpaper in COSMIC
   Settings, the applet keeps downloading but stops auto-applying until you act
   (prev/next/newest/shuffle).
+- **Tooltips** — every icon-only control (panel button, prev/next/newest/refresh,
+  thumbnail) names what it does on hover; unavailable buttons are visibly dimmed.
+- **Localized** — the UI follows your desktop language, with catalogues for the
+  73 locales COSMIC itself ships (see [Translations](#translations)).
 
 ## Build & install
 
@@ -96,8 +100,33 @@ Bing's UHD images are roughly **5 MB each**. Expect about:
   is off at refresh time catches up at next login (same trade-off as the GNOME
   extension). Timers also don't advance during suspend, so a refresh that came
   due while the machine slept fires late after resume rather than immediately.
+- **The login screen keeps its own background.** The *lock* screen follows along
+  (it runs as you, watches cosmic-bg's state file, and picks up an applet-applied
+  wallpaper within milliseconds — verified live). The *login* greeter runs as the
+  unprivileged `cosmic-greeter` user, which cannot traverse a standard
+  `drwxr-x---` home directory to read `~/Pictures/BingWallpaper/*.jpg`, so it
+  falls back to its own default. Nothing the applet can fix — it is the same gap
+  as cosmic-greeter's "TODO: fallback to background config if background state is
+  not set". Loosening the permissions on your home directory would work around
+  it; that trade is yours to make, not ours to ship.
 - Market is auto-detected, resolution is fixed at UHD, and the download folder
   is fixed at `~/Pictures/BingWallpaper`.
+
+## Translations
+
+Strings live in Fluent catalogues under `i18n/<locale>/cosmic_bing_wallpaper.ftl`,
+embedded into the binary at build time — there are no runtime data files to
+install. All 73 locales COSMIC ships are present, plus `Comment[…]` lines in the
+desktop entry for the dozen largest.
+
+**Only `en` is human-written.** The other 72 catalogues (and the desktop-entry
+comments) are machine-generated; a handful were spot-checked, the rest were not.
+Native-speaker corrections are the most useful contribution this project can
+get — edit your locale's `.ftl` and open a PR. Two rules keep the guard tests
+green: keep every message id from `i18n/en/…`, and keep each message's `{ $time }`
+/ `{ $date }` placeables (reordering them within the sentence is fine and
+expected). Dates themselves are formatted as English month abbreviations
+("Aug 5") in every locale — only the sentence frame around them is translated.
 
 ## Development
 

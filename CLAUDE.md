@@ -46,7 +46,10 @@ the panel runs. Both git deps (libcosmic, cosmic-bg-config) are **rev-pinned** i
 `Cargo.toml` with `Cargo.lock` committed; libcosmic APIs move fast, verify against
 the pinned rev before coding against remembered names.
 
-- `src/main.rs` — entry point: `cosmic::applet::run::<Window>(())`.
+- `src/main.rs` — entry point: `localize()` then `cosmic::applet::run::<Window>(())`.
+- `src/localize.rs` — Fluent i18n: `rust-embed`ded `i18n/<locale>/cosmic_bing_wallpaper.ftl`,
+  the `LANGUAGE_LOADER` `LazyLock`, the crate's own `fl!` macro, `localize()`,
+  and the locale guard tests. See "i18n" below.
 - `src/app.rs` — the `cosmic::Application` impl (`Window`): message loop, popup
   open/close, startup restore (catalogue + config, no network), the refresh
   pipeline split in two: `run_refresh`/`fetch_and_download` (async, off the UI
@@ -92,17 +95,67 @@ the pinned rev before coding against remembered names.
   in-memory JPEG factory; all network branches are tested hermetically, nothing
   ever reaches the real Bing.
 
-UI convention: dropdowns inside the applet popup must use
-`widget::dropdown::popup_dropdown(..)` with the `Message::Surface(cosmic::surface::Action)`
-forwarder (see the interval/retention rows in `view.rs`) — a plain `dropdown`
-renders its menu as an overlay clipped to the popup surface.
-
 Design decisions, live-verified Bing/cosmic-bg facts, and per-task
-implementation notes live in `docs/plans/` (see
-`20260807-cosmic-bing-wallpaper-applet.md` — in `docs/plans/` or, once
-archived, `docs/plans/completed/`). Gotchas recorded there worth
-knowing: the `zune-jpeg` `log`-feature workaround in `Cargo.toml`, and the
-transitive `cosmic-config` pin living only in `Cargo.lock`.
+implementation notes live in `docs/plans/` (`20260807-cosmic-bing-wallpaper-applet.md`
+for the applet itself, `20260808-ux-polish-lockscreen-i18n.md` for tooltips /
+disabled styling / i18n / theme conformance — each in `docs/plans/` or, once
+archived, `docs/plans/completed/`). Gotchas recorded there worth knowing: the
+`zune-jpeg` `log`-feature workaround in `Cargo.toml`, the transitive
+`cosmic-config` pin living only in `Cargo.lock`, and the live-verified
+lock-screen propagation chain (applet → cosmic-bg config → cosmic-bg state →
+greeter state-watch — intact; only the *login* greeter can't read `~/Pictures`,
+a uid/permissions gap, not an applet bug).
+
+## UI conventions
+
+Anything that renders *outside* its parent's bounds must be a real wayland
+popup, never an iced overlay — an overlay is clipped to the applet popup
+surface. Two cases, same rule:
+
+- **Dropdowns** use `widget::dropdown::popup_dropdown(..)` with the
+  `Message::Surface(cosmic::surface::Action)` forwarder (see the
+  interval/retention rows in `view.rs`).
+- **Tooltips** use `Core::applet_tooltip(..)`, not `widget::tooltip`. Inside the
+  popup go through `view::popup_tooltip(window, content, text)`, which pins the
+  two non-obvious arguments: `has_popup: false` (the tooltip surface is only
+  created when that is `false`) and `parent_id: window.popup` (parent to the
+  popup, not the panel). The panel button in `app.rs` is the mirror image:
+  `has_popup: self.popup.is_some()` (suppressed while the popup is open) and
+  `parent_id: None`.
+
+Disabled icon buttons: the theme's own disabled styling is a **no-op** for
+`Button::Icon` — `on_disabled` differs from `on` in alpha only, and the SVG
+rasteriser tints RGB while keeping source alpha; the background it half-fades
+is already fully transparent. Dim explicitly instead:
+`icon::from_name(..).icon().opacity(icon_opacity(enabled))` in `view.rs`
+(`nav_button` open-codes what `button::icon` builds, since that constructor
+exposes no path to the inner `Icon`). Don't "fix" this with
+`.class(theme::Button::Icon)` — it is already set.
+
+## i18n
+
+Every user-visible string goes through the crate's `fl!` macro; none are
+written inline. Ids live in `i18n/en/cosmic_bing_wallpaper.ftl` (the fluent
+domain is the crate name) and `i18n-embed-fl` resolves them **at compile time**,
+so a typo or a missing id is a build error. `i18n/` holds all 73 locales COSMIC
+ships; the 72 non-English ones are machine-generated. Notes:
+
+- `localize()` (the only `DesktopLanguageRequester` caller) is reachable from
+  `main` alone — the crate's `fl!` deliberately does *not* call it, unlike
+  libcosmic's copy. That is what pins the test binary to `en`, so tests keep
+  asserting literal English strings; keep it that way (`loader_is_pinned_to_english`).
+- The loader sets `set_use_isolating(false)` — otherwise every placeable comes
+  back wrapped in U+2068/U+2069.
+- Localized label arrays must be functions returning `Vec<String>`
+  (`shuffle_interval_labels`/`retention_labels`), never consts or `LazyLock` —
+  a static would freeze the labels before the language is selected.
+- Adding a locale means adding a directory *and* bumping `COSMIC_LOCALES` in
+  `localize.rs`; the three guard tests there assert the dir count, that every
+  locale defines exactly `en`'s ids (catching both missing keys and broken
+  fluent syntax, which fluent otherwise only logs), and that every message keeps
+  `en`'s `$variable` set.
+- `data/…desktop`'s `Comment[<locale>]=` lines are separate from Fluent
+  (desktop-entry spec, POSIX locale tags); `Name=` stays untranslated.
 
 ## examples/bing-wallpaper-gnome-extension
 

@@ -1,6 +1,23 @@
 [Desktop Entry]
+# `Name` is the product name and stays untranslated. `Comment` is translated
+# here rather than in `i18n/` — the desktop-entry spec has its own
+# `Key[locale]` mechanism and the launcher reads this file without running us.
+# Locale tags are POSIX-style (`pt_BR`), not the BCP-47 tags used under `i18n/`.
+# Machine-generated, like the Fluent catalogues; corrections welcome.
 Name=Bing Wallpaper
 Comment=Bing's image of the day as your COSMIC wallpaper
+Comment[de]=Bings Bild des Tages als COSMIC-Hintergrundbild
+Comment[es]=La imagen del día de Bing como fondo de pantalla de COSMIC
+Comment[fr]=L'image du jour de Bing comme fond d'écran COSMIC
+Comment[it]=L'immagine del giorno di Bing come sfondo di COSMIC
+Comment[ja]=Bing の今日の画像を COSMIC の壁紙に
+Comment[ko]=Bing의 오늘의 이미지를 COSMIC 배경 화면으로
+Comment[pl]=Obraz dnia Bing jako tapeta COSMIC
+Comment[pt_BR]=A imagem do dia do Bing como papel de parede do COSMIC
+Comment[ru]=Изображение дня Bing в качестве обоев COSMIC
+Comment[uk]=Зображення дня Bing як фонове зображення COSMIC
+Comment[zh_CN]=将 Bing 每日图片设为 COSMIC 壁纸
+Comment[zh_TW]=將 Bing 每日圖片設為 COSMIC 桌布
 Type=Application
 # Rewritten to the absolute install path by `just install` — cosmic-panel's
 # environment may not have the install bindir (e.g. ~/.local/bin) in PATH.
