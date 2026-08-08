@@ -23,6 +23,10 @@ use crate::thumbs;
 /// Height of the placeholder box shown when a thumbnail is missing
 /// (e.g. entries rebuilt from a folder scan that never went through a
 /// fetch). The UI must never decode the full UHD file to fill this.
+///
+/// Deliberately not a spacing token: the `Spacing` scale describes paddings
+/// and gaps, not content dimensions, and first-party applets size their own
+/// content areas with plain numbers too.
 const PLACEHOLDER_HEIGHT: f32 = 160.0;
 
 /// Shuffle interval choices, index-aligned with
@@ -251,13 +255,13 @@ pub fn popup_view(window: &Window) -> Element<'_, Message> {
         }
         content = content
             .push(padded_control(controls(window)).align_x(Alignment::Center))
-            .push(padded_control(widget::divider::horizontal::default()))
+            .push(divider())
             .push(padded_control(shuffle_toggler(window)));
         if window.config.shuffle_enabled {
             content = content.push(padded_control(interval_row(window)));
         }
         content = content
-            .push(padded_control(widget::divider::horizontal::default()))
+            .push(divider())
             .push(padded_control(retention_row(window)));
     } else {
         // Empty catalogue: everything except the status footer is gone;
@@ -265,11 +269,25 @@ pub fn popup_view(window: &Window) -> Element<'_, Message> {
         // hand once the network is back.
         content = content
             .push(padded_control(refresh_button(window)).align_x(Alignment::Center))
-            .push(padded_control(widget::divider::horizontal::default()));
+            .push(divider());
     }
 
     content = content.push(padded_control(widget::text::caption(status_line(window))));
     window.core.applet.popup_container(content).into()
+}
+
+/// A separator between popup sections.
+///
+/// `padded_control` alone would inset it by `menu_control_padding()`
+/// (`[space_xxs, space_m]`); every first-party applet overrides the
+/// horizontal inset to `space_s` so the rule reaches closer to the popup
+/// edge than the controls do (cosmic-applet-tiling `window.rs`, all four
+/// dividers). Matching that is the whole point of the override.
+fn divider<'a>() -> Element<'a, Message> {
+    let space = cosmic::theme::spacing();
+    padded_control(widget::divider::horizontal::default())
+        .padding([space.space_xxs, space.space_s])
+        .into()
 }
 
 /// Clickable thumbnail of the displayed wallpaper (cached 480×270 — the UI
@@ -278,7 +296,13 @@ pub fn popup_view(window: &Window) -> Element<'_, Message> {
 fn thumbnail<'a>(window: &'a Window, entry: &'a ImageEntry) -> Element<'a, Message> {
     let thumb = thumbs::thumbnail_path(&entry.filename, app::state_dir());
     let inner: Element<'_, Message> = if thumb.is_file() {
+        // `theme::Button::Image` rounds the button's border to
+        // `corner_radii.radius_s`, but nothing rounds the image inside it —
+        // libcosmic's own `button::image` rounds the handle itself (with a
+        // hardcoded `[9.0; 4]`; the token is the same corner, and follows the
+        // user's corner-radius setting).
         widget::image(widget::image::Handle::from_path(thumb))
+            .border_radius(cosmic::theme::active().cosmic().corner_radii.radius_s)
             .width(Length::Fill)
             .into()
     } else {
@@ -297,8 +321,11 @@ fn thumbnail<'a>(window: &'a Window, entry: &'a ImageEntry) -> Element<'a, Messa
 
 /// Title heading + dimmed copyright caption.
 fn header(entry: &ImageEntry) -> Element<'_, Message> {
+    // `space_xxxs` is the stock label-column spacing (cosmic-applet-tiling's
+    // "new workspace" column); the previous hardcoded `2` matched no token.
+    let space = cosmic::theme::spacing();
     let mut column = widget::Column::new()
-        .spacing(2)
+        .spacing(space.space_xxxs)
         .push(widget::text::title4(display_title(entry)));
     if !entry.copyright.is_empty() {
         column = column.push(widget::text::caption(entry.copyright.as_str()));

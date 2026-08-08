@@ -503,12 +503,76 @@ native-speaker review (README, Task 9).
 **Files:**
 - Modify: `src/view.rs`
 
-- [ ] audit the popup against cosmic-applet-tiling's `view_window` (reference findings in Technical Details): divider padding, popup column padding, spacing tokens (`space_xxxs`/`space_xxs`/`space_s` from the theme), `padded_control`/`menu_button` usage, toggler row shape (`.text_size(14).width(Fill)`)
-- [ ] apply the known gap: dividers become `padded_control(divider::horizontal::default()).padding([space_xxs, space_s])`
-- [ ] check the remaining surface for non-token hardcoded values (e.g. `PLACEHOLDER_HEIGHT`, thumbnail corner treatment under `theme::Button::Image`, control-row spacing `space_s`) and align anything that deviates from stock applet look; record each change (or "already conformant") here
-- [ ] verify side by side in the panel against a first-party applet popup (tiling or audio): margins, divider insets, corner radii
-- [ ] tests: view-code exempt (pure layout; no logic changes)
-- [ ] run `just check` — must pass before task 8
+- [x] audit the popup against cosmic-applet-tiling's `view_window` (reference findings in Technical Details): divider padding, popup column padding, spacing tokens (`space_xxxs`/`space_xxs`/`space_s` from the theme), `padded_control`/`menu_button` usage, toggler row shape (`.text_size(14).width(Fill)`)
+- [x] apply the known gap: dividers become `padded_control(divider::horizontal::default()).padding([space_xxs, space_s])`
+- [x] check the remaining surface for non-token hardcoded values (e.g. `PLACEHOLDER_HEIGHT`, thumbnail corner treatment under `theme::Button::Image`, control-row spacing `space_s`) and align anything that deviates from stock applet look; record each change (or "already conformant") here — three deviations found and fixed, everything else conformant (see findings)
+- [x] verify side by side in the panel against a first-party applet popup (tiling or audio): margins, divider insets, corner radii — **[x] manual test (skipped — GUI-only, not automatable, no interactive wayland session); every value changed was derived from the first-party source rather than from eyeballing, and Task 8 re-checks the popup after `just install`**
+- [x] tests: view-code exempt (pure layout; no logic changes)
+- [x] run `just check` — must pass before task 8 (139 tests pass, fmt + clippy clean)
+
+➕ **Findings (2026-08-08) — three deviations, five confirmations**
+
+Audited against cosmic-applet-tiling `src/window.rs:253-317` and the widget
+constructors it leans on (libcosmic rev `8a017a1`). Reference token values at
+standard density: `space_xxxs` 4, `space_xxs` 8, `space_xs` 12, `space_s` 16,
+`space_m` 24 (`cosmic-theme/src/model/spacing.rs`).
+
+**Changed:**
+
+1. **Divider insets** (the known gap). `padded_control` pads with
+   `menu_control_padding()` = `[space_xxs, space_m]` = `[8, 24]`
+   (`src/applet/mod.rs:614-626`), but all four of tiling's dividers override to
+   `[space_xxs, space_s]` = `[8, 16]`, so a stock divider reaches 8 px closer to
+   each popup edge than the controls do. Ours were plain `padded_control` →
+   inset with the controls, reading as a short rule. Extracted as
+   `view::divider()` (three call sites) with the override applied.
+2. **Thumbnail corners.** `theme::Button::Image` rounds *the button's* border to
+   `corner_radii.radius_s` (`theme/style/button.rs:98-114`) but nothing rounds
+   the image inside it; libcosmic's own `button::image` rounds the handle
+   itself (`widget/button/image.rs:18`, hardcoded `[9.0; 4]`). Our
+   `custom_image_button` path skipped that, so a square-cornered thumbnail sat
+   inside a rounded hover/focus ring. Now
+   `.border_radius(theme::active().cosmic().corner_radii.radius_s)`.
+3. **Header column spacing.** `.spacing(2)` matched no token; tiling's label
+   column uses `.spacing(space_xxxs)` (= 4). Switched to the token.
+
+**Already conformant (no change):**
+
+4. **Popup column padding.** Ours is `[space_xxs, 0]`; tiling's literal
+   `[8, 0]` is the same value at standard density and ours additionally tracks
+   the density setting.
+5. **Control-row spacing.** `space_s` between the four icon buttons is already
+   a token.
+6. **Nav-button geometry.** The open-coded `nav_button` (Task 4) matches
+   `button::icon` exactly: padding `space_xxs`, `.padding(0)` on the button,
+   `theme::Button::Icon`, glyph 16 px — `icon::from_name(..).icon()` defaults to
+   `size: 16` (`widget/icon/mod.rs:27`) and `button::icon` sets 16 for symbolic
+   handles (`widget/button/icon.rs:51`).
+7. **`padded_control` / `menu_button` / toggler shape / `fn style()`.** Every
+   row already goes through `padded_control`, the About row is
+   `menu_button(text::body(..))`, the toggler is
+   `.text_size(14).width(Length::Fill)`, and `style()` returns
+   `cosmic::applet::style()` — all identical to the reference.
+8. **`cosmic::theme::spacing()`.** Literally `active().cosmic().spacing`
+   (`src/theme/mod.rs:70`), i.e. tiling's destructure with fewer lines — not
+   churned, per the plan.
+
+[decision] `PLACEHOLDER_HEIGHT` (160.0) and the placeholder icon's `.size(64)`
+stay plain numbers. The `Spacing` scale describes paddings and gaps, not
+content dimensions, and there is no theme token for either; first-party applets
+size their own content areas with literals too. Recorded as a comment on the
+const so the next audit does not re-litigate it.
+
+[decision] The thumbnail radius uses the `radius_s` **token** rather than
+libcosmic's hardcoded `[9.0; 4]`. It is the same corner at default settings
+(`radius_s: [8.0; 4]`) and it is the exact value `Button::Image` uses for the
+ring it must line up with — so it stays aligned when the user changes the
+corner-radius setting, which the literal would not.
+
+[decision] `custom_image_button`'s default `Padding::new(5.0)`
+(`widget/button/widget.rs:101`) is left alone: it is the widget's own default,
+i.e. already the stock value, and it is what keeps the 2 px hover ring clear of
+the image edge.
 
 ### Task 8: Verify acceptance criteria
 
