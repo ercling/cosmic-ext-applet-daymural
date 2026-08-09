@@ -194,3 +194,74 @@ of scope for us regardless — applying a wallpaper forces `same-on-all`
    theme config unwritable — each should leave the user's accent untouched.
 6. Whether a new `src/accent.rs` module is the right home (it is a different
    config domain from `wallpaper.rs`, which should stay cosmic-bg-only).
+
+## 10. Incident & fix — 2026-08-09: btrfs fsync freeze + echo oscillation
+
+**Observed live** (Fedora 44, btrfs home) when the user enabled the toggle:
+the applet froze for minutes (D-state, wchans `barrier_all_devices` /
+`folio_wait_bit_common` / `wait_log_commit` — btrfs fsync/commit paths) while
+theme keys trickled out at ~1–2/s; cosmic-panel logged 18×
+`Failed to get theme entry value: GetKey("list_button", NotFound)` (it read
+the derived theme dir mid-write — cosmic-config transactions are not
+reader-atomic); after the first write cycle completed the applet immediately
+started another (`accent_last_written` flipped Some→None on disk), and the
+panel/dock flapped as every surface reloaded its theme per write. Recovery
+was manual (SIGSTOP, flip `accent_enabled=false` on disk, SIGKILL).
+
+Two root causes, two fixes (branch `fix-accent-async-writes`):
+
+- **BUG A — the freeze**: the whole write batch (2× builder `set_accent` +
+  2× `build()` + 2× full derived-theme `write_entry`, ~40 fsync'd atomic key
+  writes per mode) ran synchronously inside `update()`. Under I/O pressure
+  each fsync forces a btrfs transaction/log commit (~1 s), so one cycle
+  blocked the event loop for minutes. Fixed twice over:
+  - the theme write/restore now runs on the blocking pool
+    (`AccentInflight` task, completion message `AccentWriteFinished`,
+    mirroring `extract_accent_hue`), so `update()` never blocks;
+  - the derived-theme write is now a **changed-keys-only transaction**
+    (`accent::write_theme`, upstream cosmic-settings' `build_theme` pattern
+    — read `Theme::get_entry`, diff field-by-field, `tx.set` only
+    differences). ⚠️ The original full-entry `write_entry` was **our
+    deviation from upstream** — the plan's Theme-write section claimed it
+    "matches upstream (cosmic-settings does the same)", which was wrong and
+    is corrected there in place. An accent change legitimately touches ~20
+    of 39 keys (every component's `focus` ring is the accent), still half
+    the fsyncs and a much smaller torn-read window. Virgin theme dirs
+    (probed via `is_dark`) still get one full materialising `write_entry`:
+    upstream's diff base is `get_entry`'s default = `Theme::preferred_theme()`,
+    which is environment-dependent (`XDG_CURRENT_DESKTOP`) and could
+    nondeterministically skip `is_dark` itself. Note the first diff after a
+    materialisation rewrites `shade`/`accent_text` once — repr migration
+    from the derive's lossy hex `ColorRepr` to the bare-exact form upstream
+    writes (the hex form would re-flag those keys on every diff).
+- **BUG B — the oscillation**: with minute-long writes, our own multi-key
+  config persists echoed back through the watcher stale/torn relative to
+  in-memory state, and the `ConfigUpdated` arm routed the apparent
+  `accent_enabled` flip through the real toggle lifecycle (deliberate for
+  genuine external flips; every prior echo-interleaving analysis assumed
+  writes are fast). Stale echo → spurious disable/disarm → re-enable →
+  another full write cycle → more echoes. Fixed with a write guard:
+  while an accent task is in flight (`accent_inflight`, generation counter,
+  stale completions ignored) `ConfigUpdated` keeps all three accent fields
+  from memory and routes no flip, `AccentComputed` results are
+  dropped-and-rearmed, and user toggles are recorded + pinned to disk; the
+  task's completion reconciles exactly once — a recorded user toggle wins
+  (a concurrent `set_config` full-entry write can rewrite the pinned disk
+  flag from stale memory), else a **fresh disk read** (never the suppressed
+  echo payloads) — and routes a genuine flip through the normal lifecycle
+  then.
+
+Invariants across the async split (all still test-enforced, now through
+`settle_accent_tasks` driving the completion messages): snapshot persisted
+before the theme write starts; `last_written` persisted only after the write
+succeeds (in the completion handler; its failure chains an async rollback
+task restoring the accents the plan compared); `write_accents`' internal
+half-write rollback stays inside the blocking task; the plan's builders
+travel into the task (no re-read TOCTOU); disable flips the toggle
+immediately but clears the snapshot only after its restore verifiably lands
+(failure keeps it — the kept-snapshot shape); an enable's deferred restore
+arms the feature only from a *successful* completion. New adaptation worth
+naming: a crash while a disable-restore is in flight now leaves
+`enabled=false` + snapshot kept on disk, which the next enable's deferred
+restore already reconciles — strictly better than the old synchronous
+crash-mid-restore exposure.

@@ -267,10 +267,21 @@ we drop: full-image decode (we use the 480×270 thumbnail), the subprocess
      **single-key setter**: only the `accent` key changes, nothing else gets
      pinned user-locally (write_entry on the builder would materialise every
      key and cut the user off from future COSMIC default changes).
-  2. `builder.build().write_entry(&theme_cfg)` — the derived `Theme` **is** a
+  2. ~~`builder.build().write_entry(&theme_cfg)` — the derived `Theme` **is** a
      full-entry write; that matches upstream (cosmic-settings does the same)
      and both writes are required: nothing on the system rebuilds the theme
-     from the builder.
+     from the builder.~~
+     **⚠️ Corrected 2026-08-09 (incident — see notes §10): the
+     "matches upstream" claim was wrong.** cosmic-settings' `build_theme`
+     (`theme_manager.rs`) does **not** `write_entry` the derived theme: it
+     reads the current `Theme::get_entry`, diffs field by field, and writes
+     only the changed keys in one transaction. Our full-entry write was the
+     deviation, and its ~40 fsync'd key files per mode per write fed the
+     btrfs freeze. Superseded by `accent::write_theme` (diff transaction;
+     full `write_entry` only for a virgin theme dir, probed via `is_dark`,
+     because upstream's diff base — `get_entry`'s `preferred_theme()`
+     default — is environment-dependent there). Both writes are still
+     required: nothing on the system rebuilds the theme from the builder.
 - Restore: `set_accent(&builder_cfg, snapshot_value)` (including `None`),
   then rebuild + write the derived theme.
 - All four `Config` handles (light/dark × builder/theme) injectable
@@ -387,7 +398,9 @@ Types live in `src/accent.rs`; all colours are `[u8; 3]` (keeps `Eq` on
       mode default on failure** (never `ThemeBuilder::default()`);
       `read_current_accents(&ThemeHandles) -> (Option<[u8; 3]>, Option<[u8; 3]>)`
 - [x] `write_accents(&ThemeHandles, light, dark)` — **`set_accent` single-key
-      write** on each builder + `.build().write_entry` on each derived theme;
+      write** on each builder + `.build().write_entry` on each derived theme
+      (*2026-08-09: the derived-theme write is now `write_theme`'s
+      changed-keys diff transaction — see the Theme-write correction above*);
       `restore_accents(&ThemeHandles, snapshot)` writing `Option<Srgb>` back
       verbatim (including `None`) the same way
 - [x] write tests in a `TempDir`: write → read-back of builder accent and

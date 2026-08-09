@@ -157,12 +157,42 @@ the pinned rev before coding against remembered names.
   - **Single-key builder write**: `set_accent` on each mode's builder — only
     the `accent` key; `write_entry` on a builder would materialise every field
     and pin the user against future COSMIC default changes — then
-    `.build().write_entry` on the derived theme (that one *is* a full write,
-    same as cosmic-settings; nothing else on the system rebuilds the theme
-    from the builder, so both writes are required). Reading a builder must
-    probe the `palette` key directly and substitute the mode's own default on
-    failure: `get_entry`'s **Ok** path silently leaks the dark default palette
-    when the key is absent.
+    `write_theme` with `.build()`'s result: a **changed-keys-only
+    transaction** against the on-disk derived theme (cosmic-settings'
+    `build_theme` pattern; ~20 of 39 keys on an accent change — every
+    component's `focus` ring is the accent — vs the full rewrite that fed the
+    2026-08-08 btrfs fsync freeze, and a smaller torn-read window for other
+    COSMIC processes, which read the theme dir non-atomically). A virgin
+    theme dir (probed via `is_dark`) still gets one full `write_entry`:
+    diffing against `get_entry`'s absent-key default would diff against
+    `Theme::preferred_theme()`, which is *environment-dependent*. Both writes
+    are required — nothing else on the system rebuilds the theme from the
+    builder. Reading a builder must probe the `palette` key directly and
+    substitute the mode's own default on failure: `get_entry`'s **Ok** path
+    silently leaks the dark default palette when the key is absent.
+  - **Theme writes never run inline in `update()`** (the 2026-08-08 incident:
+    under btrfs I/O pressure each fsync'd key file took ~1 s and one write
+    cycle froze the UI thread for minutes). `write_accents`/`restore_accents`
+    run as blocking-pool tasks (`AccentInflight` describes the task,
+    `accent_job`/`run_accent_job` derive+execute it — tests run the identical
+    job via `settle_accent_tasks`), finished by `AccentWriteFinished` against
+    live state. The split keeps the old ordering: snapshot persisted *before*
+    the task spawns, `last_written` persisted in the completion handler only
+    after the write landed (its persist failing chains an async rollback
+    task), and the plan's builders travel into the task — no re-read TOCTOU.
+  - **Write guard** (`accent_inflight` + generation counter, stale
+    completions ignored): at most one theme task ever runs, and while one
+    does (a) `AccentComputed` results are dropped-and-rearmed
+    (`accent_recompute_queued`), (b) `ConfigUpdated` keeps every accent field
+    from memory and routes **no** flip — our own multi-key persists echo back
+    stale/torn during a slow write, and routing an apparent flip is what
+    oscillated enable→disarm→re-enable in the incident, rewriting both themes
+    each round — and (c) toggles are recorded (`accent_flip_requested`,
+    rendered by the toggler via `accent_toggler_state`, pinned to disk raw).
+    The completion reconciles once: a recorded user toggle wins (a
+    concurrent `set_config` full-entry write can rewrite the pinned disk
+    flag from stale memory), else a **fresh disk read** of the config —
+    never the suppressed echo payloads.
   - **Don't-clobber / disarm**: before each write, current builder accents are
     compared to `accent_last_written` in exact `[u8; 3]` space (we quantise,
     write the `u8/255` f32 via `set_accent` — exact-f32 RON round-trip — and

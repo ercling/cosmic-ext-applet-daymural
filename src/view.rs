@@ -386,9 +386,12 @@ fn shuffle_toggler(window: &Window) -> Element<'_, Message> {
 /// Accent-from-wallpaper toggler row (same idiom as [`shuffle_toggler`],
 /// including the hardcoded label size — see that function's comment). Bound
 /// to [`Message::SetAccentEnabled`]; the enable/disable/disarm lifecycle
-/// lives in `app.rs`, this row only reflects `config.accent_enabled`.
+/// lives in `app.rs`, this row only reflects `accent_toggler_state()` — the
+/// requested state while a theme write is in flight, the setting otherwise,
+/// so the row answers a click immediately even though the theme I/O behind
+/// it runs on the blocking pool.
 fn accent_toggler(window: &Window) -> Element<'_, Message> {
-    widget::toggler(window.config.accent_enabled)
+    widget::toggler(window.accent_toggler_state())
         .on_toggle(Message::SetAccentEnabled)
         .text_size(14)
         .width(Length::Fill)

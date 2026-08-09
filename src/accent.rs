@@ -15,7 +15,7 @@
 // dominant-*vibrant* rather than dominant-pixel: a small saturated subject
 // beats a large washed-out ground because grey pixels carry ~zero weight.
 
-use cosmic::cosmic_config::{self, Config, ConfigGet, CosmicConfigEntry};
+use cosmic::cosmic_config::{self, Config, ConfigGet, ConfigSet, CosmicConfigEntry};
 use cosmic::cosmic_theme::palette::{
     IntoColor, IsWithinBounds, Oklch, Srgb, color_difference::Wcag21RelativeContrast,
     convert::IntoColorUnclamped,
@@ -294,8 +294,10 @@ pub enum Mode {
 
 /// The four cosmic-config handles the accent writer touches (light/dark ×
 /// builder/theme). Built once against the real per-user configs in
-/// production; tests root all four in a `TempDir`.
-#[derive(Debug)]
+/// production; tests root all four in a `TempDir`. `Clone` because the theme
+/// writes run on the blocking pool (`app.rs`'s accent tasks) and each task
+/// takes its own copy — a `Config` is just paths.
+#[derive(Debug, Clone)]
 pub struct ThemeHandles {
     light_builder: Config,
     dark_builder: Config,
@@ -522,9 +524,15 @@ fn write_mode_accent(
 ///    user off from future COSMIC default changes). The setter serialises the
 ///    bare `Option<Srgb>` — exact-f32 RON, so our quantise-then-convert value
 ///    round-trips bit-exactly.
-/// 2. `build().write_entry` — the derived `Theme` *is* a full-entry write;
-///    that matches upstream (cosmic-settings does the same) and both writes
-///    are required: nothing on the system rebuilds the theme from the builder.
+/// 2. [`write_theme`] with `build()`'s result — a **changed-keys-only
+///    transaction** against the on-disk derived theme (the pattern upstream
+///    cosmic-settings uses in `theme_manager.rs`'s `build_theme`; both writes
+///    are required — nothing on the system rebuilds the theme from the
+///    builder). The first version of this module did a full `Theme`
+///    `write_entry` here (~40 fsync'd key files per mode, per write) while
+///    *claiming* to match upstream; the 2026-08-08 btrfs freeze traced
+///    straight to that fsync count, and the diff transaction is the fix at
+///    the source.
 fn write_builder_accent(
     handles: &ThemeHandles,
     mode: Mode,
@@ -532,7 +540,101 @@ fn write_builder_accent(
     accent: Option<Srgb>,
 ) -> Result<(), cosmic_config::Error> {
     builder.set_accent(handles.builder_cfg(mode), accent)?;
-    builder.build().write_entry(handles.theme_cfg(mode))
+    write_theme(handles.theme_cfg(mode), &builder.build())
+}
+
+/// Write `new` onto the derived-theme config, touching **only the keys whose
+/// value actually changed** — one transaction, mirroring upstream
+/// cosmic-settings (`build_theme`): read the current on-disk theme
+/// (`Theme::get_entry`, accepting the partial on `Err`), compare field by
+/// field, `tx.set` the differences, commit. For an accent-only change that is
+/// a handful of keys instead of ~40 — fewer fsyncs (the 2026-08-08 btrfs
+/// freeze) *and* a much smaller window in which other COSMIC processes can
+/// read a torn theme (cosmic-config transactions are not reader-atomic; the
+/// panel logged `GetKey("list_button", NotFound)` mid-write during the
+/// incident).
+///
+/// **Virgin-dir exception**: when the theme entry has never been written
+/// (probed via its `is_dark` key), fall back to a full `write_entry`.
+/// Upstream diffs against `get_entry`'s fallback default — but that default
+/// is `Theme::preferred_theme()`, which depends on the *environment*
+/// (`XDG_CURRENT_DESKTOP`/GNOME colour scheme), so on an empty dir the diff
+/// would nondeterministically skip keys that happen to match it — including
+/// `is_dark`, the exact dark-leak class `read_builder`'s palette probe exists
+/// to prevent. Materialising the full entry once keeps the first write
+/// deterministic and self-contained; every later write diffs against it.
+///
+/// The diff covers **every** field of the pinned `Theme` (upstream's
+/// hand-rolled list omits several); an omitted-but-changed field would leave
+/// the on-disk theme permanently torn. The four `ColorRepr`-annotated fields
+/// (`shade`, `accent_text`, `control_tint`, `text_tint`) are written as bare
+/// palette values, like upstream: `ColorRepr` is `#[serde(untagged)]` with
+/// `Rgb`/`Rgba` variants, so readers parse them fine, and the bare f32 form
+/// round-trips exactly (the hex repr quantises to `u8`, which would re-flag
+/// the key as changed on every subsequent diff).
+fn write_theme(cfg: &Config, new: &Theme) -> Result<(), cosmic_config::Error> {
+    if ConfigGet::get::<bool>(cfg, "is_dark").is_err() {
+        return new.write_entry(cfg);
+    }
+    let current = match Theme::get_entry(cfg) {
+        Ok(theme) => theme,
+        // Per-key degradation, like `read_builder`: unreadable keys diff as
+        // their defaults, so the write repairs them.
+        Err((_errors, partial)) => partial,
+    };
+    let tx = cfg.transaction();
+    macro_rules! set_changed {
+        ($key:literal, $field:ident) => {
+            if current.$field != new.$field {
+                ConfigSet::set(&tx, $key, &new.$field)?;
+            }
+        };
+        ($key:literal, $accessor:ident($transparent:literal)) => {
+            if current.$accessor($transparent) != new.$accessor($transparent) {
+                ConfigSet::set(&tx, $key, new.$accessor($transparent))?;
+            }
+        };
+    }
+    set_changed!("name", name);
+    set_changed!("background", background(false));
+    set_changed!("transparent_background", background(true));
+    set_changed!("primary", primary(false));
+    set_changed!("transparent_primary", primary(true));
+    set_changed!("secondary", secondary(false));
+    set_changed!("transparent_secondary", secondary(true));
+    set_changed!("button", button);
+    set_changed!("accent", accent);
+    set_changed!("success", success);
+    set_changed!("destructive", destructive);
+    set_changed!("warning", warning);
+    set_changed!("accent_button", accent_button);
+    set_changed!("success_button", success_button);
+    set_changed!("destructive_button", destructive_button);
+    set_changed!("warning_button", warning_button);
+    set_changed!("icon_button", icon_button);
+    set_changed!("link_button", link_button);
+    set_changed!("list_button", list_button);
+    set_changed!("text_button", text_button);
+    set_changed!("palette", palette);
+    set_changed!("spacing", spacing);
+    set_changed!("corner_radii", corner_radii);
+    set_changed!("is_dark", is_dark);
+    set_changed!("is_high_contrast", is_high_contrast);
+    set_changed!("gaps", gaps);
+    set_changed!("active_hint", active_hint);
+    set_changed!("window_hint", window_hint);
+    set_changed!("frosted", frosted);
+    set_changed!("frosted_windows", frosted_windows);
+    set_changed!("frosted_system_interface", frosted_system_interface);
+    set_changed!("frosted_panel", frosted_panel);
+    set_changed!("frosted_applets", frosted_applets);
+    set_changed!("frosted_maximized_apps", frosted_maximized_apps);
+    set_changed!("alpha_map", alpha_map);
+    set_changed!("shade", shade);
+    set_changed!("accent_text", accent_text);
+    set_changed!("control_tint", control_tint);
+    set_changed!("text_tint", text_tint);
+    tx.commit()
 }
 
 // ---- pure apply/disarm decision ---------------------------------------------
@@ -1168,6 +1270,103 @@ mod tests {
                 "{id}: builder must contain only the accent key"
             );
         }
+    }
+
+    /// Every key file under a config root, `name → contents` (recursively —
+    /// the version directory is skipped as a path component).
+    fn key_contents_under(root: &std::path::Path) -> std::collections::BTreeMap<String, String> {
+        fn walk(dir: &std::path::Path, out: &mut std::collections::BTreeMap<String, String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else {
+                    out.insert(
+                        path.file_name().unwrap().to_string_lossy().into_owned(),
+                        std::fs::read_to_string(&path).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut out = std::collections::BTreeMap::new();
+        walk(root, &mut out);
+        out
+    }
+
+    #[test]
+    fn theme_rewrites_transact_only_the_changed_keys() {
+        // The first write materialises the full derived theme (deterministic
+        // — never a diff against the environment-dependent
+        // `Theme::preferred_theme()` default); every later write must touch
+        // only the keys the accent change actually moved. The full rewrite
+        // was the fsync storm behind the 2026-08-08 btrfs freeze, and every
+        // key rewritten is a window in which other COSMIC processes read a
+        // torn theme.
+        let dir = tempfile::tempdir().unwrap();
+        let handles = ThemeHandles::sandboxed(dir.path()).unwrap();
+        let light_dir = dir.path().join("cosmic").join(LIGHT_THEME_ID);
+        let dark_dir = dir.path().join("cosmic").join(DARK_THEME_ID);
+
+        write(&handles, [7, 133, 217], [250, 41, 90]);
+        assert!(
+            key_contents_under(&light_dir).contains_key("is_dark"),
+            "first write materialises the full theme"
+        );
+        // A second write of the *same* pair settles the representation: the
+        // materialising `write_entry` stored the `ColorRepr` fields (`shade`,
+        // `accent_text`) in the derive's lossy hex form, and the first diff
+        // rewrites those two bare-exact (upstream's form). One-time
+        // migration; from here on the diff base round-trips exactly.
+        write(&handles, [7, 133, 217], [250, 41, 90]);
+        let light_before = key_contents_under(&light_dir);
+        let dark_before = key_contents_under(&dark_dir);
+
+        // Change only the light accent; the dark pair is byte-identical.
+        write(&handles, [200, 10, 10], [250, 41, 90]);
+        let light_after = key_contents_under(&light_dir);
+        assert_eq!(
+            light_before.keys().collect::<Vec<_>>(),
+            light_after.keys().collect::<Vec<_>>(),
+            "a diff write must not create or delete keys"
+        );
+        let changed: Vec<&str> = light_after
+            .iter()
+            .filter(|(key, contents)| light_before[*key] != **contents)
+            .map(|(key, _)| key.as_str())
+            .collect();
+        assert!(changed.contains(&"accent"), "changed: {changed:?}");
+        for untouched in [
+            "palette",
+            "spacing",
+            "corner_radii",
+            "is_dark",
+            "gaps",
+            "name",
+        ] {
+            assert!(
+                !changed.contains(&untouched),
+                "{untouched} must not be rewritten by an accent change (changed: {changed:?})"
+            );
+        }
+        // An accent change legitimately touches every component/container
+        // key (each carries a `focus` ring coloured by the accent —
+        // cosmic-theme `derivation.rs`, `focus: accent`) plus `accent_text`.
+        // That is ~20 of 39 keys — the structural floor, and still the
+        // point: the stable keys above never churn, so readers see a far
+        // smaller torn window and far fewer fsyncs than a full rewrite.
+        assert!(
+            changed.len() <= 24,
+            "an accent change must not approach a full rewrite \
+             ({} of {} keys changed: {changed:?})",
+            changed.len(),
+            light_after.len()
+        );
+        // The unchanged dark mode saw no writes at all: the builder setter is
+        // write-on-change and the theme diff is empty.
+        assert_eq!(dark_before, key_contents_under(&dark_dir));
     }
 
     #[test]

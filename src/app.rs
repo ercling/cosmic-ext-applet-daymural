@@ -113,6 +113,108 @@ pub struct Window {
     /// refuses to enable, computes are never armed). Tests inject
     /// TempDir-rooted handles ([`accent::ThemeHandles::sandboxed`]).
     accent_handles: Option<accent::ThemeHandles>,
+    /// Generation counter for the blocking-pool accent theme tasks;
+    /// [`Message::AccentWriteFinished`] carrying a stale generation is
+    /// ignored (same scheme as the refresh/shuffle timers).
+    accent_write_generation: u64,
+    /// The in-flight accent theme write/restore, if any — the **write
+    /// guard**. At most one theme-writing task ever runs, and while one does:
+    /// builder reads are off-limits (they would race our own write), so
+    /// `AccentComputed` results are queued ([`Self::accent_recompute_queued`])
+    /// and `ConfigUpdated` accent flips are *not* routed through the toggle
+    /// lifecycle (our own multi-key persists echo back stale/torn during a
+    /// slow write — the 2026-08-08 btrfs incident's oscillation); the
+    /// completion handler reconciles against a fresh disk read instead.
+    accent_inflight: Option<AccentInflight>,
+    /// An accent result arrived while a theme task was in flight and was
+    /// dropped; the completion handler re-arms a fresh compute for the
+    /// then-current wallpaper.
+    accent_recompute_queued: bool,
+    /// A toggle requested while a theme task was in flight (rendered by the
+    /// popup's toggler; also pinned onto the disk config so the completion's
+    /// fresh-read reconcile adopts it). Cleared by that reconcile.
+    accent_flip_requested: Option<bool>,
+}
+
+/// What the single in-flight accent theme task ([`Window::accent_inflight`])
+/// is doing, with everything its completion handler — and the derived
+/// [`AccentJob`] — needs. The builders in `Write` are the exact ones the plan
+/// compared: they travel into the task, so there is no re-read between the
+/// don't-clobber compare and the write.
+#[derive(Debug, Clone)]
+enum AccentInflight {
+    /// `accent::write_accents` is running; on success the completion handler
+    /// persists `pair` as `accent_last_written`, and when *that* persist
+    /// fails it rolls the themes back to `previous` (a follow-up
+    /// [`AccentInflight::Rollback`] task).
+    Write {
+        builders: Box<accent::Builders>,
+        pair: accent::AccentPair,
+        previous: accent::AccentSnapshot,
+    },
+    /// The disable path's snapshot restore. The toggle is already off (and
+    /// `last_written` cleared) — the snapshot itself is cleared only once
+    /// the restore verifiably lands; a failure keeps it (the kept-snapshot
+    /// shape, retried by the next enable's deferred restore).
+    DisableRestore { snapshot: accent::AccentSnapshot },
+    /// An enable's deferred restore of a kept snapshot. Nothing is persisted
+    /// yet; the enable's tail (clear `last_written`, flip the setting, arm a
+    /// compute) runs only on success — a failure refuses the enable exactly
+    /// like the old synchronous path.
+    EnableRestore { snapshot: accent::AccentSnapshot },
+    /// Rolling the themes back to `previous` after a write whose
+    /// `last_written` persist failed. If even this fails, the in-memory
+    /// record adopts `pair` so this session's guard keeps matching the disk.
+    Rollback {
+        pair: accent::AccentPair,
+        previous: accent::AccentSnapshot,
+    },
+}
+
+/// The theme write an [`AccentInflight`] record stands for — data-only, so
+/// production (the blocking-pool task) and tests (running the identical job
+/// synchronously before feeding [`Message::AccentWriteFinished`]) share one
+/// derivation ([`accent_job`]) and one executor ([`run_accent_job`]).
+enum AccentJob {
+    Write {
+        builders: Box<accent::Builders>,
+        light: [u8; 3],
+        dark: [u8; 3],
+    },
+    Restore(accent::AccentSnapshot),
+}
+
+fn accent_job(inflight: &AccentInflight) -> AccentJob {
+    match inflight {
+        AccentInflight::Write { builders, pair, .. } => AccentJob::Write {
+            builders: builders.clone(),
+            light: pair.light,
+            dark: pair.dark,
+        },
+        AccentInflight::DisableRestore { snapshot }
+        | AccentInflight::EnableRestore { snapshot } => AccentJob::Restore(*snapshot),
+        AccentInflight::Rollback { previous, .. } => AccentJob::Restore(*previous),
+    }
+}
+
+/// The blocking half of an accent task: the ~hundreds of fsync'd bytes of
+/// theme I/O that must never run inline in `update()` (the 2026-08-08 btrfs
+/// incident: each fsync forced a transaction commit and one write cycle
+/// blocked the UI thread for minutes). Failures are logged here — the
+/// completion message only carries success.
+fn run_accent_job(handles: &accent::ThemeHandles, job: AccentJob) -> bool {
+    let result = match job {
+        AccentJob::Write {
+            builders,
+            light,
+            dark,
+        } => accent::write_accents(handles, *builders, light, dark),
+        AccentJob::Restore(snapshot) => accent::restore_accents(handles, snapshot),
+    };
+    if let Err(error) = &result {
+        tracing::warn!("accent theme write failed: {error}");
+    }
+    result.is_ok()
 }
 
 /// The one-shot cold-start auto-apply: a fresh install (empty catalogue at
@@ -233,6 +335,14 @@ pub enum Message {
     AccentComputed {
         source: PathBuf,
         hue: Option<f32>,
+    },
+    /// The blocking-pool accent theme write/restore finished (payload: the
+    /// generation it was spawned with — a stale completion is ignored, same
+    /// scheme as the refresh/shuffle timers — and whether the write landed).
+    /// What it *was* lives in [`Window::accent_inflight`], not the message.
+    AccentWriteFinished {
+        generation: u64,
+        success: bool,
     },
     /// Forwarded surface actions (the dropdown's menu opens as its own
     /// wayland popup and drives it through these).
@@ -612,17 +722,25 @@ impl Window {
     /// state, because the async task's snapshot goes stale during the decode
     /// — the wallpaper may have changed (the `source` guard) and so may the
     /// builder accents (read fresh here, right before the plan).
-    fn finish_accent_compute(&mut self, source: PathBuf, hue: Option<f32>) {
+    fn finish_accent_compute(&mut self, source: PathBuf, hue: Option<f32>) -> app::Task<Message> {
         if self.current.as_deref() != Some(source.as_path()) {
             tracing::debug!("dropping stale accent result for {}", source.display());
-            return;
+            return Task::none();
+        }
+        if self.accent_inflight.is_some() {
+            // Write guard: the builders on disk are mid-mutation by our own
+            // task — a plan against them would compare torn state. Drop the
+            // result and re-arm a fresh compute once the task completes.
+            tracing::debug!("deferring accent result: a theme write is in flight");
+            self.accent_recompute_queued = true;
+            return Task::none();
         }
         let Some(handles) = &self.accent_handles else {
             // Near-unreachable (the compute is only armed with handles on
             // hand), but the module's failure contract is log-and-change-
             // nothing — never a silent return.
             tracing::debug!("dropping accent result: theme configs unavailable");
-            return;
+            return Task::none();
         };
         let builders = accent::read_builders(handles);
         let action = accent::accent_plan(
@@ -632,14 +750,25 @@ impl Window {
             &builders,
             hue,
         );
-        self.execute_accent_action(action, builders);
+        self.execute_accent_action(action, builders)
     }
 
     /// Execute a pure [`accent::AccentAction`] against the theme configs and
     /// the persisted feature state, writing onto the same `builders` the plan
     /// just compared. Every failure path logs and leaves the user's accent
     /// exactly as it was.
-    fn execute_accent_action(&mut self, action: accent::AccentAction, builders: accent::Builders) {
+    ///
+    /// A `Write` splits across the async gap (the theme write itself must
+    /// never run inline in `update()` — the 2026-08-08 btrfs incident): the
+    /// snapshot persist stays here, *before* anything is spawned; the theme
+    /// write runs as an [`AccentInflight::Write`] task; `accent_last_written`
+    /// is persisted by the completion handler ([`Window::finish_accent_write`])
+    /// only after the write verifiably landed.
+    fn execute_accent_action(
+        &mut self,
+        action: accent::AccentAction,
+        builders: accent::Builders,
+    ) -> app::Task<Message> {
         match action {
             accent::AccentAction::Write {
                 light,
@@ -650,15 +779,15 @@ impl Window {
                 // missing theme handle or a memory-only config must not leave
                 // a half-done state (a snapshot stored without its write, or
                 // theme colours without their on-disk record).
-                let (Some(handles), Some(context)) = (&self.accent_handles, &self.config_context)
-                else {
+                let (Some(_), Some(context)) = (&self.accent_handles, &self.config_context) else {
                     // Near-unreachable (enabling refuses without both), but
                     // the failure contract is log-and-change-nothing.
                     tracing::debug!(
                         "not writing accent colours: theme configs or applet config unavailable"
                     );
-                    return;
+                    return Task::none();
                 };
+                let context = context.clone();
                 let current = accent::builder_accents(&builders);
                 if snapshot_now {
                     // The current accents are still the user's — nothing of
@@ -667,12 +796,12 @@ impl Window {
                     // snapshot must be safely on disk before the write it
                     // exists to undo, or a restart would find our colours in
                     // the themes with no record behind them. No snapshot on
-                    // disk → no write.
+                    // disk → no write (and no task spawned).
                     let snapshot = accent::AccentSnapshot {
                         light: current.0,
                         dark: current.1,
                     };
-                    if let Err(error) = self.config.set_accent_snapshot(context, Some(snapshot)) {
+                    if let Err(error) = self.config.set_accent_snapshot(&context, Some(snapshot)) {
                         // The derive's setter mutates the field before
                         // writing — undo that too, so the next plan still
                         // says `snapshot_now`.
@@ -681,51 +810,21 @@ impl Window {
                             "not writing accent colours: \
                              cannot persist the accent snapshot: {error}"
                         );
-                        return;
+                        return Task::none();
                     }
                 }
-                if let Err(error) = accent::write_accents(handles, builders, light, dark) {
-                    // `write_accents` rolled any half-write back to the
-                    // accents the plan just compared, so the next recompute's
-                    // don't-clobber guard still holds and retries instead of
-                    // disarming over our own leftovers. `accent_last_written`
-                    // stays as it was (`None` before a first successful
-                    // write): the snapshot then stands in for it in
-                    // `accent_plan`'s guard, so a pick the user makes after
-                    // this failure still disarms.
-                    tracing::warn!("failed to write accent colours: {error}");
-                    return;
-                }
-                let pair = accent::AccentPair { light, dark };
-                let recorded = self.config.accent_last_written;
-                if let Err(error) = self.config.set_accent_last_written(context, Some(pair)) {
-                    // The write landed but its don't-clobber record did not.
-                    // Left like this, a restart would read the themes as an
-                    // external change (or, before a first write, hit the
-                    // snapshot-mismatch guard) and disarm over our own
-                    // colours. Roll the themes back to the accents the plan
-                    // compared instead — the guard then still holds against
-                    // the *old* record and the next recompute retries.
-                    self.config.accent_last_written = recorded; // setter mutates first
-                    tracing::warn!(
-                        "cannot persist the written accents; rolling the theme write back: {error}"
-                    );
-                    let previous = accent::AccentSnapshot {
+                // The snapshot is safely on disk; the write leaves the UI
+                // thread with the exact builders the plan compared (no
+                // re-read TOCTOU) and reports back to
+                // `finish_accent_write`.
+                self.spawn_accent_task(AccentInflight::Write {
+                    builders: Box::new(builders),
+                    pair: accent::AccentPair { light, dark },
+                    previous: accent::AccentSnapshot {
                         light: current.0,
                         dark: current.1,
-                    };
-                    if let Err(error) = accent::restore_accents(handles, previous) {
-                        // Config and themes failing together: keep the
-                        // in-memory record matching what is actually in the
-                        // themes so this session's guard still holds (and
-                        // disable still restores); the divergent on-disk
-                        // record is the same exposure as the documented
-                        // genuine-crash window — the startup gap disarm
-                        // keeps the snapshot either way.
-                        tracing::error!("accent rollback failed too: {error}");
-                        self.config.accent_last_written = Some(pair);
-                    }
-                }
+                    },
+                })
             }
             accent::AccentAction::Disarm { keep_snapshot } => {
                 // The accent no longer matches what we wrote: a manual choice
@@ -745,17 +844,244 @@ impl Window {
                 }
                 config.accent_last_written = None;
                 self.set_config(config);
+                Task::none()
             }
-            accent::AccentAction::Skip => {}
+            accent::AccentAction::Skip => Task::none(),
         }
     }
 
+    /// Launch the blocking-pool task for an accent theme write/restore and
+    /// hold the write guard: `inflight` records what is running (and
+    /// everything its completion needs), [`accent_job`] derives the actual
+    /// theme I/O from it, and the completion arrives as
+    /// [`Message::AccentWriteFinished`] carrying this generation.
+    fn spawn_accent_task(&mut self, inflight: AccentInflight) -> app::Task<Message> {
+        let Some(handles) = self.accent_handles.clone() else {
+            // Callers check; never hold the guard for a task that cannot run.
+            tracing::debug!("not spawning an accent task: theme configs unavailable");
+            return Task::none();
+        };
+        self.accent_write_generation += 1;
+        let generation = self.accent_write_generation;
+        let job = accent_job(&inflight);
+        self.accent_inflight = Some(inflight);
+        cosmic::task::future(async move {
+            let success =
+                match tokio::task::spawn_blocking(move || run_accent_job(&handles, job)).await {
+                    Ok(success) => success,
+                    Err(error) => {
+                        tracing::warn!("accent theme task failed: {error}");
+                        false
+                    }
+                };
+            Message::AccentWriteFinished {
+                generation,
+                success,
+            }
+        })
+    }
+
+    /// The [`Message::AccentWriteFinished`] handler: retire the write guard,
+    /// finish what the task started (against *live* state — the reason none
+    /// of this runs inside the task), then reconcile anything that was
+    /// deferred while the task flew: an `accent_enabled` flip (against a
+    /// **fresh** read of the on-disk config, never the possibly-stale echo
+    /// payloads suppressed meanwhile) and a queued recompute.
+    fn finish_accent_task(&mut self, generation: u64, success: bool) -> app::Task<Message> {
+        if generation != self.accent_write_generation {
+            // Same contract as the timers: a superseded task's completion
+            // must not touch the guard state of the current one.
+            tracing::debug!("ignoring a stale accent task completion");
+            return Task::none();
+        }
+        let Some(inflight) = self.accent_inflight.take() else {
+            tracing::debug!("ignoring an accent task completion with nothing in flight");
+            return Task::none();
+        };
+        let follow_up = match inflight {
+            AccentInflight::Write { pair, previous, .. } => {
+                self.finish_accent_write(pair, previous, success)
+            }
+            AccentInflight::DisableRestore { .. } => {
+                self.finish_disable_restore(success);
+                Task::none()
+            }
+            AccentInflight::EnableRestore { .. } => self.finish_enable_restore(success),
+            AccentInflight::Rollback { pair, .. } => {
+                self.finish_rollback(pair, success);
+                Task::none()
+            }
+        };
+        if self.accent_inflight.is_some() {
+            // The completion chained another theme task (the rollback): the
+            // guard stays held — reconcile and the queued recompute wait for
+            // *that* task's completion.
+            return follow_up;
+        }
+        let reconcile = self.reconcile_accent_after_task();
+        // The reconcile may itself have spawned a task (a routed disable's
+        // restore); the recompute then keeps waiting — and arming it is
+        // free when the reconcile just disabled the feature
+        // (`start_accent_compute` gates on the setting).
+        let recompute = if self.accent_inflight.is_none() && self.accent_recompute_queued {
+            self.accent_recompute_queued = false;
+            self.accent_compute_for_current()
+        } else {
+            Task::none()
+        };
+        Task::batch([follow_up, reconcile, recompute])
+    }
+
+    /// Completion of an [`AccentInflight::Write`]: persist the don't-clobber
+    /// record — **only now**, after the theme write verifiably landed. The
+    /// failure semantics are exactly the old synchronous executor's, split
+    /// across the gap:
+    ///
+    /// - write failed → the task already rolled the themes back to the
+    ///   accents the plan compared, so the guard still holds and the next
+    ///   recompute retries; `accent_last_written` stays as it was (`None`
+    ///   before a first successful write, when the snapshot stands in for it
+    ///   in `accent_plan`'s guard).
+    /// - write landed but the record's persist failed → roll the themes back
+    ///   (a follow-up [`AccentInflight::Rollback`] task — the restore is as
+    ///   heavy as the write and must not run inline either); the guard then
+    ///   still holds against the *old* record and the next recompute retries.
+    ///   Until that rollback lands the themes briefly hold unrecorded
+    ///   colours — the same exposure as the documented crash window between
+    ///   write and record, which the gap disarm (snapshot kept) covers.
+    fn finish_accent_write(
+        &mut self,
+        pair: accent::AccentPair,
+        previous: accent::AccentSnapshot,
+        success: bool,
+    ) -> app::Task<Message> {
+        if !success {
+            tracing::warn!("failed to write accent colours");
+            return Task::none();
+        }
+        let Some(context) = self.config_context.clone() else {
+            // The context existed when the write was planned; losing it
+            // mid-flight is test-only in practice, but the invariant stands:
+            // a landed write without its record must be rolled back.
+            tracing::warn!("cannot persist the written accents; rolling the theme write back");
+            return self.spawn_accent_task(AccentInflight::Rollback { pair, previous });
+        };
+        let recorded = self.config.accent_last_written;
+        if let Err(error) = self.config.set_accent_last_written(&context, Some(pair)) {
+            self.config.accent_last_written = recorded; // setter mutates first
+            tracing::warn!(
+                "cannot persist the written accents; rolling the theme write back: {error}"
+            );
+            return self.spawn_accent_task(AccentInflight::Rollback { pair, previous });
+        }
+        Task::none()
+    }
+
+    /// Completion of an [`AccentInflight::Rollback`]. Nothing to do on
+    /// success (the in-memory record was already restored when the rollback
+    /// was spawned); on failure — config and themes failing together — keep
+    /// the in-memory record matching what is actually in the themes so this
+    /// session's guard still holds (and disable still restores); the
+    /// divergent on-disk record is the same exposure as the documented
+    /// genuine-crash window — the startup gap disarm keeps the snapshot
+    /// either way.
+    fn finish_rollback(&mut self, pair: accent::AccentPair, success: bool) {
+        if !success {
+            tracing::error!("accent rollback failed too");
+            self.config.accent_last_written = Some(pair);
+        }
+    }
+
+    /// Completion of an [`AccentInflight::DisableRestore`]: the toggle went
+    /// off (and `last_written` was cleared) when the disable was requested;
+    /// the snapshot is cleared only now that the restore verifiably landed.
+    /// A failed restore keeps it — the accents on disk may still be (partly)
+    /// ours, and the snapshot is the only record of the user's pre-feature
+    /// accents; the next enable's deferred restore is what retries it.
+    fn finish_disable_restore(&mut self, success: bool) {
+        if success {
+            let mut config = self.config.clone();
+            config.accent_snapshot = None;
+            self.set_config(config);
+        } else {
+            tracing::warn!("failed to restore accent snapshot (snapshot kept)");
+        }
+    }
+
+    /// Completion of an [`AccentInflight::EnableRestore`] (the deferred
+    /// restore of a kept snapshot). Only a *successful* restore arms the
+    /// feature — the old synchronous refusal semantics across the gap: a
+    /// failure leaves everything off with the snapshot kept, and pins the
+    /// flag off on disk (an external enable arrives already persisted).
+    /// A toggle-off requested while the restore flew abandons the enable the
+    /// same way — with the pleasant side effect that the restore just put
+    /// the user's accents back.
+    fn finish_enable_restore(&mut self, success: bool) -> app::Task<Message> {
+        if !success {
+            tracing::warn!("cannot enable accent-from-wallpaper: deferred snapshot restore failed");
+            self.persist_accent_disabled();
+            return Task::none();
+        }
+        if self.accent_flip_requested == Some(false) {
+            tracing::info!("accent enable cancelled by a toggle during its restore");
+            self.persist_accent_disabled();
+            return Task::none();
+        }
+        self.arm_accent_enable()
+    }
+
+    /// The post-task reconcile for everything deferred while the write guard
+    /// was held, routed through the same toggle lifecycle the not-in-flight
+    /// path uses. A no-op in the common case (our own persists left disk and
+    /// memory agreeing). Precedence for the desired flag:
+    ///
+    /// 1. A toggle the *user* requested mid-flight
+    ///    (`accent_flip_requested`) — the newest action whose ordering is
+    ///    known. It was pinned onto the disk too, but a concurrent
+    ///    `set_config` full-entry write (retention/shuffle changed while the
+    ///    task flew) rewrites the flag from stale memory, so the in-memory
+    ///    record, not the disk, carries the user's intent.
+    /// 2. Otherwise a **fresh** read of the on-disk config — never the echo
+    ///    payloads suppressed during the flight, which may have been stale
+    ///    or torn (the incident's oscillation); the disk is where a genuine
+    ///    external flip lives.
+    fn reconcile_accent_after_task(&mut self) -> app::Task<Message> {
+        let requested = self.accent_flip_requested.take();
+        let desired = match (requested, &self.config_context) {
+            (Some(requested), _) => requested,
+            (None, Some(context)) => AppletConfig::load(context).accent_enabled,
+            (None, None) => self.config.accent_enabled,
+        };
+        if desired != self.config.accent_enabled {
+            tracing::info!("reconciling an accent toggle deferred during a theme write");
+            return self.set_accent_enabled(desired);
+        }
+        Task::none()
+    }
+
     /// The accent toggler — the flip/echo dispatcher. Enable is
-    /// [`Window::try_enable_accent`]. Disable: restore the snapshot verbatim
-    /// (including the `None` = palette-default state), then clear snapshot +
-    /// last-written; a restore that *fails* keeps the snapshot (still off) —
-    /// the next enable's deferred restore is the retry.
+    /// [`Window::try_enable_accent`]. Disable: flip the setting off and clear
+    /// `last_written` *now* (the toggler must not wait on theme I/O), then
+    /// restore the snapshot verbatim (including the `None` = palette-default
+    /// state) on the blocking pool; the snapshot itself is cleared only once
+    /// the restore lands ([`Window::finish_disable_restore`]) — a restore
+    /// that fails keeps it (still off), and the next enable's deferred
+    /// restore is the retry. A crash mid-restore leaves the persisted
+    /// kept-snapshot shape, which that same deferred restore reconciles.
+    ///
+    /// While an accent theme task is in flight, a flip is not executed (it
+    /// would race the running write): the request is recorded for the
+    /// toggler to render, pinned onto the disk config, and routed through
+    /// this same dispatcher by the completion's fresh-disk-read reconcile.
     fn set_accent_enabled(&mut self, enabled: bool) -> app::Task<Message> {
+        if self.accent_inflight.is_some() {
+            if enabled == self.accent_toggler_state() {
+                return Task::none();
+            }
+            self.accent_flip_requested = Some(enabled);
+            self.persist_accent_flag(enabled);
+            return Task::none();
+        }
         if enabled == self.config.accent_enabled {
             // The toggler only fires on a flip; an echo must not re-snapshot
             // (it would capture *our* accents as the user's).
@@ -765,16 +1091,12 @@ impl Window {
             return self.try_enable_accent();
         }
         match (&self.accent_handles, self.config.accent_snapshot) {
-            (Some(handles), Some(snapshot)) => {
-                if let Err(error) = accent::restore_accents(handles, snapshot) {
-                    // The accents on disk may still be (partly) ours, and
-                    // the snapshot is the only record of the user's
-                    // pre-feature accents — keep it while still turning the
-                    // feature off: the next enable's deferred restore is
-                    // what retries it.
-                    tracing::warn!("failed to restore accent snapshot (snapshot kept): {error}");
-                    return self.disable_keeping_snapshot();
-                }
+            (Some(_), Some(snapshot)) => {
+                let mut config = self.config.clone();
+                config.accent_enabled = false;
+                config.accent_last_written = None;
+                self.set_config(config);
+                self.spawn_accent_task(AccentInflight::DisableRestore { snapshot })
             }
             (None, Some(_)) => {
                 // Theme handles gone (config enabled on disk while the theme
@@ -784,17 +1106,36 @@ impl Window {
                 tracing::warn!(
                     "cannot restore accent snapshot: theme configs unavailable (snapshot kept)"
                 );
-                return self.disable_keeping_snapshot();
+                self.disable_keeping_snapshot()
             }
             // Nothing was ever snapshotted; nothing to restore.
-            (_, None) => {}
+            (_, None) => {
+                let mut config = self.config.clone();
+                config.accent_enabled = false;
+                config.accent_snapshot = None;
+                config.accent_last_written = None;
+                self.set_config(config);
+                Task::none()
+            }
         }
-        let mut config = self.config.clone();
-        config.accent_enabled = false;
-        config.accent_snapshot = None;
-        config.accent_last_written = None;
-        self.set_config(config);
-        Task::none()
+    }
+
+    /// What the popup's accent toggler renders: the *requested* state while
+    /// an accent theme task is in flight (a flip deferred behind the write
+    /// guard, or an enable whose deferred restore is still running), the
+    /// setting itself otherwise — so the row answers a click immediately
+    /// even though the lifecycle behind it is asynchronous.
+    pub(crate) fn accent_toggler_state(&self) -> bool {
+        if let Some(requested) = self.accent_flip_requested {
+            return requested;
+        }
+        if matches!(
+            self.accent_inflight,
+            Some(AccentInflight::EnableRestore { .. })
+        ) {
+            return true;
+        }
+        self.config.accent_enabled
     }
 
     /// The enable arm of [`Window::set_accent_enabled`]. Snapshot the *live*
@@ -802,8 +1143,13 @@ impl Window {
     /// snapshot, so a normal re-enable re-snapshots), **unless** a snapshot
     /// survived from a disable that could not restore — that one is the only
     /// record of the user's pre-feature accents while the disk may still hold
-    /// *ours*, so it is restored now (the deferred restore) and kept, never
-    /// re-captured. Then compute for the current wallpaper.
+    /// *ours*, so it is restored first (the deferred restore, now an
+    /// [`AccentInflight::EnableRestore`] task: theme writes never run inline)
+    /// and kept, never re-captured. The enable's tail —
+    /// [`Window::arm_accent_enable`] — runs inline on the normal path and
+    /// from the restore's completion on the deferred one, and only after a
+    /// *successful* restore: a failure refuses the enable, exactly like the
+    /// old synchronous path.
     ///
     /// Every persist here is checked (the derive's setters, not the
     /// warn-and-continue [`Window::set_config`]): the snapshot must be on
@@ -835,20 +1181,11 @@ impl Window {
             // may still be *ours* from that earlier run, so re-capturing
             // them would clobber the only record of the user's
             // pre-feature accents — and a later disable would "restore"
-            // our own colours. Honour the deferred restore instead, and
-            // refuse to arm when it fails: the disk/snapshot mismatch
-            // would read as user intervention to the next recompute's
-            // guard.
-            Some(snapshot) => {
-                if let Err(error) = accent::restore_accents(handles, snapshot) {
-                    tracing::warn!(
-                        "cannot enable accent-from-wallpaper: \
-                         deferred snapshot restore failed: {error}"
-                    );
-                    self.persist_accent_disabled();
-                    return Task::none();
-                }
-            }
+            // our own colours. Honour the deferred restore instead; its
+            // completion arms the feature, or refuses when it fails: an
+            // unreconciled disk/snapshot mismatch would read as user
+            // intervention to the next recompute's guard.
+            Some(snapshot) => self.spawn_accent_task(AccentInflight::EnableRestore { snapshot }),
             // The normal enable: the live accents are the user's —
             // capture them so disable can put them back. Checked persist,
             // and the snapshot goes first: if a later step fails, a
@@ -856,9 +1193,10 @@ impl Window {
             // benign kept-snapshot shape (its values are the live
             // accents, so the eventual deferred restore is a no-op).
             None => {
+                let context = context.clone();
                 let (light, dark) = accent::read_current_accents(handles);
                 let snapshot = accent::AccentSnapshot { light, dark };
-                if let Err(error) = self.config.set_accent_snapshot(context, Some(snapshot)) {
+                if let Err(error) = self.config.set_accent_snapshot(&context, Some(snapshot)) {
                     // The derive's setter mutates the field before
                     // writing — undo that, or the un-persisted snapshot
                     // would sidestep every safeguard built on it.
@@ -870,12 +1208,26 @@ impl Window {
                     self.persist_accent_disabled();
                     return Task::none();
                 }
+                self.arm_accent_enable()
             }
         }
+    }
+
+    /// The enable's tail, shared by the normal (inline) path and the
+    /// deferred-restore completion: clear the stale `last_written`, flip the
+    /// setting on, arm a compute. Runs only once the snapshot situation is
+    /// settled — persisted on the normal path, restored on the deferred one.
+    fn arm_accent_enable(&mut self) -> app::Task<Message> {
+        let Some(context) = self.config_context.clone() else {
+            // Checked before anything was persisted or spawned; refusing
+            // here (test-only in practice) keeps the sequencing honest.
+            tracing::warn!("cannot enable accent-from-wallpaper: applet config is not persistable");
+            return Task::none();
+        };
         // Nothing of ours is on disk yet as far as this enablement is
         // concerned; a stale pair would trip the don't-clobber compare.
         let recorded = self.config.accent_last_written;
-        if let Err(error) = self.config.set_accent_last_written(context, None) {
+        if let Err(error) = self.config.set_accent_last_written(&context, None) {
             self.config.accent_last_written = recorded; // setter mutates first
             tracing::warn!(
                 "cannot enable accent-from-wallpaper: \
@@ -886,7 +1238,7 @@ impl Window {
         }
         // The toggle lands last: a failure prefix of this sequence never
         // leaves `accent_enabled = true` on disk over unpersisted state.
-        if let Err(error) = self.config.set_accent_enabled(context, true) {
+        if let Err(error) = self.config.set_accent_enabled(&context, true) {
             self.config.accent_enabled = false; // setter mutates first
             tracing::warn!("cannot enable accent-from-wallpaper: {error}");
             self.persist_accent_disabled();
@@ -920,12 +1272,20 @@ impl Window {
     /// feature over state the toggler never built. Best-effort — when even
     /// this write fails there is nothing left to do but log.
     fn persist_accent_disabled(&self) {
+        self.persist_accent_flag(false);
+    }
+
+    /// Raw single-key persist of `accent_enabled`, bypassing the in-memory
+    /// struct: the enable-refusal pin ([`Window::persist_accent_disabled`])
+    /// and the record of a toggle deferred behind the write guard (the
+    /// completion's reconcile re-reads it from disk). Best-effort.
+    fn persist_accent_flag(&self, enabled: bool) {
         use cosmic_config::ConfigSet as _;
 
         if let Some(context) = &self.config_context
-            && let Err(error) = context.set("accent_enabled", false)
+            && let Err(error) = context.set("accent_enabled", enabled)
         {
-            tracing::warn!("failed to persist the refused accent enable: {error}");
+            tracing::warn!("failed to persist the requested accent toggle: {error}");
         }
     }
 
@@ -1426,6 +1786,10 @@ impl cosmic::Application for Window {
             last_updated: None,
             last_error: None,
             accent_handles,
+            accent_write_generation: 0,
+            accent_inflight: None,
+            accent_recompute_queued: false,
+            accent_flip_requested: None,
         };
         let timer = window.schedule_refresh(delay);
         // Shuffle restored as enabled starts a fresh full-interval cycle.
@@ -1498,13 +1862,31 @@ impl cosmic::Application for Window {
                 // never snapshot on enable). Adopt everything *except* the
                 // accent fields, then route the flip through the toggle
                 // path, which persists the resulting accent state itself.
-                let accent_flip = (config.accent_enabled != self.config.accent_enabled)
-                    .then_some(config.accent_enabled);
-                if accent_flip.is_some() {
+                //
+                // **Unless an accent theme task is in flight**: while our
+                // own multi-key persists are being echoed back, the payloads
+                // can be stale or torn relative to in-memory state (the
+                // 2026-08-08 btrfs incident: minute-long writes made an echo
+                // read as an external disable, and routing it through the
+                // lifecycle oscillated enable→disarm→re-enable, rewriting
+                // the themes each round). The in-memory accent fields stay
+                // authoritative and *no* flip is routed; the task's
+                // completion reconciles against a fresh disk read instead.
+                let accent_flip = if self.accent_inflight.is_some() {
                     config.accent_enabled = self.config.accent_enabled;
                     config.accent_snapshot = self.config.accent_snapshot;
                     config.accent_last_written = self.config.accent_last_written;
-                }
+                    None
+                } else {
+                    let flip = (config.accent_enabled != self.config.accent_enabled)
+                        .then_some(config.accent_enabled);
+                    if flip.is_some() {
+                        config.accent_enabled = self.config.accent_enabled;
+                        config.accent_snapshot = self.config.accent_snapshot;
+                        config.accent_last_written = self.config.accent_last_written;
+                    }
+                    flip
+                };
                 self.config = config;
                 let mut tasks = Vec::new();
                 if retention_reduced {
@@ -1626,7 +2008,13 @@ impl cosmic::Application for Window {
                 }
             }
             Message::SetAccentEnabled(enabled) => return self.set_accent_enabled(enabled),
-            Message::AccentComputed { source, hue } => self.finish_accent_compute(source, hue),
+            Message::AccentComputed { source, hue } => {
+                return self.finish_accent_compute(source, hue);
+            }
+            Message::AccentWriteFinished {
+                generation,
+                success,
+            } => return self.finish_accent_task(generation, success),
             Message::Surface(action) => {
                 return cosmic::surface::surface_task(action);
             }
@@ -3222,6 +3610,29 @@ mod tests {
         }
     }
 
+    /// Run the pending accent theme task synchronously and feed its
+    /// completion back through `update` — the test-side stand-in for the
+    /// blocking pool, using the *production* job derivation
+    /// ([`accent_job`] + [`run_accent_job`]) so it cannot drift from what
+    /// the spawned task would have done. Loops because a completion can
+    /// chain another task (a rollback, a reconciled disable's restore).
+    fn settle_accent_tasks(window: &mut Window) {
+        use cosmic::Application as _;
+
+        while let Some(inflight) = window.accent_inflight.clone() {
+            let handles = window
+                .accent_handles
+                .clone()
+                .expect("an in-flight accent task requires theme handles");
+            let success = run_accent_job(&handles, accent_job(&inflight));
+            let generation = window.accent_write_generation;
+            drop(window.update(Message::AccentWriteFinished {
+                generation,
+                success,
+            }));
+        }
+    }
+
     #[test]
     fn accent_computed_writes_snapshots_and_persists_last_written() {
         use cosmic::Application as _;
@@ -3233,6 +3644,7 @@ mod tests {
 
         let hue = Some(200.0);
         drop(window.update(Message::AccentComputed { source, hue }));
+        settle_accent_tasks(&mut window);
 
         // Both builders hold the transplanted colours…
         let expected = expected_pair(hue);
@@ -3270,6 +3682,10 @@ mod tests {
             hue: Some(120.0),
         }));
 
+        assert!(
+            window.accent_inflight.is_none(),
+            "a stale result must not even spawn a write"
+        );
         assert_eq!(current_accents(&window), (None, None));
         assert_eq!(window.config.accent_snapshot, None);
         assert_eq!(window.config.accent_last_written, None);
@@ -3354,6 +3770,7 @@ mod tests {
             source,
             hue: Some(30.0),
         }));
+        settle_accent_tasks(&mut window);
         assert_eq!(
             window.config.accent_last_written,
             Some(expected_pair(Some(30.0)))
@@ -3361,10 +3778,16 @@ mod tests {
         assert_eq!(window.config.accent_snapshot, Some(user));
         assert_ne!(current_accents(&window), (user.light, user.dark));
 
-        // Toggle off: the snapshot comes back verbatim — including the
-        // palette-default `None` dark — and the feature state is cleared,
-        // on disk too.
+        // Toggle off: the setting flips immediately, the restore runs as a
+        // task, and the snapshot comes back verbatim — including the
+        // palette-default `None` dark — with the feature state cleared, on
+        // disk too.
         drop(window.update(Message::SetAccentEnabled(false)));
+        assert!(
+            !window.config.accent_enabled,
+            "the toggle must not wait on theme I/O"
+        );
+        settle_accent_tasks(&mut window);
         assert!(!window.config.accent_enabled);
         assert_eq!(window.config.accent_snapshot, None);
         assert_eq!(window.config.accent_last_written, None);
@@ -3427,6 +3850,7 @@ mod tests {
             source,
             hue: Some(200.0),
         }));
+        settle_accent_tasks(&mut window);
         assert_ne!(current_accents(&window), (user.light, user.dark));
 
         // A repeated SetAccentEnabled(true) — an echo, not a flip — must not
@@ -3437,6 +3861,7 @@ mod tests {
 
         // Disable still restores the true pre-feature accents.
         drop(window.update(Message::SetAccentEnabled(false)));
+        settle_accent_tasks(&mut window);
         assert_eq!(current_accents(&window), (user.light, user.dark));
     }
 
@@ -3454,6 +3879,7 @@ mod tests {
             source,
             hue: Some(200.0),
         }));
+        settle_accent_tasks(&mut window);
         restore_dir_permissions(&locked);
 
         // The write failed: nothing recorded as written (so the next
@@ -3502,6 +3928,7 @@ mod tests {
             source: source.clone(),
             hue: Some(200.0),
         }));
+        settle_accent_tasks(&mut window);
         restore_dir_permissions(&locked);
 
         // The feature stays enabled and armed for a retry, snapshot kept…
@@ -3517,6 +3944,7 @@ mod tests {
             source,
             hue: Some(200.0),
         }));
+        settle_accent_tasks(&mut window);
         assert!(window.config.accent_enabled);
         assert_eq!(
             window.config.accent_last_written,
@@ -3546,6 +3974,7 @@ mod tests {
             source,
             hue: Some(200.0),
         }));
+        settle_accent_tasks(&mut window);
         let ours = current_accents(&window);
         assert_ne!(ours, (user.light, user.dark));
 
@@ -3556,6 +3985,7 @@ mod tests {
         // enable's deferred restore is the retry mechanism.
         let locked = read_only_theme_dirs(&dir);
         drop(window.update(Message::SetAccentEnabled(false)));
+        settle_accent_tasks(&mut window);
         restore_dir_permissions(&locked);
 
         assert!(!window.config.accent_enabled);
@@ -3567,10 +3997,12 @@ mod tests {
         // The retry is real: re-enabling runs the deferred restore, and a
         // clean disable then ends on the user's pre-feature accents.
         drop(window.update(Message::SetAccentEnabled(true)));
+        settle_accent_tasks(&mut window);
         assert!(window.config.accent_enabled);
         assert_eq!(window.config.accent_snapshot, Some(user));
         assert_eq!(current_accents(&window), (user.light, user.dark));
         drop(window.update(Message::SetAccentEnabled(false)));
+        settle_accent_tasks(&mut window);
         assert_eq!(window.config.accent_snapshot, None);
         assert_eq!(current_accents(&window), (user.light, user.dark));
     }
@@ -3611,6 +4043,7 @@ mod tests {
 
         let locked = read_only_theme_dirs(&dir);
         drop(window.update(Message::ConfigUpdated(external)));
+        settle_accent_tasks(&mut window);
         restore_dir_permissions(&locked);
 
         // Refused: off in memory *and* on disk, snapshot kept in both.
@@ -3680,6 +4113,7 @@ mod tests {
             source,
             hue: Some(200.0),
         }));
+        settle_accent_tasks(&mut window);
         assert_eq!(
             window.config.accent_last_written,
             Some(expected_pair(Some(200.0)))
@@ -3723,6 +4157,9 @@ mod tests {
             source: source.clone(),
             hue: Some(200.0),
         }));
+        // The write task lands, its record's persist fails, and the chained
+        // rollback task undoes the write — all before the guard clears.
+        settle_accent_tasks(&mut window);
         restore_dir_permissions(&locked);
 
         // Themes rolled back to the user's accents, nothing recorded, still
@@ -3738,6 +4175,7 @@ mod tests {
             source,
             hue: Some(200.0),
         }));
+        settle_accent_tasks(&mut window);
         assert_eq!(
             window.config.accent_last_written,
             Some(expected_pair(Some(200.0)))
@@ -3847,6 +4285,7 @@ mod tests {
             source: source.clone(),
             hue: Some(200.0),
         }));
+        settle_accent_tasks(&mut window);
         let ours = current_accents(&window);
         assert_ne!(ours, (user.light, user.dark));
 
@@ -3860,6 +4299,7 @@ mod tests {
         assert_eq!(current_accents(&window), ours);
 
         drop(window.update(Message::SetAccentEnabled(true)));
+        settle_accent_tasks(&mut window);
         // The kept snapshot survives (not clobbered by our on-disk accents)…
         assert_eq!(window.config.accent_snapshot, Some(user));
         assert_eq!(window.config.accent_last_written, None);
@@ -3872,11 +4312,13 @@ mod tests {
             source,
             hue: Some(30.0),
         }));
+        settle_accent_tasks(&mut window);
         assert!(window.config.accent_enabled, "must not have disarmed");
         assert_ne!(current_accents(&window), (user.light, user.dark));
 
         // …and disable restores the true pre-feature accents, not run A's.
         drop(window.update(Message::SetAccentEnabled(false)));
+        settle_accent_tasks(&mut window);
         assert_eq!(current_accents(&window), (user.light, user.dark));
         assert_eq!(window.config.accent_snapshot, None);
     }
@@ -3901,6 +4343,7 @@ mod tests {
 
         let locked = read_only_theme_dirs(&dir);
         drop(window.update(Message::SetAccentEnabled(true)));
+        settle_accent_tasks(&mut window);
         restore_dir_permissions(&locked);
 
         assert!(!window.config.accent_enabled);
@@ -3940,6 +4383,7 @@ mod tests {
             source,
             hue: Some(200.0),
         }));
+        settle_accent_tasks(&mut window);
         assert_ne!(current_accents(&window), (user.light, user.dark));
 
         // External disable: the snapshot is restored and the state cleared,
@@ -3947,6 +4391,7 @@ mod tests {
         let mut external = window.config.clone();
         external.accent_enabled = false;
         drop(window.update(Message::ConfigUpdated(external)));
+        settle_accent_tasks(&mut window);
         assert!(!window.config.accent_enabled);
         assert_eq!(window.config.accent_snapshot, None);
         assert_eq!(window.config.accent_last_written, None);
@@ -3979,6 +4424,7 @@ mod tests {
             source: source.clone(),
             hue: Some(200.0),
         }));
+        settle_accent_tasks(&mut window);
 
         // The user picks new accents in Settings; the next recompute disarms
         // without restoring.
@@ -4001,11 +4447,216 @@ mod tests {
             source,
             hue: Some(30.0),
         }));
+        settle_accent_tasks(&mut window);
 
         // Disable restores what re-enable captured, not the originals.
         drop(window.update(Message::SetAccentEnabled(false)));
+        settle_accent_tasks(&mut window);
         assert_eq!(current_accents(&window), (manual.light, manual.dark));
         assert_ne!(current_accents(&window), (original.light, original.dark));
+    }
+
+    // -----------------------------------------------------------------
+    // The write guard (2026-08-08 btrfs incident): while an accent theme
+    // task is in flight, echoes must not run the toggle lifecycle, results
+    // are deferred, stale completions are ignored, and the completion
+    // reconciles against a fresh disk read.
+    // -----------------------------------------------------------------
+
+    /// An [`accent_window`] with a `Write` task in flight for `hue` 200°:
+    /// the state the incident's echoes arrived in.
+    fn window_with_inflight_write(dir: &tempfile::TempDir) -> (Window, PathBuf) {
+        use cosmic::Application as _;
+
+        let mut window = accent_window(dir);
+        let source = PathBuf::from("/imgs/20260808-Foo_ROW1_UHD.jpg");
+        window.current = Some(source.clone());
+        drop(window.update(Message::AccentComputed {
+            source: source.clone(),
+            hue: Some(200.0),
+        }));
+        assert!(
+            matches!(window.accent_inflight, Some(AccentInflight::Write { .. })),
+            "the compute must have spawned a write task"
+        );
+        (window, source)
+    }
+
+    #[test]
+    fn a_config_echo_during_an_inflight_write_is_not_routed_through_the_lifecycle() {
+        use cosmic::Application as _;
+
+        // The incident's oscillation: our own multi-key persists echoed back
+        // stale/torn while the minute-long theme write flew, the apparent
+        // `accent_enabled` flip ran the disable lifecycle, and the
+        // enable→disarm→re-enable loop rewrote both themes each round. An
+        // echo arriving mid-flight must leave every accent field alone —
+        // while still adopting genuine non-accent changes.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut window, _) = window_with_inflight_write(&dir);
+        let snapshot = window.config.accent_snapshot;
+
+        let mut echo = window.config.clone();
+        echo.accent_enabled = false;
+        echo.accent_snapshot = None;
+        echo.accent_last_written = None;
+        echo.retention_days = 30;
+        drop(window.update(Message::ConfigUpdated(echo)));
+
+        assert!(window.config.accent_enabled, "no disable routed");
+        assert_eq!(window.config.accent_snapshot, snapshot, "snapshot kept");
+        assert!(
+            matches!(window.accent_inflight, Some(AccentInflight::Write { .. })),
+            "the in-flight write survives the echo"
+        );
+        assert_eq!(window.config.retention_days, 30, "non-accent fields adopt");
+
+        // Completion: the write lands once, the reconcile's fresh disk read
+        // agrees with memory (the disk still says enabled) — no second write
+        // cycle, no disarm.
+        settle_accent_tasks(&mut window);
+        assert!(window.config.accent_enabled);
+        assert_eq!(
+            window.config.accent_last_written,
+            Some(expected_pair(Some(200.0)))
+        );
+        let persisted = persisted_config(&window);
+        assert!(persisted.accent_enabled);
+        assert_eq!(
+            persisted.accent_last_written,
+            window.config.accent_last_written
+        );
+        assert_eq!(persisted.accent_snapshot, window.config.accent_snapshot);
+    }
+
+    #[test]
+    fn a_stale_accent_write_completion_is_ignored() {
+        use cosmic::Application as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut window, _) = window_with_inflight_write(&dir);
+
+        // A completion from a superseded generation — even one claiming
+        // success — must not retire the guard or persist a record for a
+        // write that never ran.
+        drop(window.update(Message::AccentWriteFinished {
+            generation: 0,
+            success: true,
+        }));
+        assert!(
+            window.accent_inflight.is_some(),
+            "the guard must survive a stale completion"
+        );
+        assert_eq!(
+            window.config.accent_last_written, None,
+            "a stale completion must not persist a record"
+        );
+
+        // The real completion still lands normally.
+        settle_accent_tasks(&mut window);
+        assert_eq!(
+            window.config.accent_last_written,
+            Some(expected_pair(Some(200.0)))
+        );
+    }
+
+    #[test]
+    fn an_accent_result_during_an_inflight_write_is_deferred_and_rearmed() {
+        use cosmic::Application as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut window, source) = window_with_inflight_write(&dir);
+
+        // A second result while the first write flies: acting on it would
+        // plan against builders our own task is mutating. It is dropped and
+        // queued instead — no second task, nothing persisted for it.
+        drop(window.update(Message::AccentComputed {
+            source,
+            hue: Some(30.0),
+        }));
+        assert!(window.accent_recompute_queued, "deferred, not executed");
+        assert!(
+            matches!(window.accent_inflight, Some(AccentInflight::Write { .. })),
+            "still the first write, no second task"
+        );
+
+        // The completion re-arms a fresh compute (the task itself is opaque
+        // here; the cleared flag is the observable hand-off) and the first
+        // write's record is what landed.
+        settle_accent_tasks(&mut window);
+        assert!(!window.accent_recompute_queued);
+        assert_eq!(
+            window.config.accent_last_written,
+            Some(expected_pair(Some(200.0)))
+        );
+    }
+
+    #[test]
+    fn the_post_task_reconcile_adopts_the_fresh_disk_state() {
+        use cosmic::Application as _;
+        use cosmic_config::CosmicConfigEntry as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut window, _) = window_with_inflight_write(&dir);
+
+        // A genuine external disable lands on the disk while the write
+        // flies; its echo is suppressed (see the echo test), so only the
+        // disk records it.
+        let mut external = persisted_config(&window);
+        external.accent_enabled = false;
+        external
+            .write_entry(window.config_context.as_ref().unwrap())
+            .unwrap();
+        drop(window.update(Message::ConfigUpdated(external)));
+        assert!(window.config.accent_enabled, "echo suppressed mid-flight");
+
+        // The completion reconciles against the fresh disk read — not the
+        // echo payload — and routes the disable through the real lifecycle:
+        // off, snapshot restored and cleared, record cleared, themes back to
+        // the user's accents.
+        settle_accent_tasks(&mut window);
+        assert!(!window.config.accent_enabled);
+        assert_eq!(window.config.accent_snapshot, None);
+        assert_eq!(window.config.accent_last_written, None);
+        assert_eq!(
+            current_accents(&window),
+            (None, None),
+            "the routed disable undid the landed write"
+        );
+        assert!(!persisted_config(&window).accent_enabled);
+    }
+
+    #[test]
+    fn a_toggle_during_an_inflight_write_is_deferred_to_the_reconcile() {
+        use cosmic::Application as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut window, _) = window_with_inflight_write(&dir);
+
+        // The user flips the toggler off mid-write: the lifecycle must not
+        // race the running task, so the request is recorded (the toggler
+        // renders it immediately) and pinned onto the disk config for the
+        // completion's fresh-read reconcile.
+        drop(window.update(Message::SetAccentEnabled(false)));
+        assert!(
+            window.config.accent_enabled,
+            "the lifecycle itself is deferred"
+        );
+        assert!(
+            !window.accent_toggler_state(),
+            "the row answers immediately"
+        );
+        assert!(!persisted_config(&window).accent_enabled, "pinned on disk");
+        assert!(window.accent_inflight.is_some());
+
+        // Completion: the reconcile routes the real disable — restore,
+        // clear, all persisted.
+        settle_accent_tasks(&mut window);
+        assert!(!window.config.accent_enabled);
+        assert_eq!(window.config.accent_snapshot, None);
+        assert_eq!(window.config.accent_last_written, None);
+        assert_eq!(current_accents(&window), (None, None));
+        assert_eq!(persisted_config(&window), window.config);
     }
 
     #[tokio::test]
