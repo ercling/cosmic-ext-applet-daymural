@@ -162,7 +162,14 @@ the pinned rev before coding against remembered names.
     `build_theme` pattern; ~20 of 39 keys on an accent change — every
     component's `focus` ring is the accent — vs the full rewrite that fed the
     2026-08-08 btrfs fsync freeze, and a smaller torn-read window for other
-    COSMIC processes, which read the theme dir non-atomically). A virgin
+    COSMIC processes, which read the theme dir non-atomically). The diff
+    compares **serialized bytes** (`would_rewrite`, same ron/PrettyConfig as
+    cosmic-config's `set`), never `PartialEq`: colour-bearing fields
+    round-trip lossily (hex `ColorRepr` quantisation), so a value compare
+    re-flags every component key forever and rewrites an *unchanged* mode
+    byte-identically — upstream's value-space diff has exactly that hole,
+    and the mtime-pinned `theme_rewrites_transact_only_the_changed_keys`
+    exists because content assertions cannot see it. A virgin
     theme dir (probed via `is_dark`) still gets one full `write_entry`:
     diffing against `get_entry`'s absent-key default would diff against
     `Theme::preferred_theme()`, which is *environment-dependent*. Both writes
@@ -183,16 +190,27 @@ the pinned rev before coding against remembered names.
   - **Write guard** (`accent_inflight` + generation counter, stale
     completions ignored): at most one theme task ever runs, and while one
     does (a) `AccentComputed` results are dropped-and-rearmed
-    (`accent_recompute_queued`), (b) `ConfigUpdated` keeps every accent field
-    from memory and routes **no** flip — our own multi-key persists echo back
-    stale/torn during a slow write, and routing an apparent flip is what
-    oscillated enable→disarm→re-enable in the incident, rewriting both themes
-    each round — and (c) toggles are recorded (`accent_flip_requested`,
-    rendered by the toggler via `accent_toggler_state`, pinned to disk raw).
+    (`accent_recompute_queued`), (b) no `ConfigUpdated` flip is routed, and
+    (c) toggles are recorded (`accent_flip_requested`, rendered by the
+    toggler via `accent_toggler_state`, pinned to disk raw).
+    `ConfigUpdated` **never adopts the three accent fields from a watcher
+    payload, in-flight or not**: payloads are read at event time and can be
+    delivered late, so even after the guard drops an echo can carry
+    mid-flight state (adopting its `last_written: None` disarms spuriously
+    on the next recompute — the oscillation class); in-memory accent state
+    is authoritative (single-instance assumption), and a not-in-flight
+    payload flip is only routed after a **fresh disk read** confirms it.
     The completion reconciles once: a recorded user toggle wins (a
     concurrent `set_config` full-entry write can rewrite the pinned disk
-    flag from stale memory), else a **fresh disk read** of the config —
-    never the suppressed echo payloads.
+    flag from stale memory), else a genuine external flip — evidenced by
+    the disk flag read **before the completion's own persists** (they
+    rewrite that very key: `arm_accent_enable` pins it `true`, a disable
+    completion's `set_config` rewrites it `false` — reading after them
+    reads our own write back and stomps the flip) differing from the
+    flight's **spawn-time baseline** (`accent_disk_enabled_at_spawn`; a
+    bare disk-vs-memory compare would misread the enable's
+    flag-lands-last ordering as an external disable). Never the
+    suppressed echo payloads.
   - **Don't-clobber / disarm**: before each write, current builder accents are
     compared to `accent_last_written` in exact `[u8; 3]` space (we quantise,
     write the `u8/255` f32 via `set_accent` — exact-f32 RON round-trip — and
@@ -241,7 +259,17 @@ the pinned rev before coding against remembered names.
     first write it undoes (persist failure aborts the write), and a
     `last_written` that cannot be persisted rolls the theme write back so the
     guard still holds. The setters mutate the field before writing, so every
-    error path also rolls the in-memory field back. Remaining exposure is a
+    error path also rolls the in-memory field back. When the rollback *itself*
+    fails too (themes and config failing together), the themes keep the new
+    pair, memory adopts it — and the **on-disk record is repaired**
+    (`finish_rollback`): memory now equals the themes, so every later
+    recompute Skips and nothing would ever overwrite the stale on-disk
+    record — a restart would hit the destructive
+    `Disarm { keep_snapshot: false }`. Best-effort ladder: persist
+    `Some(pair)` (a restart then Skips); failing that, clear it to `None`
+    (the gap shape, whose disarm keeps the snapshot); only both failing —
+    the config wholly unwritable — leaves the destructive shape, with
+    nothing writable left to repair it. Remaining exposure is a
     genuine crash between the theme write and its record — accepted, and the
     gap disarm keeping the snapshot makes even that recoverable via
     re-enable.

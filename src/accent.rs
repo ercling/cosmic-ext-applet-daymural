@@ -572,6 +572,16 @@ fn write_builder_accent(
 /// `Rgb`/`Rgba` variants, so readers parse them fine, and the bare f32 form
 /// round-trips exactly (the hex repr quantises to `u8`, which would re-flag
 /// the key as changed on every subsequent diff).
+///
+/// The diff itself compares **serialized bytes**, not values
+/// ([`would_rewrite`]): every colour inside `Component`/`Container`
+/// serializes through the lossy hex `ColorRepr` quantisation, so a freshly
+/// built value practically never `PartialEq`-equals its own disk round-trip
+/// even when the text a write would produce is identical. Upstream diffs in
+/// value space and silently rewrites every colour-bearing key byte-for-byte
+/// on an unchanged mode (~19 pointless fsyncs — half the freeze's I/O);
+/// "would this key's bytes change?" is the only predicate that actually
+/// delivers the changed-keys-only transaction.
 fn write_theme(cfg: &Config, new: &Theme) -> Result<(), cosmic_config::Error> {
     if ConfigGet::get::<bool>(cfg, "is_dark").is_err() {
         return new.write_entry(cfg);
@@ -585,12 +595,12 @@ fn write_theme(cfg: &Config, new: &Theme) -> Result<(), cosmic_config::Error> {
     let tx = cfg.transaction();
     macro_rules! set_changed {
         ($key:literal, $field:ident) => {
-            if current.$field != new.$field {
+            if would_rewrite(&current.$field, &new.$field) {
                 ConfigSet::set(&tx, $key, &new.$field)?;
             }
         };
         ($key:literal, $accessor:ident($transparent:literal)) => {
-            if current.$accessor($transparent) != new.$accessor($transparent) {
+            if would_rewrite(current.$accessor($transparent), new.$accessor($transparent)) {
                 ConfigSet::set(&tx, $key, new.$accessor($transparent))?;
             }
         };
@@ -635,6 +645,25 @@ fn write_theme(cfg: &Config, new: &Theme) -> Result<(), cosmic_config::Error> {
     set_changed!("control_tint", control_tint);
     set_changed!("text_tint", text_tint);
     tx.commit()
+}
+
+/// Whether writing `new` in place of `current` would change the key file's
+/// bytes — the diff predicate of [`write_theme`]. Serializes both sides
+/// exactly like the transaction's `set` does (`ron::ser::to_string_pretty`,
+/// default `PrettyConfig`; same `ron` 0.12.x as cosmic-config) and compares
+/// the text: colour-bearing theme fields round-trip lossily in value space
+/// (hex `ColorRepr` quantisation), so a `PartialEq` compare flags them as
+/// changed forever even when the bytes are identical. A value that fails to
+/// serialize counts as changed, so the transaction's own `set` surfaces the
+/// error instead of it being swallowed here.
+fn would_rewrite<T: serde::Serialize>(current: &T, new: &T) -> bool {
+    match (
+        ron::ser::to_string_pretty(current, ron::ser::PrettyConfig::new()),
+        ron::ser::to_string_pretty(new, ron::ser::PrettyConfig::new()),
+    ) {
+        (Ok(current), Ok(new)) => current != new,
+        _ => true,
+    }
 }
 
 // ---- pure apply/disarm decision ---------------------------------------------
@@ -1296,6 +1325,58 @@ mod tests {
         out
     }
 
+    /// Pin every key file under `root` to the given mtime (recursively).
+    fn set_all_mtimes(root: &std::path::Path, to: std::time::SystemTime) {
+        fn walk(dir: &std::path::Path, to: std::time::SystemTime) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, to);
+                } else {
+                    std::fs::File::options()
+                        .write(true)
+                        .open(&path)
+                        .unwrap()
+                        .set_modified(to)
+                        .unwrap();
+                }
+            }
+        }
+        walk(root, to);
+    }
+
+    /// The key files under `root` whose mtime is newer than `than` —
+    /// i.e. the files a rewrite physically touched after
+    /// [`set_all_mtimes`] pinned everything to `than`.
+    fn files_newer_than(
+        root: &std::path::Path,
+        than: std::time::SystemTime,
+    ) -> std::collections::BTreeSet<String> {
+        fn walk(
+            dir: &std::path::Path,
+            than: std::time::SystemTime,
+            out: &mut std::collections::BTreeSet<String>,
+        ) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, than, out);
+                } else if path.metadata().unwrap().modified().unwrap() > than {
+                    out.insert(path.file_name().unwrap().to_string_lossy().into_owned());
+                }
+            }
+        }
+        let mut out = std::collections::BTreeSet::new();
+        walk(root, than, &mut out);
+        out
+    }
+
     #[test]
     fn theme_rewrites_transact_only_the_changed_keys() {
         // The first write materialises the full derived theme (deterministic
@@ -1305,6 +1386,14 @@ mod tests {
         // was the fsync storm behind the 2026-08-08 btrfs freeze, and every
         // key rewritten is a window in which other COSMIC processes read a
         // torn theme.
+        //
+        // Content comparison alone cannot pin this down: a regression back
+        // to a full `write_entry` rewrites the unchanged keys with
+        // byte-identical contents, passing every content assertion while
+        // restoring the fsync storm. So every key file's mtime is pinned to
+        // a sentinel first, and the set of files *physically rewritten*
+        // (mtime moved — the atomic temp-then-rename gives rewritten keys a
+        // fresh timestamp) must be exactly the set whose contents changed.
         let dir = tempfile::tempdir().unwrap();
         let handles = ThemeHandles::sandboxed(dir.path()).unwrap();
         let light_dir = dir.path().join("cosmic").join(LIGHT_THEME_ID);
@@ -1323,6 +1412,10 @@ mod tests {
         write(&handles, [7, 133, 217], [250, 41, 90]);
         let light_before = key_contents_under(&light_dir);
         let dark_before = key_contents_under(&dark_dir);
+        let sentinel =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        set_all_mtimes(&light_dir, sentinel);
+        set_all_mtimes(&dark_dir, sentinel);
 
         // Change only the light accent; the dark pair is byte-identical.
         write(&handles, [200, 10, 10], [250, 41, 90]);
@@ -1332,12 +1425,19 @@ mod tests {
             light_after.keys().collect::<Vec<_>>(),
             "a diff write must not create or delete keys"
         );
-        let changed: Vec<&str> = light_after
+        let changed: std::collections::BTreeSet<String> = light_after
             .iter()
             .filter(|(key, contents)| light_before[*key] != **contents)
-            .map(|(key, _)| key.as_str())
+            .map(|(key, _)| key.clone())
             .collect();
-        assert!(changed.contains(&"accent"), "changed: {changed:?}");
+        let rewritten = files_newer_than(&light_dir, sentinel);
+        assert_eq!(
+            rewritten, changed,
+            "exactly the keys whose value changed may be rewritten — \
+             an unchanged key rewritten byte-identically is a full-\
+             `write_entry` regression the contents cannot show"
+        );
+        assert!(changed.contains("accent"), "changed: {changed:?}");
         for untouched in [
             "palette",
             "spacing",
@@ -1347,7 +1447,7 @@ mod tests {
             "name",
         ] {
             assert!(
-                !changed.contains(&untouched),
+                !changed.contains(untouched),
                 "{untouched} must not be rewritten by an accent change (changed: {changed:?})"
             );
         }
@@ -1365,8 +1465,14 @@ mod tests {
             light_after.len()
         );
         // The unchanged dark mode saw no writes at all: the builder setter is
-        // write-on-change and the theme diff is empty.
+        // write-on-change and the theme diff is empty — no dark key file was
+        // even touched.
         assert_eq!(dark_before, key_contents_under(&dark_dir));
+        assert_eq!(
+            files_newer_than(&dark_dir, sentinel),
+            std::collections::BTreeSet::new(),
+            "the unchanged dark theme must see no file writes at all"
+        );
     }
 
     #[test]

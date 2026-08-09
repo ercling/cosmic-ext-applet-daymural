@@ -53,6 +53,11 @@ rust-embed = { version = "8", features = ["debug-embed"] }
 # else tokio-ish (reqwest I/O, libcosmic's executor) enables its own
 # features additively.
 tokio = { version = "1", features = ["macros", "rt", "time"] }
+# Same 0.12.x cosmic-config serializes keys with (one copy in the graph):
+# `accent::write_theme` diffs the *serialized* forms to decide whether a key
+# write would change its bytes — several theme fields round-trip lossily in
+# value space, so a value compare cannot answer that question.
+ron = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

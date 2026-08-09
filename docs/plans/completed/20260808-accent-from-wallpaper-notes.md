@@ -242,14 +242,60 @@ Two root causes, two fixes (branch `fix-accent-async-writes`):
   writes are fast). Stale echo → spurious disable/disarm → re-enable →
   another full write cycle → more echoes. Fixed with a write guard:
   while an accent task is in flight (`accent_inflight`, generation counter,
-  stale completions ignored) `ConfigUpdated` keeps all three accent fields
-  from memory and routes no flip, `AccentComputed` results are
-  dropped-and-rearmed, and user toggles are recorded + pinned to disk; the
-  task's completion reconciles exactly once — a recorded user toggle wins
-  (a concurrent `set_config` full-entry write can rewrite the pinned disk
-  flag from stale memory), else a **fresh disk read** (never the suppressed
-  echo payloads) — and routes a genuine flip through the normal lifecycle
-  then.
+  stale completions ignored) `ConfigUpdated` routes no flip,
+  `AccentComputed` results are dropped-and-rearmed, and user toggles are
+  recorded + pinned to disk; the task's completion reconciles exactly once —
+  a recorded user toggle wins (a concurrent `set_config` full-entry write
+  can rewrite the pinned disk flag from stale memory), else a genuine
+  external flip read from the **disk** (never the suppressed echo payloads)
+  — and routes it through the normal lifecycle then.
+
+  A follow-up review round (2026-08-09) hardened three edges of that guard:
+
+  - `ConfigUpdated` now **never adopts the three accent fields from a
+    watcher payload — in-flight or not**. Payloads are read at event time
+    and can be delivered a message late, so a stale echo can arrive *after*
+    `AccentWriteFinished` retired the guard; adopting its mid-flight
+    `accent_last_written: None` while the builders hold the new pair makes
+    the next recompute Disarm spuriously (feature off, accent stranded —
+    the oscillation class under I/O pressure). In-memory accent state is
+    authoritative (single-instance assumption); a not-in-flight payload
+    flip is treated as evidence only and routed with the value a fresh
+    disk read confirms.
+  - The completion's reconcile takes its fresh disk read **before the
+    completion handlers' own persists** and compares it against a
+    **spawn-time baseline** (`accent_disk_enabled_at_spawn`, kept across a
+    chained rollback). Reading after them read our own write back: an
+    `EnableRestore` completion's `arm_accent_enable` pins the flag `true`
+    over an external disable written mid-flight, and a `DisableRestore`
+    completion's full `set_config` rewrites `false` over an external
+    enable — both silently stomped instead of routed. The baseline is what
+    distinguishes a genuine mid-flight flip (disk *changed*) from the
+    enable path's deliberate flag-lands-last ordering (disk still `false`
+    during a popup-origin `EnableRestore` — no external edit happened).
+  - A rollback that itself fails (themes and config failing together) now
+    **repairs the on-disk `accent_last_written`**: the themes keep the new
+    pair, memory adopts it so this session's guard holds — but then every
+    later recompute Skips and the stale on-disk record would survive until
+    a restart hit the destructive `Disarm { keep_snapshot: false }` (the
+    old comment claimed the gap disarm covered this; it does not — the
+    record on disk is `Some`, not the gap's `None`). Best-effort ladder:
+    persist `Some(pair)` (a restart then Skips), else clear to `None` (the
+    gap shape, whose disarm keeps the snapshot); only both failing leaves
+    the destructive shape, with nothing writable left to repair it.
+
+  The same round also made the changed-keys-only claim *physically* true
+  and test-enforced: the theme diff now compares **serialized bytes**
+  (`would_rewrite`, same ron serializer as cosmic-config's `set`), because
+  colour-bearing `Component`/`Container` fields round-trip lossily through
+  the hex `ColorRepr` quantisation — upstream's value-space diff re-flags
+  every one of them forever, and byte-identically rewrote all ~19 colour
+  keys of an *unchanged* mode on each write (half the freeze's fsyncs,
+  invisible to content assertions). The
+  `theme_rewrites_transact_only_the_changed_keys` test pins every key
+  file's mtime to a sentinel and asserts the physically rewritten set
+  equals the content-changed set — and that the unchanged mode sees no
+  file writes at all.
 
 Invariants across the async split (all still test-enforced, now through
 `settle_accent_tasks` driving the completion messages): snapshot persisted

@@ -979,6 +979,7 @@ dependencies = [
  "image",
  "libcosmic",
  "reqwest",
+ "ron 0.12.2",
  "rust-embed",
  "serde",
  "serde_json",
