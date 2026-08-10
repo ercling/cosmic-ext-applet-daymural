@@ -385,14 +385,69 @@ menu on one xdg-shell stack) at the point the view decides.
 
 ### Task 5: Verify acceptance criteria
 
-- [ ] verify every popup parented to `window.popup` routes through
+- [x] verify every popup parented to `window.popup` routes through
       `TooltipSurface`/`DropdownSurface` — grep remaining `Message::Surface`
       uses and confirm each is unrelated
-- [ ] verify no surface action is cloned on any handler path
-- [ ] verify no `fl!` id was added, renamed or removed (no locale churn)
-- [ ] run the full suite: `just check` (fmt + clippy `-D warnings` + tests)
-- [ ] re-read the ledger table against the implementation and confirm every
+- [x] verify no surface action is cloned on any handler path
+- [x] verify no `fl!` id was added, renamed or removed (no locale churn)
+- [x] run the full suite: `just check` (fmt + clippy `-D warnings` + tests)
+- [x] re-read the ledger table against the implementation and confirm every
       row has a test
+
+**Verification results.**
+
+- *Routing.* The only popup creators in `src/` are `widget::dropdown::popup_dropdown`
+  (`src/view.rs:409`, `426` — both `on_surface_action: Message::DropdownSurface`),
+  `crate::tooltip::tooltip`'s `SctkPopupSettings` (`src/tooltip.rs:85`, both its
+  `on_close` and its mapper going to `Message::TooltipSurface`), and
+  `TogglePopup`'s own `app_popup` (`src/app.rs`), which creates `window.popup`
+  itself — parented to the panel, not to `window.popup`, so it is not a child
+  and needs no ledger row. `Message::Surface` has no remaining uses: the
+  variant was removed in Task 3 (see the deviation note there), so the grep is
+  empty by construction.
+- *No clones.* Both handlers `match &action` and move the untouched value into
+  `surface_task`; `grep -n 'clone()' src/tooltip.rs src/view.rs src/app.rs`
+  shows no `surface::Action` clone on any path (the tooltip's two clones are a
+  `Cow<str>` label and a `widget::Id`).
+- *No locale churn.* `git diff 7b03cf9..HEAD -- i18n/ data/` is empty and the
+  diff over `src/` touches no `fl!(` line, so the `fl!` sites at
+  `src/view.rs:323`/`474` and all 73 catalogues are untouched.
+- *Ledger rows.* Every row of the table is driven through `Window::update`:
+  arm (`a_tooltip_arm_marks_the_tooltip_open`), destroy without a dropdown
+  (`a_tooltip_destroy_clears_the_flag_when_no_dropdown_is_open`), destroy
+  behind one (`a_tooltip_destroy_is_deferred_while_a_dropdown_is_open`),
+  create + interlock (`a_dropdown_create_closes_an_open_tooltip_first`,
+  `a_dropdown_create_without_a_tooltip_only_marks_the_dropdown_open`),
+  dropdown destroy + flush
+  (`a_dropdown_destroy_clears_the_flag_and_flushes_a_deferred_tooltip_destroy`),
+  and the three `PopupClosed` ids
+  (`popup_closed_only_clears_the_matching_surface`,
+  `popup_closed_for_the_tooltip_surface_clears_only_the_tooltip`,
+  `popup_closed_for_an_unknown_surface_clears_only_the_dropdown`,
+  `a_dropdown_close_flushes_the_deferred_tooltip_destroy`). Two gaps were
+  found and closed — see below. `just check`: fmt + clippy `-D warnings`
+  clean, 271 tests pass (was 268).
+
+➕ **Gap 1 — the create row names `Popup`/`AppPopup`, only `Popup` was tested.**
+The handler does match both, but the two are distinct arms: a create arriving
+as the untested variant would fall through to the catch-all, map a menu, and
+leave the ledger believing nothing is open — precisely the two-children state
+the invariant forbids. Added `an_app_popup_dropdown_create_interlocks_the_same_way`.
+
+➕ **Gap 2 (defect) — `TogglePopup` left the ledger stale.** The
+`PopupClosed(id) | id == self.popup` row cannot fire for a popup we close
+ourselves: `TogglePopup` `take()`s `self.popup` before emitting the destroy, and
+the runtime's `Action::Destroy`
+(`iced/winit/src/platform_specific/wayland/event_loop/state.rs:1392`) sends no
+event at all — it drains `self.popups` and emits only subsurface teardown.
+`PopupEvent::Done` comes from *compositor*-initiated dismissal only. So closing
+the popup by clicking the panel icon while a dropdown was open left
+`dropdown_open == true` forever: tooltips suppressed for the rest of the
+session, and any tooltip destroy deferred with nothing left to flush it. Fixed
+by extracting `Window::clear_popup_ledger` and calling it from both paths that
+end our popup; covered by `closing_our_own_popup_resets_the_ledger`. Add this
+to the manual soak: open a dropdown, close the popup from the panel icon,
+reopen it, and confirm tooltips still appear.
 
 ### Task 6: [Final] Update documentation
 
