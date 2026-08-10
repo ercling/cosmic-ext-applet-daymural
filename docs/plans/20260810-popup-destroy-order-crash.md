@@ -282,20 +282,20 @@ that preceded it.
 - Modify: `src/app.rs`
 - Modify: `src/tooltip.rs`
 
-- [ ] expose the shared tooltip surface id (`pub fn window_id() -> window::Id`
+- [x] expose the shared tooltip surface id (`pub fn window_id() -> window::Id`
       over the existing `WINDOW_ID` `LazyLock`, `src/tooltip.rs:37`)
-- [ ] add `tooltip_open`, `dropdown_open`, `tooltip_destroy_deferred` to
+- [x] add `tooltip_open`, `dropdown_open`, `tooltip_destroy_deferred` to
       `Window` with the doc comments from Technical Details (no `init` change
       needed — `Window` derives `Default`)
-- [ ] extend `Message::PopupClosed` (`src/app.rs:1908`) to clear the flags per
+- [x] extend `Message::PopupClosed` (`src/app.rs:1908`) to clear the flags per
       the last three ledger rows, with a comment on why an id that is neither
       ours nor the tooltip's must be a dropdown
-- [ ] update the existing `popup_closed_only_clears_the_matching_surface`
+- [x] update the existing `popup_closed_only_clears_the_matching_surface`
       (`src/app.rs:3558`) with the new flag assertions rather than adding a
       parallel test
-- [ ] write tests: `PopupClosed(tooltip::window_id())` clears only
+- [x] write tests: `PopupClosed(tooltip::window_id())` clears only
       `tooltip_open`; `PopupClosed(<other id>)` clears only `dropdown_open`
-- [ ] run `just check` - must pass before task 2
+- [x] run `just check` - must pass before task 2
 
 ### Task 2: Route tooltip surface actions through the ledger
 

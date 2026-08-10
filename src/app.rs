@@ -26,7 +26,7 @@ use crate::catalogue::{self, Catalogue, ImageEntry};
 use crate::config::AppletConfig;
 // No `fl!` here: every user-visible string this applet renders lives in the
 // popup (`view.rs`). The panel contributes an icon and nothing else.
-use crate::{accent, bing, schedule, thumbs, view, wallpaper};
+use crate::{accent, bing, schedule, thumbs, tooltip, view, wallpaper};
 
 /// One name everywhere: cosmic-config app ID, state dir, desktop entry.
 pub const APP_ID: &str = "io.github.ercling.CosmicBingWallpaper";
@@ -70,6 +70,23 @@ pub struct Window {
     /// The open popup's window id (the interval dropdown needs it as the
     /// parent surface of its menu popup).
     pub(crate) popup: Option<window::Id>,
+    /// Whether a tooltip popup on the shared surface
+    /// ([`crate::tooltip::window_id`]) is armed. Armed, not mapped: the
+    /// observable signal is the widget's `surface::Action::Task`, whose
+    /// delayed future may still resolve to `Ignore`. The flag is biased
+    /// toward `true` on purpose — a spurious destroy is a runtime no-op
+    /// (`"No popup to destroy"`), a missed one strands a mapped tooltip as a
+    /// second child of `popup`, which is the crash this all exists to
+    /// prevent.
+    pub(crate) tooltip_open: bool,
+    /// Whether a dropdown menu popup is mapped. Its window id is minted
+    /// inside the widget and cannot be read at creation, so the ledger tracks
+    /// presence only — which is all the single-child invariant needs.
+    pub(crate) dropdown_open: bool,
+    /// A tooltip destroy that arrived while a dropdown was open, held back
+    /// because it would have destroyed a non-topmost popup. Flushed when the
+    /// dropdown closes.
+    pub(crate) tooltip_destroy_deferred: bool,
     /// Applet settings (shuffle, retention). Defaults when the config context
     /// is unavailable.
     pub(crate) config: AppletConfig,
@@ -362,6 +379,50 @@ pub enum Message {
 }
 
 impl Window {
+    /// A popup surface closed: ours, the tooltip's, or a dropdown menu's.
+    ///
+    /// `PopupClosed` is the *only* signal for a dropdown dismissed by grab
+    /// loss (it publishes no `DestroyPopup` of its own), so the popup ledger
+    /// is maintained here as well as on the surface actions we forward.
+    fn on_popup_closed(&mut self, id: window::Id) -> app::Task<Message> {
+        if self.popup == Some(id) {
+            // The parent is gone, and with `close_with_children` every child
+            // went with it: nothing is left to destroy, and a deferred
+            // destroy must not outlive the surface it was meant for.
+            tracing::debug!("popup closed: our own popup");
+            self.popup = None;
+            self.tooltip_open = false;
+            self.dropdown_open = false;
+            self.tooltip_destroy_deferred = false;
+            return Task::none();
+        }
+        if id == tooltip::window_id() {
+            tracing::debug!("popup closed: the tooltip");
+            self.tooltip_open = false;
+            return Task::none();
+        }
+        // By elimination: a dropdown menu. Its window id is minted inside the
+        // widget (`window::Id::unique()` into private state) and is never
+        // visible to us at creation, so a close naming neither our popup nor
+        // the shared tooltip surface can only be one of the menus we opened.
+        tracing::debug!("popup closed: a dropdown menu");
+        self.dropdown_open = false;
+        self.flush_deferred_tooltip_destroy()
+    }
+
+    /// Emit a tooltip destroy that was held back while a dropdown was open
+    /// (it would have destroyed a non-topmost popup — the protocol error this
+    /// ledger exists to prevent). Deferred, never dropped: dropping one would
+    /// strand a mapped tooltip as a second child of `popup` forever.
+    fn flush_deferred_tooltip_destroy(&mut self) -> app::Task<Message> {
+        if !std::mem::take(&mut self.tooltip_destroy_deferred) {
+            return Task::none();
+        }
+        tracing::debug!("flushing the deferred tooltip destroy");
+        self.tooltip_open = false;
+        cosmic::surface::surface_task(cosmic::surface::action::destroy_popup(tooltip::window_id()))
+    }
+
     /// Write-on-change: adopt `config` and persist it if it differs from the
     /// current settings. Used by the shuffle/retention controls.
     fn set_config(&mut self, config: AppletConfig) {
@@ -1840,6 +1901,9 @@ impl cosmic::Application for Window {
         let mut window = Self {
             core,
             popup: None,
+            tooltip_open: false,
+            dropdown_open: false,
+            tooltip_destroy_deferred: false,
             config,
             config_context,
             catalogue,
@@ -1905,11 +1969,7 @@ impl cosmic::Application for Window {
                     None,
                 ));
             }
-            Message::PopupClosed(id) => {
-                if self.popup == Some(id) {
-                    self.popup = None;
-                }
-            }
+            Message::PopupClosed(id) => return self.on_popup_closed(id),
             Message::ConfigUpdated(config) => {
                 // Our own setter writes echo back here unchanged (no-op);
                 // an *external* edit of the shuffle settings restarts the
@@ -3565,8 +3625,79 @@ mod tests {
         drop(window.update(Message::PopupClosed(window::Id::unique())));
         assert_eq!(window.popup, Some(ours), "another surface is not ours");
 
+        // Our popup taking every child with it (`close_with_children`) is the
+        // one close that resets the whole ledger.
+        window.tooltip_open = true;
+        window.dropdown_open = true;
+        window.tooltip_destroy_deferred = true;
+
         drop(window.update(Message::PopupClosed(ours)));
         assert_eq!(window.popup, None);
+        assert!(!window.tooltip_open);
+        assert!(!window.dropdown_open);
+        assert!(
+            !window.tooltip_destroy_deferred,
+            "a deferred destroy must not outlive the surface it targets"
+        );
+    }
+
+    /// The tooltip's close names the shared tooltip surface, and touches only
+    /// its own flag.
+    #[test]
+    fn popup_closed_for_the_tooltip_surface_clears_only_the_tooltip() {
+        use cosmic::Application as _;
+
+        let mut window = Window::default();
+        window.popup = Some(window::Id::unique());
+        window.tooltip_open = true;
+        window.dropdown_open = true;
+
+        drop(window.update(Message::PopupClosed(crate::tooltip::window_id())));
+
+        assert!(!window.tooltip_open);
+        assert!(window.dropdown_open, "a dropdown close it is not");
+        assert!(window.popup.is_some());
+    }
+
+    /// A dropdown menu is identified by elimination — its window id is minted
+    /// inside the widget and never visible here. Grab-loss dismissal publishes
+    /// no `DestroyPopup`, so this close is the only signal the ledger gets.
+    #[test]
+    fn popup_closed_for_an_unknown_surface_clears_only_the_dropdown() {
+        use cosmic::Application as _;
+
+        let mut window = Window::default();
+        window.popup = Some(window::Id::unique());
+        window.tooltip_open = true;
+        window.dropdown_open = true;
+
+        drop(window.update(Message::PopupClosed(window::Id::unique())));
+
+        assert!(!window.dropdown_open);
+        assert!(window.tooltip_open, "the tooltip is untouched");
+        assert!(window.popup.is_some());
+    }
+
+    /// A tooltip destroy held back while a dropdown was open is emitted when
+    /// the dropdown goes away — deferred, never dropped.
+    #[test]
+    fn a_dropdown_close_flushes_the_deferred_tooltip_destroy() {
+        use cosmic::Application as _;
+
+        let mut window = Window::default();
+        window.popup = Some(window::Id::unique());
+        window.dropdown_open = true;
+        window.tooltip_open = true;
+        window.tooltip_destroy_deferred = true;
+
+        drop(window.update(Message::PopupClosed(window::Id::unique())));
+
+        assert!(!window.dropdown_open);
+        assert!(
+            !window.tooltip_destroy_deferred,
+            "the deferred destroy is spent, not left to fire twice"
+        );
+        assert!(!window.tooltip_open, "the flushed destroy closes it");
     }
 
     #[test]

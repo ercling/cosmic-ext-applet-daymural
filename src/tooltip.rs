@@ -36,6 +36,15 @@ use crate::app::Message;
 /// the popup.
 static WINDOW_ID: LazyLock<window::Id> = LazyLock::new(window::Id::unique);
 
+/// The one tooltip surface id (see [`WINDOW_ID`]).
+///
+/// `app.rs` needs it to keep its popup ledger: a `PopupClosed` naming this id
+/// is the tooltip's, anything else parented to our popup is a dropdown menu
+/// (whose id is minted inside the widget and cannot be observed from here).
+pub fn window_id() -> window::Id {
+    *WINDOW_ID
+}
+
 /// Autosize id of the tooltip surface's root element: per-surface bookkeeping,
 /// so a single shared constant is right (the dropdown surfaces carry their own).
 static SURFACE_ID: LazyLock<widget::Id> = LazyLock::new(|| widget::Id::new("tooltip-surface"));
@@ -60,7 +69,7 @@ pub fn tooltip<'a>(
     label: impl Into<Cow<'static, str>>,
     parent_id: Option<window::Id>,
 ) -> Element<'a, Message> {
-    let window_id = *WINDOW_ID;
+    let window_id = window_id();
     let (popup_anchor, gravity) = away_from_panel(core.applet.anchor);
     let label = label.into();
 
