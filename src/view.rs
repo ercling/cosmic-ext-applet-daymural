@@ -411,7 +411,7 @@ fn interval_row(window: &Window) -> Element<'_, Message> {
             Some(shuffle_interval_index(window.config.shuffle_interval_secs)),
             Message::SetShuffleInterval,
             window.popup.unwrap_or(Id::NONE),
-            Message::Surface,
+            Message::DropdownSurface,
             |message| message,
         ))
         .align_y(Alignment::Center)
@@ -428,7 +428,7 @@ fn retention_row(window: &Window) -> Element<'_, Message> {
             Some(retention_index(window.config.retention_days)),
             Message::SetRetention,
             window.popup.unwrap_or(Id::NONE),
-            Message::Surface,
+            Message::DropdownSurface,
             |message| message,
         ))
         .align_y(Alignment::Center)

@@ -373,13 +373,17 @@ pub enum Message {
         generation: u64,
         success: bool,
     },
-    /// Forwarded surface actions (the dropdown's menu opens as its own
-    /// wayland popup and drives it through these).
-    Surface(cosmic::surface::Action),
-    /// Surface actions from the tooltip widget ([`crate::tooltip`]), routed
-    /// here instead of [`Message::Surface`] so the popup ledger sees them —
-    /// see [`Window::on_tooltip_surface`].
+    /// Surface actions from the tooltip widget ([`crate::tooltip`]). Every
+    /// popup parented to `self.popup` is routed through a ledger-aware
+    /// message like this one — there is deliberately no blind `Surface`
+    /// forwarder left, since anything that bypassed the ledger could map a
+    /// second child popup and trip the xdg-shell topmost rule. See
+    /// [`Window::on_tooltip_surface`].
     TooltipSurface(cosmic::surface::Action),
+    /// Surface actions from a `popup_dropdown` menu, routed here for the same
+    /// reason as [`Message::TooltipSurface`] — see
+    /// [`Window::on_dropdown_surface`].
+    DropdownSurface(cosmic::surface::Action),
 }
 
 impl Window {
@@ -449,6 +453,52 @@ impl Window {
             other => tracing::debug!("tooltip surface action forwarded as-is: {other:?}"),
         }
         cosmic::surface::surface_task(action)
+    }
+
+    /// A surface action published by a `popup_dropdown` menu, run through the
+    /// popup ledger on its way to the runtime.
+    ///
+    /// As in [`Window::on_tooltip_surface`] the action is matched **by
+    /// reference** and then forwarded untouched — never clone it, or the
+    /// runtime's `Arc::try_unwrap` of the settings fails and it silently
+    /// creates nothing.
+    fn on_dropdown_surface(&mut self, action: cosmic::surface::Action) -> app::Task<Message> {
+        // Sequenced around the forwarded action, never batched: the whole
+        // point is the order in which the compositor sees the destroys.
+        let mut before = Task::none();
+        let mut after = Task::none();
+        match &action {
+            cosmic::surface::Action::Popup(..) | cosmic::surface::Action::AppPopup(..) => {
+                // The interlock. Both the tooltip and this menu are children
+                // of `self.popup`, i.e. siblings on one xdg-shell stack, and
+                // only the topmost may be destroyed. The instant the create
+                // arrives is the *last* moment the tooltip is still topmost —
+                // once the menu is mapped nothing can close the tooltip until
+                // the menu goes away, and we can never close the menu
+                // ourselves (its window id is minted inside the widget). So
+                // the destroy is chained ahead of the create.
+                if self.tooltip_open {
+                    tracing::debug!("dropdown create: destroying the open tooltip first");
+                    self.tooltip_open = false;
+                    before = cosmic::surface::surface_task(cosmic::surface::action::destroy_popup(
+                        tooltip::window_id(),
+                    ));
+                }
+                tracing::debug!("dropdown opened");
+                self.dropdown_open = true;
+            }
+            cosmic::surface::Action::DestroyPopup(_) => {
+                tracing::debug!("dropdown destroyed");
+                self.dropdown_open = false;
+                // Ordered after the menu's own destroy: only then is the
+                // tooltip topmost again.
+                after = self.flush_deferred_tooltip_destroy();
+            }
+            other => tracing::debug!("dropdown surface action forwarded as-is: {other:?}"),
+        }
+        before
+            .chain(cosmic::surface::surface_task(action))
+            .chain(after)
     }
 
     /// Emit a tooltip destroy that was held back while a dropdown was open
@@ -2192,10 +2242,8 @@ impl cosmic::Application for Window {
                 generation,
                 success,
             } => return self.finish_accent_task(generation, success),
-            Message::Surface(action) => {
-                return cosmic::surface::surface_task(action);
-            }
             Message::TooltipSurface(action) => return self.on_tooltip_surface(action),
+            Message::DropdownSurface(action) => return self.on_dropdown_surface(action),
             Message::RefreshFinished(result) => return self.finish_refresh(result),
             // Returning to the message loop re-renders the popup, so a
             // preview generated while it was open shows up by itself.
@@ -3812,6 +3860,104 @@ mod tests {
         drop(window.update(Message::PopupClosed(window::Id::unique())));
         assert!(!window.tooltip_destroy_deferred);
         assert!(!window.tooltip_open);
+    }
+
+    /// A `popup_dropdown` create. The settings payloads are opaque
+    /// (`Arc<Box<dyn Any + ..>>`) and never executed here — `update` only
+    /// inspects the variant.
+    fn dropdown_create() -> cosmic::surface::Action {
+        use std::any::Any;
+        use std::sync::Arc;
+
+        let opaque = || Arc::new(Box::new(()) as Box<dyn Any + Send + Sync>);
+        cosmic::surface::Action::Popup(opaque(), opaque(), None)
+    }
+
+    fn dropdown_destroy() -> cosmic::surface::Action {
+        cosmic::surface::Action::DestroyPopup(window::Id::unique())
+    }
+
+    /// The interlock: a menu create arriving while a tooltip is up is the last
+    /// moment the tooltip is legally topmost, so the ledger closes it there.
+    #[test]
+    fn a_dropdown_create_closes_an_open_tooltip_first() {
+        use cosmic::Application as _;
+
+        let mut window = Window::default();
+        window.popup = Some(window::Id::unique());
+        window.tooltip_open = true;
+
+        drop(window.update(Message::DropdownSurface(dropdown_create())));
+
+        assert!(!window.tooltip_open, "the sibling is destroyed with it");
+        assert!(window.dropdown_open);
+        assert!(
+            !window.tooltip_destroy_deferred,
+            "the destroy was emitted, not held back"
+        );
+    }
+
+    /// With nothing to interlock against the create just records the menu.
+    #[test]
+    fn a_dropdown_create_without_a_tooltip_only_marks_the_dropdown_open() {
+        use cosmic::Application as _;
+
+        let mut window = Window::default();
+        window.popup = Some(window::Id::unique());
+
+        drop(window.update(Message::DropdownSurface(dropdown_create())));
+
+        assert!(window.dropdown_open);
+        assert!(!window.tooltip_open);
+        assert!(!window.tooltip_destroy_deferred);
+    }
+
+    /// The menu's own destroy clears the flag and spends any tooltip destroy
+    /// that was held back behind it.
+    #[test]
+    fn a_dropdown_destroy_clears_the_flag_and_flushes_a_deferred_tooltip_destroy() {
+        use cosmic::Application as _;
+
+        let mut window = Window::default();
+        window.popup = Some(window::Id::unique());
+        window.dropdown_open = true;
+        window.tooltip_open = true;
+        window.tooltip_destroy_deferred = true;
+
+        drop(window.update(Message::DropdownSurface(dropdown_destroy())));
+
+        assert!(!window.dropdown_open);
+        assert!(
+            !window.tooltip_destroy_deferred,
+            "the deferred destroy is spent, not left to fire twice"
+        );
+        assert!(!window.tooltip_open, "the flushed destroy closes it");
+    }
+
+    /// The full crash sequence, driven end to end through the ledger: hover
+    /// arms a tooltip, a dropdown opens over it, the pointer leaves, the
+    /// dropdown closes. At no point are two children of `popup` mapped.
+    #[test]
+    fn a_tooltip_and_a_dropdown_are_never_open_together() {
+        use cosmic::Application as _;
+
+        let mut window = Window::default();
+        window.popup = Some(window::Id::unique());
+
+        drop(window.update(Message::TooltipSurface(tooltip_arm())));
+        assert!(window.tooltip_open && !window.dropdown_open);
+
+        drop(window.update(Message::DropdownSurface(dropdown_create())));
+        assert!(!window.tooltip_open && window.dropdown_open);
+
+        // A destroy for the tooltip we already closed: harmless, and held
+        // back rather than sent while the menu is up.
+        drop(window.update(Message::TooltipSurface(tooltip_destroy())));
+        assert!(!window.tooltip_open && window.dropdown_open);
+
+        drop(window.update(Message::DropdownSurface(dropdown_destroy())));
+        assert!(!window.tooltip_open && !window.dropdown_open);
+        assert!(!window.tooltip_destroy_deferred);
     }
 
     #[test]

@@ -249,7 +249,9 @@ TooltipSurface(cosmic::surface::Action),
 DropdownSurface(cosmic::surface::Action),
 ```
 
-`Message::Surface` stays for anything else needing a raw forward.
+~~`Message::Surface` stays for anything else needing a raw forward.~~ It has no
+other constructor, so it was removed instead — see the deviation note under
+Task 3.
 
 ### Ledger transitions
 
@@ -324,20 +326,31 @@ that preceded it.
 - Modify: `src/view.rs`
 - Modify: `src/app.rs`
 
-- [ ] add `Message::DropdownSurface(..)`; on a create action, chain
+- [x] add `Message::DropdownSurface(..)`; on a create action, chain
       `destroy_popup(tooltip::window_id())` ahead of the forwarded create when
       `tooltip_open`, then set `dropdown_open`
-- [ ] on a dropdown destroy, clear `dropdown_open` and flush a deferred tooltip
+- [x] on a dropdown destroy, clear `dropdown_open` and flush a deferred tooltip
       destroy
-- [ ] pass `Message::DropdownSurface` as `on_surface_action` in `interval_row`
+- [x] pass `Message::DropdownSurface` as `on_surface_action` in `interval_row`
       (`src/view.rs:409`) and `retention_row` (`src/view.rs:426`)
-- [ ] comment the interlock: the create arriving is the only instant the
+- [x] comment the interlock: the create arriving is the only instant the
       tooltip is still legally topmost
-- [ ] write tests: a dropdown create with `tooltip_open` clears it and sets
+- [x] write tests: a dropdown create with `tooltip_open` clears it and sets
       `dropdown_open`; a create without a tooltip just sets `dropdown_open`; a
       dropdown destroy clears `dropdown_open` and clears
       `tooltip_destroy_deferred`
-- [ ] run `just check` - must pass before task 4
+- [x] run `just check` - must pass before task 4
+
+⚠️ **Deviation: `Message::Surface` is gone, not kept.** "Technical Details"
+said it "stays for anything else needing a raw forward", but the two dropdown
+rows were its *only* constructors — rerouting them left the variant
+unconstructed and `clippy -D warnings` fails on `dead_code`. Rather than
+`#[allow(dead_code)]` a forwarder that by design must not exist (a blind
+forward is exactly what could map a second child of `window.popup`), the
+variant and its `update` arm were removed. Task 5's "grep remaining
+`Message::Surface` uses" is therefore trivially satisfied: there are none.
+`CLAUDE.md`'s UI-conventions line naming the `Message::Surface` forwarder is
+now stale and is corrected in Task 6.
 
 ### Task 4: Suppress tooltip arming while a dropdown is open
 
