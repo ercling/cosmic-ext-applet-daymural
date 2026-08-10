@@ -505,24 +505,24 @@ while it shows the default".
 
 ### Task 6: [Final] Update documentation
 
-- [ ] README.md: **correct** the existing lock-screen paragraph (lines
+- [x] README.md: **correct** the existing lock-screen paragraph (lines
       ~122-142) — it still claims "a lock that is up when a state write
       lands switches to the real wallpaper mid-lock", which the dedupe
       finding falsifies for identical-value churn — and describe the
       workaround: on lock/resume the applet writes a value-toggled cosmic-bg
       state so the locker rebuilds; the lock screen may show the default for
       ~1-4 s before healing
-- [ ] CLAUDE.md: add `src/lockwatch.rs` to the architecture list (event
+- [x] CLAUDE.md: add `src/lockwatch.rs` to the architecture list (event
       sources, ladder, generation cancel, the normalizing toggle and *why*:
       the subscription/derive dedupe guard **and** cosmic-bg's RMW
       `save_state` — cite both; the first-entry/append-at-end invariant;
       the accepted duplicated rest shape); note the workaround
       self-neutralizes once cosmic-greeter#511 ships (the toggle still
       fires, the extra rebuild is harmless)
-- [ ] update `docs/plans/completed/20260808-ux-polish-lockscreen-i18n.md`
+- [x] update `docs/plans/completed/20260808-ux-polish-lockscreen-i18n.md`
       with a short pointer correction (its step 1-2 "every state write
       reaches the locker" holds only for *changed* values — link this plan)
-- [ ] move this plan to `docs/plans/completed/`
+- [x] move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 

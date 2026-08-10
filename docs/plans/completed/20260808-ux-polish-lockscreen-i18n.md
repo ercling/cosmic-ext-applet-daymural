@@ -333,6 +333,19 @@ first apply after an unlock still empties the cache) and means overwriting a
 user's cosmic-bg field, which `updated_entry` deliberately preserves — not a fix
 to ship.
 
+⚠️ **Addendum (2026-08-11).** Steps 1–2 of the trace above overclaim: a state
+write reaches the locker only when its **value changed**. The locker consumes
+the state through `cosmic_config`'s subscription, whose derive-generated
+`update_keys` carries a value-equality guard and forwards nothing for an
+identical rewrite — so cosmic-bg's five-minute identical-content churn
+(step 1, "identical content" observed but its significance missed) is never
+delivered, and the prediction below that a lock screen left up across a state
+write "flips to the real wallpaper mid-lock" holds only for a *genuine*
+wallpaper change (daily auto-apply, shuffle) landing mid-lock. Full dedupe
+finding, source citations at both pinned libcosmic revs, and the applet-side
+workaround (a value-toggled state poke on lock/resume) in
+`docs/plans/completed/20260811-lockscreen-wallpaper-poke.md`.
+
 The paragraph below is retained for the record; read it as "the code path is
 capable of following, and the watches are in place", not as "it does follow":
 `locker::main`

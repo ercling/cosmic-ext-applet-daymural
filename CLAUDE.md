@@ -141,10 +141,49 @@ the pinned rev before coding against remembered names.
 - `src/wallpaper.rs` — cosmic-bg config writer: `updated_entry` mutates only
   `source`, `apply` writes the `all` entry *before* flipping `same-on-all`,
   `current_wallpaper`/`is_ours`/`should_auto_apply` back the don't-clobber rule,
-  `download_dir()`. Only the cosmic-bg *context* plumbing inside
-  `apply`/`current_wallpaper` is uncovered (the context cannot be rooted in a
-  tempdir from this crate — see the comment on `apply`); the three-way state
-  mapping is the pure, tested `classify`.
+  `download_dir()`. Also hosts the lock-screen poke's write half:
+  `poke_state(&Config)` (fresh raw-key read of cosmic-bg's *state*
+  `wallpapers`, `lockwatch::toggle_wallpapers`, `ConfigSet::set` back — raw
+  keys on **our** pinned cosmic-config instance because cosmic-bg-config's
+  `CosmicConfigEntry` comes from a foreign instance this crate cannot name)
+  and the prod handle `poke_state_handle()`. Only the cosmic-bg *context*
+  plumbing inside `apply`/`current_wallpaper`/`poke_state_handle` is uncovered
+  (the context cannot be rooted in a tempdir from this crate — see the comment
+  on `apply`); the three-way state mapping is the pure, tested `classify`, and
+  `poke_state` itself is tested via injected `Config::with_custom_path`.
+- `src/lockwatch.rs` — lock-screen wallpaper workaround for
+  [cosmic-greeter#511](https://github.com/pop-os/cosmic-greeter/issues/511)
+  (the locker's image cache rebuilds only on a *delivered* cosmic-bg state
+  update, and locking never rebuilds — so from the second lock onward it shows
+  the bundled default). Event sources: logind's session `Lock` signal plus the
+  `PrepareForSleep` **resume** edge (`sleep_edge_to_event`; no `Unlocked`
+  variant — nothing on this system ever calls `UnlockSession`), via a zbus
+  system-bus `subscription()` that never finishes (transient D-Bus errors
+  back off ~30 s inside the stream; "no logind session" warns once and
+  parks). Each event bumps `lock_poke_generation` in `app.rs` — cancelling any
+  pending ladder — and arms one poke per `POKE_DELAYS` (`[1 s, 4 s]`; the
+  first can race the locker re-inserting `surface_names`, the second is the
+  safety net), each running `wallpaper::poke_state` async, ending in
+  `LockPokeFinished` (log-only). The poke **must change the value**, hence the
+  normalizing `toggle_wallpapers`: two independent verified reasons — (a)
+  cosmic-config's read side dedupes: the subscription only forwards when
+  derive-generated `update_keys` reports changed keys, and that guard is
+  value-equality, so an identical rewrite (including cosmic-bg's own 5-minute
+  single-file churn) is never delivered; (b) cosmic-bg's `save_state` is
+  **read-modify-write** — it mutates the first entry per output and writes the
+  rest back verbatim, so no tick ever restores a canonical shape and the
+  transform must be self-healing, not just reversible. The toggle normalizes
+  first (first entry per output name wins, original order kept), else appends
+  a duplicate of the last entry; empty/unreadable state is never written.
+  **Invariant: the first entry per output name is never altered or reordered,
+  additions go at the end** — every consumer reads first-match-wins. A ladder
+  interrupted between its pokes leaves the duplicated shape at rest: accepted,
+  tolerated by every consumer, cleaned by the next poke's normalization —
+  parity is *not* guaranteed. Once cosmic-greeter#511 ships, the workaround
+  self-neutralizes: the toggle still fires but is just a harmless extra
+  rebuild. Mechanism pinned by tests: a mirror `CosmicConfigEntry` derive
+  proves through `update_keys` that identical rewrites report no changed keys
+  and toggled writes do.
 - `src/accent.rs` — opt-in accent-from-wallpaper, **off by default** (a stopgap
   until COSMIC ships [cosmic-settings#343](https://github.com/pop-os/cosmic-settings/issues/343)
   natively; the restore path is the exit strategy). The whole colour domain

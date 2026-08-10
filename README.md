@@ -121,29 +121,39 @@ Bing's UHD images are roughly **5 MB each**. Expect about:
   is off at refresh time catches up at next login (same trade-off as the GNOME
   extension). Timers also don't advance during suspend, so a refresh that came
   due while the machine slept fires late after resume rather than immediately.
-- **The lock screen usually shows its own default — an upstream cosmic-greeter
-  bug, not something the applet can reach.** The applet writes nothing
-  lock-screen-specific: it writes cosmic-bg's config, cosmic-bg records the
-  applied path in its state file, and cosmic-greeter reads that. Our side of the
-  chain is verified live (config write → cosmic-bg's inotify watch → state file
-  rewritten 42 ms later with the applied path → the locker's own watch on that
-  state file). What breaks is cosmic-greeter 1.5.0's own image cache: every
-  cosmic-bg state write makes the locker clear `surface_images` and rebuild it
-  (`src/locker.rs:1023-1027`), but the rebuild silently skips any surface whose
-  id is no longer in `surface_names` (`src/common.rs:148-150`) — and unlocking
-  removed exactly those ids (`src/locker.rs:1004`, `1133`). Locking re-inserts
-  the names (`src/locker.rs:968`) without rebuilding, so from the second lock
-  onward `view_window` falls back to the bundled `res/background.jpg`
-  (`src/locker.rs:1167-1172`). Consequences: the first lock after login is
-  correct; a lock that is up when a state write lands switches to the real
-  wallpaper mid-lock; every other lock is the default. cosmic-bg rewrites that
-  state file every `rotation_frequency` seconds even for a single-file source
-  (`cosmic-bg/src/wallpaper.rs:320-352`), so on a typical config the window
-  closes within minutes. Nothing here is applet-fixable — upstream needs one
+- **The lock screen may show its own default for a few seconds before the
+  wallpaper appears — an upstream cosmic-greeter bug the applet works around.**
+  The applet writes nothing lock-screen-specific: it writes cosmic-bg's config,
+  cosmic-bg records the applied path in its state file, and cosmic-greeter reads
+  that. Our side of the chain is verified live (config write → cosmic-bg's
+  inotify watch → state file rewritten 42 ms later with the applied path → the
+  locker's own watch on that state file). What breaks is cosmic-greeter 1.5.0's
+  own image cache: every *delivered* cosmic-bg state update makes the locker
+  clear `surface_images` and rebuild it (`src/locker.rs:1023-1027`), but the
+  rebuild silently skips any surface whose id is no longer in `surface_names`
+  (`src/common.rs:148-150`) — and unlocking removed exactly those ids
+  (`src/locker.rs:1004`, `1133`). Locking re-inserts the names
+  (`src/locker.rs:968`) without rebuilding, so from the second lock onward
+  `view_window` falls back to the bundled `res/background.jpg`
+  (`src/locker.rs:1167-1172`). And cosmic-bg's own state churn cannot heal a
+  lock that is already up: it does rewrite the state every
+  `rotation_frequency` seconds even for a single-file source
+  (`cosmic-bg/src/wallpaper.rs:320-352`), but with one file the value never
+  changes, and cosmic-config's read side only delivers *changed* values — an
+  identical rewrite produces no update, so a lock stays on the default
+  indefinitely unless a genuine wallpaper change (daily auto-apply, shuffle)
+  happens to land mid-lock. The workaround: the applet watches the system
+  D-Bus for the session's `Lock` signal and the resume edge of
+  `PrepareForSleep`, then rewrites cosmic-bg's state with a semantically
+  identical but value-different `wallpapers` list (once ~1 s after the event,
+  again at ~4 s as a safety net) — a change the locker does deliver and
+  rebuild from. So the lock screen may show the default background for roughly
+  one to four seconds before healing to the real wallpaper. Upstream needs one
   `update_wallpapers` call on lock, or to stop dropping the names on unlock:
   [pop-os/cosmic-greeter#511](https://github.com/pop-os/cosmic-greeter/issues/511),
   filed from this trace (same symptom as its #460 / #497, which had no
-  reproduction).
+  reproduction); once that ships, the applet's poke becomes a harmless extra
+  rebuild.
 - **The login screen needs cosmic-greeter to *be* your display manager.** It
   shows your wallpaper only under greetd + `cosmic-greeter.service` with
   `cosmic-greeter-daemon.service` running: that daemon reads your cosmic-bg
