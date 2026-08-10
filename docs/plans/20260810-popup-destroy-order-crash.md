@@ -451,22 +451,47 @@ reopen it, and confirm tooltips still appear.
 
 ### Task 6: [Final] Update documentation
 
-- [ ] add a "popup stack" rule to the **UI conventions** section of
+- [x] add a "popup stack" rule to the **UI conventions** section of
       `CLAUDE.md`: everything parented to `window.popup` is a sibling on one
       xdg-shell stack; libcosmic's runtime collects only a single child chain
       and a dropdown's id is unobservable, so the invariant is **at most one
       child popup at a time**, held by the interlock + suppression + deferral;
       never clone a `surface::Action`
-- [ ] fix the stale line in `CLAUDE.md`'s tooltip bullet — "Both `view.rs` and
+- [x] fix the stale line in `CLAUDE.md`'s tooltip bullet — "Both `view.rs` and
       `app.rs` build their tooltips through it" is false, `app.rs` has no
       tooltip (the panel button deliberately has none); the only call sites are
       `src/view.rs:323` and `474`
-- [ ] note in `CLAUDE.md` that the accent feature's documented crash-window
+- [x] note in `CLAUDE.md` that the accent feature's documented crash-window
       exposure was observed in the wild because of this crash, and that its
       premise (the applet does not crash) is what this fix restores
-- [ ] record the compositor-initiated `popup_done` residual path so a future
+- [x] record the compositor-initiated `popup_done` residual path so a future
       protocol error is not misread as a regression of this fix
-- [ ] move this plan to `docs/plans/completed/`
+- [x] (deferred to the orchestrator's post-review archive step) move this plan
+      to `docs/plans/completed/`
+
+**Documentation results.** All four `CLAUDE.md` edits were written against the
+*current* code, not the plan's original design text:
+
+- The dropdowns bullet in **UI conventions** now names
+  `Message::DropdownSurface` and states that no blind `Message::Surface`
+  forwarder exists (Task 3's deviation), so nobody reintroduces one.
+- A new **"Popup stack"** rule states the invariant, both libcosmic facts that
+  make it the only actionable rule, and the four maintenance rules the
+  implementation actually rests on: ledger-aware routing for every child popup,
+  never clone a `surface::Action`, `tooltip_open` is "armed" and biased toward
+  `true`, and `clear_popup_ledger` must be called from both paths that end our
+  popup (Task 5's Gap 2 — `Action::Destroy` emits no event, only compositor
+  dismissal produces `PopupClosed`). The residual `popup_done` path closes the
+  rule, framed as "note which surface id it names".
+- The `src/tooltip.rs` architecture bullet drops the false "`app.rs` builds
+  tooltips too" and gains the `suppressed` parameter.
+- The accent bullet's "remaining exposure" paragraph records that the exposure
+  *fired* on 2026-08-10 through this crash, with the explicit instruction not
+  to add a write-ahead record until a repeat report rules the crash out.
+
+`just check`: fmt + clippy `-D warnings` clean, 271 tests pass (docs-only
+change, no code touched, so no new tests — the i18n guard tests are unaffected,
+`CLAUDE.md` holds no `fl!` ids).
 
 ## Post-Completion
 
