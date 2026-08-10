@@ -518,8 +518,8 @@ confirm tooltips still appear.
       premise (the applet does not crash) is what this fix restores
 - [x] record the compositor-initiated `popup_done` residual path so a future
       protocol error is not misread as a regression of this fix
-- [x] (deferred to the orchestrator's post-review archive step) move this plan
-      to `docs/plans/completed/`
+- [x] move this plan to `docs/plans/completed/` (performed in the post-review
+      pass, 2026-08-11)
 
 **Documentation results.** All four `CLAUDE.md` edits were written against the
 *current* code, not the plan's original design text:

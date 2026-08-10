@@ -137,6 +137,14 @@ const WALLPAPERS_KEY: &str = "wallpapers";
 /// list skips the same way (`toggle_wallpapers` returns `None` — nothing to
 /// heal). Only a *write* failure is an error.
 ///
+/// Caveat: the read→toggle→write is **not atomic** against the state's
+/// other writers (cosmic-bg's own RMW `save_state`, the applet's apply): a
+/// genuine wallpaper change landing in the milliseconds between the fresh
+/// read and the `set` gets clobbered with the toggled *stale* list. Only a
+/// live lock screen's image can notice, and cosmic-bg's next rotation tick
+/// (≤ `rotation_frequency`, 300 s default) rewrites the current source and
+/// self-heals it.
+///
 /// Raw keys, not `cosmic_bg_config::state::State`'s entry API: that API
 /// comes from cosmic-bg-config's own `cosmic-config` instance, whose traits
 /// this crate cannot name (see module comment; `Cargo.lock` carries both
@@ -551,42 +559,20 @@ mod tests {
 
         use super::*;
         use crate::lockwatch::toggle_wallpapers;
-        use cosmic::cosmic_config::{ConfigGet, ConfigSet};
-        use std::os::unix::fs::MetadataExt;
-
-        /// Mirrors cosmic-bg's real state identity (name + version) so the
-        /// raw-key layout under the tempdir matches production shape; the
-        /// custom path keeps it hermetic.
-        fn state_config(dir: &Path) -> cosmic::cosmic_config::Config {
-            cosmic::cosmic_config::Config::with_custom_path(
-                cosmic_bg_config::NAME,
-                cosmic_bg_config::state::State::version(),
-                dir.to_path_buf(),
-            )
-            .expect("create tempdir-rooted state config")
-        }
-
-        /// Where `with_custom_path` puts the key file:
-        /// `<dir>/cosmic/<name>/v<version>/wallpapers`.
-        fn key_file(dir: &Path) -> PathBuf {
-            dir.join("cosmic")
-                .join(cosmic_bg_config::NAME)
-                .join(format!("v{}", cosmic_bg_config::state::State::version()))
-                .join("wallpapers")
-        }
+        use crate::testutil::{
+            bg_path_source as path_source, bg_state_config as state_config,
+            bg_wallpapers_key_file as key_file, read_only_trees, restore_dir_permissions,
+        };
+        use cosmic::cosmic_config::ConfigSet;
 
         fn inode(path: &Path) -> u64 {
+            use std::os::unix::fs::MetadataExt as _;
             std::fs::metadata(path).expect("stat key file").ino()
         }
 
         fn read_wallpapers(config: &cosmic::cosmic_config::Config) -> Vec<(String, Source)> {
+            use cosmic::cosmic_config::ConfigGet as _;
             config.get("wallpapers").expect("read wallpapers key")
-        }
-
-        fn path_source(name: &str) -> Source {
-            Source::Path(PathBuf::from(format!(
-                "/home/u/Pictures/BingWallpaper/{name}.jpg"
-            )))
         }
 
         #[test]
@@ -719,6 +705,34 @@ mod tests {
                 toggle_wallpapers(changed).expect("canonical toggles"),
                 "the second poke must toggle the freshly read value"
             );
+        }
+
+        #[test]
+        fn poke_surfaces_a_failed_write_as_an_error() {
+            // Only a *write* failure is an `Err` (reads skip): a read-only
+            // version dir makes cosmic-config's AtomicFile temp-create fail,
+            // exercising `poke_state`'s one error path hermetically.
+            let dir = tempfile::tempdir().expect("tempdir");
+            let config = state_config(dir.path());
+            let canonical = vec![("all".to_owned(), path_source("a"))];
+            config.set("wallpapers", &canonical).expect("seed state");
+            let seeded_inode = inode(&key_file(dir.path()));
+
+            let key_dir = key_file(dir.path())
+                .parent()
+                .expect("key file has a version dir")
+                .to_path_buf();
+            let locked = read_only_trees(&[key_dir]);
+            let result = poke_state(&config);
+            restore_dir_permissions(&locked);
+
+            result.expect_err("a failed state write must surface, not be swallowed");
+            assert_eq!(
+                inode(&key_file(dir.path())),
+                seeded_inode,
+                "the seeded value must be untouched"
+            );
+            assert_eq!(read_wallpapers(&config), canonical);
         }
     }
 

@@ -368,26 +368,37 @@ lock-screen propagation chain (applet → cosmic-bg config → cosmic-bg state �
 greeter state-watch — our end is intact and stays that way).
 
 ⚠️ **Both of that plan's lock-screen conclusions were wrong; corrected in place
-there (2026-08-08, read against the installed cosmic-greeter 1.5.0 sources).**
-Two independent facts, worth knowing before anyone "fixes" `wallpaper.rs` over
-a lock-screen report:
+there (2026-08-08, read against the installed cosmic-greeter 1.5.0 sources;
+churn/heal claims re-corrected 2026-08-11 by the lockwatch plan's dedupe
+finding).** Two independent facts, worth knowing before anyone "fixes"
+`wallpaper.rs` over a lock-screen report:
 
 - **The lock screen genuinely does not follow (observed by the user, then
-  traced).** Not our chain — cosmic-greeter's locker cache. Each cosmic-bg state
-  write clears `surface_images` and rebuilds (`src/locker.rs:1023-1027`); the
-  rebuild silently `continue`s past any surface missing from `surface_names`
-  (`src/common.rs:148-150`); unlocking removed those ids
+  traced).** Not our chain — cosmic-greeter's locker cache. A **delivered**
+  cosmic-bg state update clears `surface_images` and rebuilds
+  (`src/locker.rs:1023-1027`) — and *delivered* means value-changed:
+  cosmic-config's subscription only forwards keys the derive's value-equality
+  `update_keys` guard reports changed, so an identical rewrite (inotify and
+  all) is deduped. The rebuild silently `continue`s past any surface missing
+  from `surface_names` (`src/common.rs:148-150`); unlocking removed those ids
   (`src/locker.rs:1004`, `1133`); locking re-inserts the names
   (`src/locker.rs:968`) but never rebuilds — so `view_window` serves the bundled
   `res/background.jpg` (`src/locker.rs:1167-1172`). First lock after login is
-  right; later locks are the default; a lock that is up when a state write lands
-  flips to the real wallpaper. cosmic-bg rewrites state every
-  `rotation_frequency` seconds even for a single-file source
-  (`cosmic-bg/src/wallpaper.rs:320-352`), so the churn is constant. Note the
-  skip is **silent** — an empty journal is not evidence the wallpaper arrived,
-  which is exactly the wrong inference made once already. Filed upstream as
+  right; later locks are the default — and cosmic-bg's rewrite of the state
+  every `rotation_frequency` seconds (`cosmic-bg/src/wallpaper.rs:320-352`)
+  never heals a live lock, because with a single-file source every tick
+  rewrites an *identical* value that the dedupe swallows; only a genuine value
+  change landing mid-lock (daily auto-apply, shuffle) reaches the locker. Note
+  the skip is **silent** — an empty journal is not evidence the wallpaper
+  arrived, which is exactly the wrong inference made once already. Filed
+  upstream as
   [cosmic-greeter#511](https://github.com/pop-os/cosmic-greeter/issues/511)
-  (their #460/#497 are the same symptom without a repro). Don't "fix" this here.
+  (their #460/#497 are the same symptom without a repro). The greeter bug
+  itself is not fixable here — but the applet ships a workaround: the
+  `src/lockwatch.rs` state poke (see its architecture bullet) writes a
+  value-*toggled* `wallpapers` list on lock/resume, and self-neutralizes into
+  a harmless extra rebuild once cosmic-greeter#511 ships. Don't remove it as
+  "not ours to fix".
 - **Permissions are not the login-screen gate; the display manager is.** The
   greeter process never opens the image: `cosmic-greeter-daemon` runs as root and
   reads each user's cosmic-bg state *and* the bytes inside `run_as_user`
@@ -426,8 +437,8 @@ Everything parented to it — the tooltip and either dropdown menu — is a
 *sibling* on one xdg-shell stack, and the protocol only permits destroying the
 **topmost** popup of a stack; violating it is a fatal `xdg_popup was destroyed
 while it was not the topmost popup` (the 2026-08-10 crash, plan
-`20260810-popup-destroy-order-crash.md` in `docs/plans/` or, once archived,
-`docs/plans/completed/`). Two libcosmic facts make the invariant the only
+`docs/plans/completed/20260810-popup-destroy-order-crash.md`). Two libcosmic
+facts make the invariant the only
 actionable rule — verified against the pinned rev:
 
 - the runtime's `Action::Destroy`

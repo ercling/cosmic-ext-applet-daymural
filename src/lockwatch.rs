@@ -64,6 +64,13 @@ pub enum LockEvent {
 /// slow lock. Both pokes are full toggles — a "normalize-only" final poke
 /// would write nothing when the first poke fired too early and left the
 /// list canonical, get deduped, and lose the heal.
+///
+/// Delivery is **bounded-loss, not guaranteed**: cosmic-bg's own rotation
+/// tick can RMW-rewrite the pre-toggle value after a rung's write lands but
+/// before the locker's watcher reads the file, deduping that rung — the
+/// other rung, or the next lock/resume, heals. (The two rungs also share one
+/// generation and are not serialized against each other; see
+/// `app.rs::arm_lock_pokes`.)
 pub const POKE_DELAYS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(4)];
 
 /// The normalizing toggle: produce a `wallpapers` value that (a) compares
@@ -121,7 +128,10 @@ pub fn toggle_wallpapers(list: Vec<(String, Source)>) -> Option<Vec<(String, Sou
         // Canonical: append a duplicate of the last entry (never the first —
         // see the first-match invariant above).
         let mut appended = list;
-        let last = appended.last().cloned()?;
+        let last = appended
+            .last()
+            .cloned()
+            .expect("guarded non-empty above — a silent skip here would hide a logic bug");
         appended.push(last);
         Some(appended)
     }
@@ -225,6 +235,12 @@ pub fn subscription() -> Subscription<LockEvent> {
 
 /// Outer driver: reconnect/park policy around [`connect_and_forward`].
 async fn watch(mut output: mpsc::Sender<LockEvent>) {
+    // The first transient failure warns (mirroring the `NoSession` arm): a
+    // permanently unreachable system bus would otherwise retry every 30 s
+    // forever with only debug logs, and a user for whom the workaround
+    // silently never works would have no default-visibility signal. Repeats
+    // stay at debug — one warning per panel run is signal enough.
+    let mut transient_warned = false;
     loop {
         match connect_and_forward(&mut output).await {
             WatchEnd::Closed => return,
@@ -238,10 +254,19 @@ async fn watch(mut output: mpsc::Sender<LockEvent>) {
                 future::pending::<()>().await;
             }
             WatchEnd::Transient(reason) => {
-                tracing::debug!(
-                    "logind lock watch failed ({reason}); \
-                     retrying in {TRANSIENT_RETRY:?}"
-                );
+                if transient_warned {
+                    tracing::debug!(
+                        "logind lock watch failed ({reason}); \
+                         retrying in {TRANSIENT_RETRY:?}"
+                    );
+                } else {
+                    transient_warned = true;
+                    tracing::warn!(
+                        "logind lock watch failed ({reason}); \
+                         lock-screen wallpaper pokes retry every \
+                         {TRANSIENT_RETRY:?} until it recovers"
+                    );
+                }
                 tokio::time::sleep(TRANSIENT_RETRY).await;
             }
         }
@@ -262,12 +287,14 @@ async fn connect_and_forward(output: &mut mpsc::Sender<LockEvent>) -> WatchEnd {
         Err(err) => return WatchEnd::Transient(format!("logind manager proxy failed: {err}")),
     };
 
-    // The bus is demonstrably up (the proxy built), so both resolution
-    // paths failing means "this process has no logind session" — the
-    // permanent class, not the transient one.
+    // Building the proxy makes no bus round-trip, so a resolution failure
+    // proves nothing by itself — [`resolve_session`] classifies by error:
+    // only logind's own "no session" method errors park permanently, and a
+    // transient bus failure (NoReply/ServiceUnknown/… during a
+    // systemd-logind restart) retries with the backoff.
     let session_path = match resolve_session(&manager).await {
         Ok(path) => path,
-        Err(reason) => return WatchEnd::NoSession(reason),
+        Err(end) => return end,
     };
 
     let session_builder = match SessionProxy::builder(&conn).path(session_path.clone()) {
@@ -317,12 +344,33 @@ async fn connect_and_forward(output: &mut mpsc::Sender<LockEvent>) -> WatchEnd {
     WatchEnd::Transient("signal streams ended (bus connection lost)".to_owned())
 }
 
+/// Is this error logind saying "there is no such session"? Only these
+/// method errors are evidence of the permanent [`WatchEnd::NoSession`]
+/// class. Every other failure — `org.freedesktop.DBus.Error.NoReply` /
+/// `ServiceUnknown` / `NameHasNoOwner` during a systemd-logind restart, a
+/// timeout, a dropped connection — says nothing about whether a session
+/// exists and must retry as [`WatchEnd::Transient`]: parking on one of
+/// those would permanently disable the workaround over a hiccup.
+fn is_session_absence(err: &zbus::Error) -> bool {
+    matches!(
+        err,
+        zbus::Error::MethodError(name, _, _)
+            if matches!(
+                name.as_str(),
+                "org.freedesktop.login1.NoSessionForPID"
+                    | "org.freedesktop.login1.NoSuchSession"
+            )
+    )
+}
+
 /// Resolve this process's logind session object path:
 /// `Manager.GetSessionByPID(our pid)` first (verified live: the panel's PID
 /// resolves through its session scope), falling back to `$XDG_SESSION_ID` →
-/// `Manager.GetSession`. `Err` carries the human-readable evidence trail for
-/// the one-time no-session warning.
-async fn resolve_session(manager: &ManagerProxy<'_>) -> Result<OwnedObjectPath, String> {
+/// `Manager.GetSession`. `Err` classifies the combined failure
+/// ([`is_session_absence`] — `NoSession` only when every attempted path
+/// failed with a session-shaped error) and carries the human-readable
+/// evidence trail.
+async fn resolve_session(manager: &ManagerProxy<'_>) -> Result<OwnedObjectPath, WatchEnd> {
     let pid_err = match manager.get_session_by_pid(std::process::id()).await {
         Ok(path) => return Ok(path),
         Err(err) => err,
@@ -330,11 +378,23 @@ async fn resolve_session(manager: &ManagerProxy<'_>) -> Result<OwnedObjectPath, 
     match std::env::var("XDG_SESSION_ID") {
         Ok(id) => match manager.get_session(&id).await {
             Ok(path) => Ok(path),
-            Err(err) => Err(format!(
-                "GetSessionByPID: {pid_err}; GetSession({id:?}): {err}"
-            )),
+            Err(err) => {
+                let trail = format!("GetSessionByPID: {pid_err}; GetSession({id:?}): {err}");
+                if is_session_absence(&pid_err) && is_session_absence(&err) {
+                    Err(WatchEnd::NoSession(trail))
+                } else {
+                    Err(WatchEnd::Transient(trail))
+                }
+            }
         },
-        Err(_) => Err(format!("GetSessionByPID: {pid_err}; $XDG_SESSION_ID unset")),
+        Err(_) => {
+            let trail = format!("GetSessionByPID: {pid_err}; $XDG_SESSION_ID unset");
+            if is_session_absence(&pid_err) {
+                Err(WatchEnd::NoSession(trail))
+            } else {
+                Err(WatchEnd::Transient(trail))
+            }
+        }
     }
 }
 
@@ -355,47 +415,33 @@ mod tests {
 
     #[test]
     fn canonical_list_gets_a_trailing_duplicate() {
-        // Single output.
-        let single = vec![("all".to_owned(), path_source("a"))];
-        let toggled = toggle_wallpapers(single.clone()).expect("canonical list must toggle");
-        assert_ne!(toggled, single, "the write must be a value change");
-        assert_eq!(
-            toggled,
-            vec![
-                ("all".to_owned(), path_source("a")),
-                ("all".to_owned(), path_source("a")),
-            ]
-        );
-
-        // Multiple outputs: the duplicate is of the *last* entry, appended
-        // at the end.
-        let multi = vec![
-            ("DP-1".to_owned(), path_source("a")),
-            ("HDMI-1".to_owned(), path_source("b")),
-        ];
-        let toggled = toggle_wallpapers(multi.clone()).expect("canonical list must toggle");
-        assert_ne!(toggled, multi);
-        assert_eq!(
-            toggled,
-            vec![
-                ("DP-1".to_owned(), path_source("a")),
-                ("HDMI-1".to_owned(), path_source("b")),
-                ("HDMI-1".to_owned(), path_source("b")),
-            ]
-        );
-
-        // A Color source is toggled the same way — the transform never
-        // inspects the Source.
-        let color = vec![("all".to_owned(), color_source())];
-        let toggled = toggle_wallpapers(color.clone()).expect("color list must toggle");
-        assert_ne!(toggled, color);
-        assert_eq!(
-            toggled,
-            vec![
-                ("all".to_owned(), color_source()),
-                ("all".to_owned(), color_source()),
-            ]
-        );
+        // Labelled loop (one scenario failing must not mask the rest): the
+        // duplicate is always of the *last* entry, appended at the end, and
+        // the transform never inspects the Source (hence the Color case).
+        for (label, canonical) in [
+            ("single output", vec![("all".to_owned(), path_source("a"))]),
+            (
+                "multiple outputs",
+                vec![
+                    ("DP-1".to_owned(), path_source("a")),
+                    ("HDMI-1".to_owned(), path_source("b")),
+                ],
+            ),
+            ("color source", vec![("all".to_owned(), color_source())]),
+        ] {
+            let toggled = toggle_wallpapers(canonical.clone())
+                .unwrap_or_else(|| panic!("{label}: canonical list must toggle"));
+            assert_ne!(
+                toggled, canonical,
+                "{label}: the write must be a value change"
+            );
+            let mut expected = canonical.clone();
+            expected.push(canonical.last().cloned().expect("non-empty scenario"));
+            assert_eq!(
+                toggled, expected,
+                "{label}: a clone of the last entry, appended at the end"
+            );
+        }
     }
 
     #[test]
@@ -469,6 +515,47 @@ mod tests {
     #[test]
     fn empty_list_is_not_poked() {
         assert_eq!(toggle_wallpapers(Vec::new()), None);
+    }
+
+    #[test]
+    fn only_logind_session_absence_errors_park_the_watch() {
+        // The `WatchEnd::NoSession` park is permanent for the panel run, so
+        // it must trigger only on logind's own "no such session" method
+        // errors — a transient bus failure during a systemd-logind restart
+        // fails the same calls and must stay retryable.
+        fn method_error(name: &str) -> zbus::Error {
+            let message =
+                zbus::message::Message::method_call("/org/freedesktop/login1", "GetSession")
+                    .expect("build method call")
+                    .build(&())
+                    .expect("build message");
+            zbus::Error::MethodError(
+                zbus::names::OwnedErrorName::try_from(name).expect("valid error name"),
+                None,
+                message,
+            )
+        }
+
+        assert!(is_session_absence(&method_error(
+            "org.freedesktop.login1.NoSessionForPID"
+        )));
+        assert!(is_session_absence(&method_error(
+            "org.freedesktop.login1.NoSuchSession"
+        )));
+        // logind restarting / bus hiccups: same failed calls, different
+        // error shapes — all transient.
+        assert!(!is_session_absence(&method_error(
+            "org.freedesktop.DBus.Error.NoReply"
+        )));
+        assert!(!is_session_absence(&method_error(
+            "org.freedesktop.DBus.Error.ServiceUnknown"
+        )));
+        assert!(!is_session_absence(&method_error(
+            "org.freedesktop.DBus.Error.NameHasNoOwner"
+        )));
+        assert!(!is_session_absence(&zbus::Error::Failure(
+            "connection reset".to_owned()
+        )));
     }
 
     #[test]

@@ -1,8 +1,10 @@
 // Test-only helpers: a minimal loopback HTTP mock server so the network
 // branches of `bing.rs`/`app.rs` run hermetically (nothing ever reaches
 // the real Bing), an in-memory tiny-JPEG factory, the stock-palette
-// accessors, and the cosmic-config filesystem walkers (key-file lookup and
-// read-only failure injection) shared by the accent/app/config test modules.
+// accessors, the cosmic-config filesystem walkers (key-file lookup and
+// read-only failure injection) shared by the accent/app/config test modules,
+// and the tempdir-rooted cosmic-bg *state* builders shared by the lock-poke
+// tests in `wallpaper.rs` and `app.rs`.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -143,6 +145,47 @@ pub fn restore_dir_permissions(dirs: &[PathBuf]) {
     for dir in dirs {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
+}
+
+/// A tempdir-rooted stand-in for [`crate::wallpaper::poke_state_handle`]'s
+/// production handle (which always roots in the real user state dir): same
+/// identity (cosmic-bg's `NAME` + `State::version()`) so the raw-key layout
+/// under `root` matches production shape; the custom path keeps it hermetic.
+pub fn bg_state_config(root: &Path) -> cosmic::cosmic_config::Config {
+    cosmic::cosmic_config::Config::with_custom_path(
+        cosmic_bg_config::NAME,
+        cosmic_bg_config::state::State::version(),
+        root.to_path_buf(),
+    )
+    .expect("create tempdir-rooted cosmic-bg state config")
+}
+
+/// Where `with_custom_path` puts the lock poke's key file:
+/// `<root>/cosmic/<name>/v<version>/wallpapers`.
+pub fn bg_wallpapers_key_file(root: &Path) -> PathBuf {
+    root.join("cosmic")
+        .join(cosmic_bg_config::NAME)
+        .join(format!("v{}", cosmic_bg_config::state::State::version()))
+        .join("wallpapers")
+}
+
+/// The key file's inode — write assertions go by **inode** (cosmic-config's
+/// `set` commits an `AtomicFile`, i.e. temp+rename, so every real write is a
+/// new inode), never by mtime (the flakiness class `thumbs.rs` abandoned:
+/// timestamp ties cannot distinguish "unchanged" from "changed").
+pub fn bg_wallpapers_inode(root: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(bg_wallpapers_key_file(root))
+        .expect("stat wallpapers key")
+        .ino()
+}
+
+/// A `Source::Path` in the canonical download-dir shape, distinguished by
+/// `name`.
+pub fn bg_path_source(name: &str) -> cosmic_bg_config::Source {
+    cosmic_bg_config::Source::Path(PathBuf::from(format!(
+        "/home/u/Pictures/BingWallpaper/{name}.jpg"
+    )))
 }
 
 /// A real, decodable JPEG of the given size, in memory (for mock download

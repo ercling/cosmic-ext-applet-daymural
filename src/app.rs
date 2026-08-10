@@ -611,6 +611,15 @@ impl Window {
     /// generation — which atomically invalidates any pending ladder (the
     /// [`Self::schedule_refresh`] shape). Both rungs are full toggles; see
     /// `POKE_DELAYS` for why the second exists.
+    ///
+    /// The rungs share one generation deliberately (the ladder cancels as a
+    /// unit), which also means they are **not serialized against each
+    /// other**: under an extreme I/O stall rung 1's `spawn_blocking` write
+    /// can still be in flight when rung 2 fires, and the interleaved
+    /// fresh-reads can double-append or normalize an uncommitted shape.
+    /// Every such outcome stays inside the duplicated-rest-shape class
+    /// [`lockwatch::toggle_wallpapers`] tolerates by design and is cleaned
+    /// by the next poke's normalization.
     fn arm_lock_pokes(&mut self) -> app::Task<Message> {
         self.lock_poke_generation += 1;
         let generation = self.lock_poke_generation;
@@ -5617,25 +5626,17 @@ mod tests {
     // real ~/.local/state/cosmic/com.system76.CosmicBackground.
     // -----------------------------------------------------------------
 
+    use crate::testutil::{
+        bg_path_source, bg_state_config, bg_wallpapers_inode, bg_wallpapers_key_file,
+    };
     use cosmic_bg_config::Source;
 
-    /// A tempdir-rooted stand-in for [`wallpaper::poke_state_handle`]'s
-    /// production handle (which always roots in the real user state dir) —
-    /// same identity (name + version) so the key layout matches production.
-    fn bg_state_config(dir: &tempfile::TempDir) -> cosmic_config::Config {
-        cosmic_config::Config::with_custom_path(
-            cosmic_bg_config::NAME,
-            cosmic_bg_config::state::State::version(),
-            dir.path().to_path_buf(),
-        )
-        .expect("create tempdir-rooted cosmic-bg state config")
-    }
-
     /// A window whose poke handle is injected tempdir-rooted (mirroring how
-    /// [`accent_window`] injects `config_context`).
+    /// [`accent_window`] injects `config_context`; the shared
+    /// [`bg_state_config`] builder mirrors production's key layout).
     fn poke_window(dir: &tempfile::TempDir) -> Window {
         Window {
-            poke_config: Some(bg_state_config(dir)),
+            poke_config: Some(bg_state_config(dir.path())),
             ..Window::default()
         }
     }
@@ -5658,27 +5659,6 @@ mod tests {
             .expect("poke handle must be injected")
             .get("wallpapers")
             .expect("read wallpapers key")
-    }
-
-    /// The injected `wallpapers` key file's inode — write assertions go by
-    /// inode (cosmic-config's `set` commits an `AtomicFile`, temp+rename, so
-    /// every real write is a new inode), never by mtime (the flakiness class
-    /// `thumbs.rs` abandoned).
-    fn bg_wallpapers_inode(dir: &tempfile::TempDir) -> u64 {
-        use std::os::unix::fs::MetadataExt as _;
-        let key = dir
-            .path()
-            .join("cosmic")
-            .join(cosmic_bg_config::NAME)
-            .join(format!("v{}", cosmic_bg_config::state::State::version()))
-            .join("wallpapers");
-        std::fs::metadata(key).expect("stat wallpapers key").ino()
-    }
-
-    fn bg_path_source(name: &str) -> Source {
-        Source::Path(PathBuf::from(format!(
-            "/home/u/Pictures/BingWallpaper/{name}.jpg"
-        )))
     }
 
     /// Deliver one rung of the poke ladder synchronously — the test-side
@@ -5707,7 +5687,6 @@ mod tests {
 
     #[test]
     fn settled_lock_poke_toggles_the_injected_state() {
-        use crate::lockwatch::toggle_wallpapers;
         use cosmic::Application as _;
 
         let dir = tempfile::tempdir().unwrap();
@@ -5717,7 +5696,7 @@ mod tests {
             ("HDMI-1".to_owned(), bg_path_source("b")),
         ];
         seed_bg_wallpapers(&window, &canonical);
-        let seeded_inode = bg_wallpapers_inode(&dir);
+        let seeded_inode = bg_wallpapers_inode(dir.path());
 
         drop(window.update(Message::LockEvent(lockwatch::LockEvent::Locked)));
         let generation = window.lock_poke_generation;
@@ -5726,20 +5705,19 @@ mod tests {
             "the ladder's first rung must write"
         );
         assert_ne!(
-            bg_wallpapers_inode(&dir),
+            bg_wallpapers_inode(dir.path()),
             seeded_inode,
             "a write must have landed (atomic rename = new inode)"
         );
-        assert_eq!(
-            read_bg_wallpapers(&window),
-            toggle_wallpapers(canonical.clone()).expect("canonical toggles"),
-            "the on-disk value is exactly the toggle of the seeded list"
-        );
+        // A *value change* reached the injected state — the wiring's job.
+        // The exact toggled bytes are `wallpaper.rs`'s poke tests' pin
+        // (`poke_toggles_the_wallpapers_key` / `second_poke_restores_..`),
+        // not re-asserted here.
+        assert_ne!(read_bg_wallpapers(&window), canonical);
 
-        // The same ladder's second rung toggles back — on a canonical list
-        // an uninterrupted ladder rests canonical.
+        // The same ladder's second rung writes again (a full toggle, never
+        // deduped-away).
         assert!(settle_lock_pokes(&mut window, generation));
-        assert_eq!(read_bg_wallpapers(&window), canonical);
     }
 
     #[test]
@@ -5750,7 +5728,7 @@ mod tests {
         let mut window = poke_window(&dir);
         let canonical = vec![("all".to_owned(), bg_path_source("a"))];
         seed_bg_wallpapers(&window, &canonical);
-        let seeded_inode = bg_wallpapers_inode(&dir);
+        let seeded_inode = bg_wallpapers_inode(dir.path());
 
         drop(window.update(Message::LockEvent(lockwatch::LockEvent::Locked)));
         let stale = window.lock_poke_generation;
@@ -5766,7 +5744,7 @@ mod tests {
         );
         assert!(window.due_lock_poke(stale).is_none());
         assert_eq!(
-            bg_wallpapers_inode(&dir),
+            bg_wallpapers_inode(dir.path()),
             seeded_inode,
             "the state file must be untouched"
         );
@@ -5835,5 +5813,84 @@ mod tests {
         assert!(!settle_lock_pokes(&mut window, generation));
         // The completion path stays harmless too (log-only).
         drop(window.update(Message::LockPokeFinished(false)));
+    }
+
+    /// Every `LockPokeDue` generation the task's rungs will deliver, in
+    /// order — the only way to see what [`Window::arm_lock_pokes`] actually
+    /// armed (its `Task` is otherwise dropped unpolled by every other test,
+    /// so a ladder of zero rungs or rungs minted with a pre-bump generation
+    /// — every rung permanently stale — would pass the whole suite).
+    /// Paused tokio time auto-advances the rung sleeps.
+    async fn armed_rung_generations(task: app::Task<Message>) -> Vec<u64> {
+        use cosmic::iced::futures::StreamExt as _;
+
+        let Some(stream) = cosmic::iced::runtime::task::into_stream(task) else {
+            return Vec::new();
+        };
+        stream
+            .filter_map(|action| async move {
+                match action {
+                    cosmic::iced::runtime::Action::Output(cosmic::Action::App(
+                        Message::LockPokeDue(generation),
+                    )) => Some(generation),
+                    _ => None,
+                }
+            })
+            .collect()
+            .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lock_event_arms_one_fresh_rung_per_delay() {
+        use cosmic::Application as _;
+
+        let mut window = Window::default();
+        let task = window.update(Message::LockEvent(lockwatch::LockEvent::Locked));
+
+        let rungs = armed_rung_generations(task).await;
+        assert_eq!(
+            rungs.len(),
+            lockwatch::POKE_DELAYS.len(),
+            "one rung per ladder delay"
+        );
+        assert!(
+            rungs.iter().all(|g| *g == window.lock_poke_generation),
+            "every rung must carry the *bumped* generation ({}), got {rungs:?} — \
+             a pre-bump capture would make the whole ladder stillborn",
+            window.lock_poke_generation
+        );
+    }
+
+    #[test]
+    fn a_failed_poke_settles_as_not_written() {
+        use cosmic::Application as _;
+
+        // A read-only version dir fails the state write, driving
+        // `run_lock_poke`'s warn-and-`false` branch (the completion then
+        // carries `wrote == false`).
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = poke_window(&dir);
+        let canonical = vec![("all".to_owned(), bg_path_source("a"))];
+        seed_bg_wallpapers(&window, &canonical);
+        let seeded_inode = bg_wallpapers_inode(dir.path());
+
+        drop(window.update(Message::LockEvent(lockwatch::LockEvent::Locked)));
+        let generation = window.lock_poke_generation;
+
+        let key_dir = bg_wallpapers_key_file(dir.path())
+            .parent()
+            .expect("key file has a version dir")
+            .to_path_buf();
+        let locked = crate::testutil::read_only_trees(&[key_dir]);
+        let wrote = settle_lock_pokes(&mut window, generation);
+        crate::testutil::restore_dir_permissions(&locked);
+
+        assert!(!wrote, "a failed write must settle as not-written");
+        assert_eq!(
+            bg_wallpapers_inode(dir.path()),
+            seeded_inode,
+            "the seeded state must be untouched"
+        );
+        assert_eq!(read_bg_wallpapers(&window), canonical);
     }
 }

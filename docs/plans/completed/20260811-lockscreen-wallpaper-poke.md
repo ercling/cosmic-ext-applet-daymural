@@ -307,10 +307,14 @@ while it shows the default".
 
 - Poke write = single raw `wallpapers` key under
   `~/.local/state/cosmic/com.system76.CosmicBackground/v1/` via
-  cosmic-config's atomic temp+rename. Racing cosmic-bg's own tick is benign:
-  both writers are atomic; whichever value lands last is valid and renders
-  identically (first-match invariant); artifacts are bounded and cleaned by
-  the next poke's normalization — **not** by cosmic-bg, whose `save_state`
+  cosmic-config's atomic temp+rename. Racing cosmic-bg's own tick is
+  **bounded-loss, not zero-loss** (review correction): both writers are
+  atomic and whichever value lands last is valid and renders identically
+  (first-match invariant), but a tick whose RMW write lands after a rung's
+  toggled write and *before* the locker's watcher reads the file restores
+  the pre-toggle value, so that rung's delivery is deduped — the other rung,
+  or the next lock/resume, heals. Artifacts are bounded and cleaned by the
+  next poke's normalization — **not** by cosmic-bg, whose `save_state`
   is read-modify-write and preserves whatever shape it finds.
 - Generation counter follows the documented repo model (`app.rs:6-8`): bump
   = cancel; a `LockPokeDue` carrying a stale generation is dropped. Rapid
