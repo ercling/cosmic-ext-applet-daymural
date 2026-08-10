@@ -64,8 +64,6 @@ pub enum LockEvent {
 /// slow lock. Both pokes are full toggles — a "normalize-only" final poke
 /// would write nothing when the first poke fired too early and left the
 /// list canonical, get deduped, and lose the heal.
-// TODO(lockwatch Task 4): remove the allow when app.rs arms the ladder.
-#[allow(dead_code)]
 pub const POKE_DELAYS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(4)];
 
 /// The normalizing toggle: produce a `wallpapers` value that (a) compares
@@ -219,10 +217,6 @@ struct LockWatchSubscription;
 /// restart a finished subscription): transient failures loop with a
 /// [`TRANSIENT_RETRY`] backoff inside [`watch`], and a no-session
 /// environment parks on a pending future after one warning.
-// TODO(lockwatch Task 4): remove the allow when app.rs merges this into the
-// application subscription (the seed also keeps `LockEvent` and
-// `sleep_edge_to_event` live for dead-code analysis until then).
-#[allow(dead_code)]
 pub fn subscription() -> Subscription<LockEvent> {
     Subscription::run_with(TypeId::of::<LockWatchSubscription>(), |_| {
         cosmic::iced::stream::channel(4, watch)

@@ -120,9 +120,6 @@ pub fn apply(path: &Path) -> Result<(), WallpaperError> {
 /// The single cosmic-bg *state* key the lock-screen poke rewrites.
 const WALLPAPERS_KEY: &str = "wallpapers";
 
-// TODO(lockwatch Task 4): remove the allows when app.rs wires the pokes in
-// (until then the fns are exercised by tests only).
-#[allow(dead_code)]
 /// Poke cosmic-bg's *state* so a live lock screen rebuilds its wallpaper
 /// cache — the cosmic-greeter#511 workaround (full rationale in
 /// `lockwatch.rs`). Returns whether a write happened.
@@ -169,7 +166,6 @@ pub fn poke_state(config: &cosmic::cosmic_config::Config) -> Result<bool, Wallpa
     }
 }
 
-#[allow(dead_code)]
 /// The production handle for [`poke_state`]: cosmic-bg's state context,
 /// built once in `init` and cloned into poke tasks. `None` (with a warning)
 /// when it cannot be opened — every poke is then a no-op.

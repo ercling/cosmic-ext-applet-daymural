@@ -433,32 +433,40 @@ while it shows the default".
 **Files:**
 - Modify: `src/app.rs`
 
-- [ ] add `lock_poke_generation: u64` and `poke_config: Option<Config>` to
+- [x] add `lock_poke_generation: u64` and `poke_config: Option<Config>` to
       `Window` (`poke_config` built in `init` via
       `wallpaper::poke_state_handle()`); messages `LockEvent(..)`,
       `LockPokeDue(u64)`, `LockPokeFinished(bool)`
-- [ ] handle `LockEvent`: bump generation, spawn one sleeping task per
+- [x] handle `LockEvent`: bump generation, spawn one sleeping task per
       `POKE_DELAYS` entry carrying it (shape of `arm_refresh_timer`);
       handle `LockPokeDue`: drop stale, else clone `poke_config` into a
       spawned async task running `wallpaper::poke_state`, resolving to
       `LockPokeFinished`; handle `LockPokeFinished`: log only — never touch
       other applet state, never touch the popup-ledger paths
-- [ ] merge `lockwatch::subscription()` into `subscription()` with
+      (the stale/handle-less decision is factored as `Window::due_lock_poke`
+      so the settle helper shares it; the poke body is the shared
+      `run_lock_poke`, `spawn_blocking` inside a `cosmic::task::future` like
+      the accent tasks)
+- [x] merge `lockwatch::subscription()` into `subscription()` with
       `Subscription::batch`, mapped into `Message::LockEvent`
-- [ ] add the test-side `settle_lock_pokes(&mut Window)` helper in the shape
+- [x] add the test-side `settle_lock_pokes(&mut Window)` helper in the shape
       of `settle_accent_tasks` (`app.rs:4167-4182`): run
       `wallpaper::poke_state` on the injected handle synchronously, feed
       `LockPokeFinished(wrote)` back through `update` — a `Task` returned
       from `update()` is never polled in unit tests, so on-disk assertions
       must go through the settle helper, and message-level tests assert
       **generation bookkeeping only**
-- [ ] write tests (harness style of `accent_window`, `poke_config` injected
+      (signature deviation: `settle_lock_pokes(&mut Window, generation) ->
+      bool` — the explicit generation lets the staleness tests settle a
+      *dead* rung through the production `due_lock_poke` decision instead of
+      duplicating it in the test)
+- [x] write tests (harness style of `accent_window`, `poke_config` injected
       tempdir-rooted): `settled_lock_poke_toggles_the_injected_state`
       (value actually toggled on disk, via `settle_lock_pokes`),
       `a_stale_poke_due_is_a_noop` (generation bookkeeping; injected file's
       inode unchanged), `a_second_lock_event_invalidates_the_first_ladder`,
       `resumed_pokes_like_locked`, `poke_with_no_config_handle_is_a_noop`
-- [ ] run `just check` — must pass before task 5
+- [x] run `just check` — must pass before task 5
 
 ### Task 5: Verify acceptance criteria
 

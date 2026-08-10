@@ -26,7 +26,7 @@ use crate::catalogue::{self, Catalogue, ImageEntry};
 use crate::config::AppletConfig;
 // No `fl!` here: every user-visible string this applet renders lives in the
 // popup (`view.rs`). The panel contributes an icon and nothing else.
-use crate::{accent, bing, schedule, thumbs, tooltip, view, wallpaper};
+use crate::{accent, bing, lockwatch, schedule, thumbs, tooltip, view, wallpaper};
 
 /// One name everywhere: cosmic-config app ID, state dir, desktop entry.
 pub const APP_ID: &str = "io.github.ercling.CosmicBingWallpaper";
@@ -164,6 +164,20 @@ pub struct Window {
     /// `EnableRestore` the disk legitimately still says `false`) as an
     /// external disable. `None` when no config context existed at spawn.
     accent_disk_enabled_at_spawn: Option<bool>,
+    /// Generation counter for the lock-poke ladder
+    /// ([`lockwatch::POKE_DELAYS`]); a [`Message::LockPokeDue`] carrying a
+    /// stale generation is dropped, so a fresh [`Message::LockEvent`]
+    /// atomically replaces any pending ladder (rapid re-locks: the last
+    /// event's ladder wins). Same scheme as the refresh/shuffle timers.
+    lock_poke_generation: u64,
+    /// cosmic-bg *state* handle for the lock-screen poke
+    /// ([`wallpaper::poke_state`] — the cosmic-greeter#511 workaround,
+    /// rationale in `lockwatch.rs`), built once in `init` via
+    /// [`wallpaper::poke_state_handle`] and cloned into each poke task.
+    /// `None` when the state context cannot be opened — every poke is then a
+    /// no-op. Tests inject a tempdir-rooted `Config::with_custom_path`
+    /// handle (mirroring `config_context`).
+    poke_config: Option<cosmic_config::Config>,
 }
 
 /// What the single in-flight accent theme task ([`Window::accent_inflight`])
@@ -245,6 +259,22 @@ fn run_accent_job(handles: &accent::ThemeHandles, job: AccentJob) -> bool {
         tracing::warn!("accent theme write failed: {error}");
     }
     result.is_ok()
+}
+
+/// The blocking half of a lock poke: the cosmic-bg state read+write
+/// ([`wallpaper::poke_state`]). Not inline in `update()` — a state-dir write
+/// under I/O pressure is exactly the 2026-08-08 freeze shape (cheap
+/// insurance; see the accent tasks). Failures are logged here — the
+/// completion message only carries whether a write happened. Shared by the
+/// spawned task and the test-side settle helper so they cannot drift.
+fn run_lock_poke(config: &cosmic_config::Config) -> bool {
+    match wallpaper::poke_state(config) {
+        Ok(wrote) => wrote,
+        Err(error) => {
+            tracing::warn!("lock-screen state poke failed: {error}");
+            false
+        }
+    }
 }
 
 /// The one-shot cold-start auto-apply: a fresh install (empty catalogue at
@@ -374,6 +404,16 @@ pub enum Message {
         generation: u64,
         success: bool,
     },
+    /// A lock-relevant event from the logind watch
+    /// ([`lockwatch::subscription`]): arm the poke ladder — the
+    /// cosmic-greeter#511 workaround (full rationale in `lockwatch.rs`).
+    LockEvent(lockwatch::LockEvent),
+    /// A rung of the poke ladder came due (payload: the generation it was
+    /// armed with — a stale rung from a replaced ladder is dropped).
+    LockPokeDue(u64),
+    /// The async state poke finished (payload: whether a write happened).
+    /// Log-only by design: pokes never touch other applet state.
+    LockPokeFinished(bool),
     /// Surface actions from the tooltip widget ([`crate::tooltip`]). Every
     /// popup parented to `self.popup` is routed through a ledger-aware
     /// message like this one — there is deliberately no blind `Surface`
@@ -564,6 +604,33 @@ impl Window {
     fn disarm_shuffle(&mut self) {
         self.shuffle_generation += 1;
         self.shuffle_armed = false;
+    }
+
+    /// Arm the lock-poke ladder: one one-shot sleeping task per
+    /// [`lockwatch::POKE_DELAYS`] rung, all carrying a freshly bumped
+    /// generation — which atomically invalidates any pending ladder (the
+    /// [`Self::schedule_refresh`] shape). Both rungs are full toggles; see
+    /// `POKE_DELAYS` for why the second exists.
+    fn arm_lock_pokes(&mut self) -> app::Task<Message> {
+        self.lock_poke_generation += 1;
+        let generation = self.lock_poke_generation;
+        Task::batch(lockwatch::POKE_DELAYS.map(|delay| {
+            cosmic::task::future(async move {
+                tokio::time::sleep(delay).await;
+                Message::LockPokeDue(generation)
+            })
+        }))
+    }
+
+    /// The [`Message::LockPokeDue`] decision, shared with the test-side
+    /// settle helper so the two cannot drift: the handle to poke with, or
+    /// `None` when the rung is stale (a newer ladder replaced it) or no
+    /// state handle exists.
+    fn due_lock_poke(&self, generation: u64) -> Option<cosmic_config::Config> {
+        if generation != self.lock_poke_generation {
+            return None;
+        }
+        self.poke_config.clone()
     }
 
     /// Bring the shuffle timer in line with the current state: it runs only
@@ -2011,6 +2078,8 @@ impl cosmic::Application for Window {
             accent_recompute_queued: false,
             accent_flip_requested: None,
             accent_disk_enabled_at_spawn: None,
+            lock_poke_generation: 0,
+            poke_config: wallpaper::poke_state_handle(),
         };
         let timer = window.schedule_refresh(delay);
         // Shuffle restored as enabled starts a fresh full-interval cycle.
@@ -2248,6 +2317,31 @@ impl cosmic::Application for Window {
                 generation,
                 success,
             } => return self.finish_accent_task(generation, success),
+            Message::LockEvent(event) => {
+                tracing::debug!(?event, "arming lock-screen poke ladder");
+                return self.arm_lock_pokes();
+            }
+            Message::LockPokeDue(generation) => {
+                let Some(config) = self.due_lock_poke(generation) else {
+                    return Task::none();
+                };
+                return cosmic::task::future(async move {
+                    let wrote =
+                        match tokio::task::spawn_blocking(move || run_lock_poke(&config)).await {
+                            Ok(wrote) => wrote,
+                            Err(error) => {
+                                tracing::warn!("lock poke task failed: {error}");
+                                false
+                            }
+                        };
+                    Message::LockPokeFinished(wrote)
+                });
+            }
+            Message::LockPokeFinished(wrote) => {
+                // Log-only by design: pokes never touch other applet state
+                // (and never the popup ledger).
+                tracing::debug!(wrote, "lock-screen state poke finished");
+            }
             Message::TooltipSurface(action) => return self.on_tooltip_surface(action),
             Message::DropdownSurface(action) => return self.on_dropdown_surface(action),
             Message::RefreshFinished(result) => return self.finish_refresh(result),
@@ -2267,11 +2361,16 @@ impl cosmic::Application for Window {
     }
 
     fn subscription(&self) -> iced::Subscription<Self::Message> {
-        // Keep `self.config` in sync with on-disk changes (our own setter
-        // writes echo back through here too, which is harmless).
-        self.core
-            .watch_config::<AppletConfig>(APP_ID)
-            .map(|update| Message::ConfigUpdated(update.config))
+        iced::Subscription::batch([
+            // Keep `self.config` in sync with on-disk changes (our own setter
+            // writes echo back through here too, which is harmless).
+            self.core
+                .watch_config::<AppletConfig>(APP_ID)
+                .map(|update| Message::ConfigUpdated(update.config)),
+            // logind lock/resume events → the poke ladder (the
+            // cosmic-greeter#511 workaround; rationale in `lockwatch.rs`).
+            lockwatch::subscription().map(Message::LockEvent),
+        ])
     }
 
     /// The panel button — bare, with **no** hover tooltip naming the applet.
@@ -5510,5 +5609,231 @@ mod tests {
             .unwrap();
         thumbs::ensure_thumbnail(&grey, &state).unwrap();
         assert_eq!(extract_accent_hue(&grey, &state).await, Some(None));
+    }
+
+    // -----------------------------------------------------------------
+    // Lock-screen poke wiring (the cosmic-greeter#511 workaround). The
+    // cosmic-bg state handle is TempDir-rooted — nothing ever touches the
+    // real ~/.local/state/cosmic/com.system76.CosmicBackground.
+    // -----------------------------------------------------------------
+
+    use cosmic_bg_config::Source;
+
+    /// A tempdir-rooted stand-in for [`wallpaper::poke_state_handle`]'s
+    /// production handle (which always roots in the real user state dir) —
+    /// same identity (name + version) so the key layout matches production.
+    fn bg_state_config(dir: &tempfile::TempDir) -> cosmic_config::Config {
+        cosmic_config::Config::with_custom_path(
+            cosmic_bg_config::NAME,
+            cosmic_bg_config::state::State::version(),
+            dir.path().to_path_buf(),
+        )
+        .expect("create tempdir-rooted cosmic-bg state config")
+    }
+
+    /// A window whose poke handle is injected tempdir-rooted (mirroring how
+    /// [`accent_window`] injects `config_context`).
+    fn poke_window(dir: &tempfile::TempDir) -> Window {
+        Window {
+            poke_config: Some(bg_state_config(dir)),
+            ..Window::default()
+        }
+    }
+
+    fn seed_bg_wallpapers(window: &Window, list: &Vec<(String, Source)>) {
+        use cosmic_config::ConfigSet as _;
+        window
+            .poke_config
+            .as_ref()
+            .expect("poke handle must be injected")
+            .set("wallpapers", list)
+            .expect("seed wallpapers key");
+    }
+
+    fn read_bg_wallpapers(window: &Window) -> Vec<(String, Source)> {
+        use cosmic_config::ConfigGet as _;
+        window
+            .poke_config
+            .as_ref()
+            .expect("poke handle must be injected")
+            .get("wallpapers")
+            .expect("read wallpapers key")
+    }
+
+    /// The injected `wallpapers` key file's inode — write assertions go by
+    /// inode (cosmic-config's `set` commits an `AtomicFile`, temp+rename, so
+    /// every real write is a new inode), never by mtime (the flakiness class
+    /// `thumbs.rs` abandoned).
+    fn bg_wallpapers_inode(dir: &tempfile::TempDir) -> u64 {
+        use std::os::unix::fs::MetadataExt as _;
+        let key = dir
+            .path()
+            .join("cosmic")
+            .join(cosmic_bg_config::NAME)
+            .join(format!("v{}", cosmic_bg_config::state::State::version()))
+            .join("wallpapers");
+        std::fs::metadata(key).expect("stat wallpapers key").ino()
+    }
+
+    fn bg_path_source(name: &str) -> Source {
+        Source::Path(PathBuf::from(format!(
+            "/home/u/Pictures/BingWallpaper/{name}.jpg"
+        )))
+    }
+
+    /// Deliver one rung of the poke ladder synchronously — the test-side
+    /// stand-in for the spawned poke task, in the shape of
+    /// [`settle_accent_tasks`]: a `Task` returned from `update()` is never
+    /// polled in unit tests, so on-disk assertions must come through here.
+    /// Feeds `LockPokeDue(generation)` through `update` (the bookkeeping the
+    /// real timer tick hits), then runs the *production* decision
+    /// ([`Window::due_lock_poke`]) and the *production* poke body
+    /// ([`run_lock_poke`]) so neither can drift, and feeds
+    /// `LockPokeFinished` back exactly when production would (a stale or
+    /// handle-less rung sends no completion). Returns whether a write
+    /// happened. The explicit `generation` (the plan sketched a bare
+    /// `&mut Window`) is what lets the staleness tests settle a *dead* rung.
+    fn settle_lock_pokes(window: &mut Window, generation: u64) -> bool {
+        use cosmic::Application as _;
+
+        drop(window.update(Message::LockPokeDue(generation)));
+        let Some(config) = window.due_lock_poke(generation) else {
+            return false;
+        };
+        let wrote = run_lock_poke(&config);
+        drop(window.update(Message::LockPokeFinished(wrote)));
+        wrote
+    }
+
+    #[test]
+    fn settled_lock_poke_toggles_the_injected_state() {
+        use crate::lockwatch::toggle_wallpapers;
+        use cosmic::Application as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = poke_window(&dir);
+        let canonical = vec![
+            ("DP-1".to_owned(), bg_path_source("a")),
+            ("HDMI-1".to_owned(), bg_path_source("b")),
+        ];
+        seed_bg_wallpapers(&window, &canonical);
+        let seeded_inode = bg_wallpapers_inode(&dir);
+
+        drop(window.update(Message::LockEvent(lockwatch::LockEvent::Locked)));
+        let generation = window.lock_poke_generation;
+        assert!(
+            settle_lock_pokes(&mut window, generation),
+            "the ladder's first rung must write"
+        );
+        assert_ne!(
+            bg_wallpapers_inode(&dir),
+            seeded_inode,
+            "a write must have landed (atomic rename = new inode)"
+        );
+        assert_eq!(
+            read_bg_wallpapers(&window),
+            toggle_wallpapers(canonical.clone()).expect("canonical toggles"),
+            "the on-disk value is exactly the toggle of the seeded list"
+        );
+
+        // The same ladder's second rung toggles back — on a canonical list
+        // an uninterrupted ladder rests canonical.
+        assert!(settle_lock_pokes(&mut window, generation));
+        assert_eq!(read_bg_wallpapers(&window), canonical);
+    }
+
+    #[test]
+    fn a_stale_poke_due_is_a_noop() {
+        use cosmic::Application as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = poke_window(&dir);
+        let canonical = vec![("all".to_owned(), bg_path_source("a"))];
+        seed_bg_wallpapers(&window, &canonical);
+        let seeded_inode = bg_wallpapers_inode(&dir);
+
+        drop(window.update(Message::LockEvent(lockwatch::LockEvent::Locked)));
+        let stale = window.lock_poke_generation;
+        drop(window.update(Message::LockEvent(lockwatch::LockEvent::Locked)));
+        assert!(
+            window.lock_poke_generation > stale,
+            "a fresh event must bump the generation (that bump *is* the cancel)"
+        );
+
+        assert!(
+            !settle_lock_pokes(&mut window, stale),
+            "a rung from the replaced ladder must not poke"
+        );
+        assert!(window.due_lock_poke(stale).is_none());
+        assert_eq!(
+            bg_wallpapers_inode(&dir),
+            seeded_inode,
+            "the state file must be untouched"
+        );
+        assert_eq!(read_bg_wallpapers(&window), canonical);
+    }
+
+    #[test]
+    fn a_second_lock_event_invalidates_the_first_ladder() {
+        use cosmic::Application as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = poke_window(&dir);
+        let canonical = vec![("all".to_owned(), bg_path_source("a"))];
+        seed_bg_wallpapers(&window, &canonical);
+
+        drop(window.update(Message::LockEvent(lockwatch::LockEvent::Locked)));
+        let first = window.lock_poke_generation;
+        // A rapid re-lock (or a resume racing a lock): the last event wins.
+        drop(window.update(Message::LockEvent(lockwatch::LockEvent::Resumed)));
+        let second = window.lock_poke_generation;
+        assert!(second > first);
+
+        // Every rung of the first ladder is dead…
+        assert!(!settle_lock_pokes(&mut window, first));
+        assert!(!settle_lock_pokes(&mut window, first));
+        assert_eq!(read_bg_wallpapers(&window), canonical);
+        // …while the second ladder pokes normally.
+        assert!(settle_lock_pokes(&mut window, second));
+        assert_ne!(read_bg_wallpapers(&window), canonical);
+    }
+
+    #[test]
+    fn resumed_pokes_like_locked() {
+        use crate::lockwatch::toggle_wallpapers;
+        use cosmic::Application as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = poke_window(&dir);
+        let canonical = vec![("all".to_owned(), bg_path_source("a"))];
+        seed_bg_wallpapers(&window, &canonical);
+
+        // The suspend path may never emit a session `Lock` signal — the
+        // resume edge must arm the identical ladder.
+        drop(window.update(Message::LockEvent(lockwatch::LockEvent::Resumed)));
+        let generation = window.lock_poke_generation;
+        assert!(settle_lock_pokes(&mut window, generation));
+        assert_eq!(
+            read_bg_wallpapers(&window),
+            toggle_wallpapers(canonical).expect("canonical toggles")
+        );
+    }
+
+    #[test]
+    fn poke_with_no_config_handle_is_a_noop() {
+        use cosmic::Application as _;
+
+        // No handle (cosmic-bg state context failed to open in `init`):
+        // events still arm the ladder harmlessly, and every rung no-ops.
+        let mut window = Window::default();
+        assert!(window.poke_config.is_none());
+
+        drop(window.update(Message::LockEvent(lockwatch::LockEvent::Locked)));
+        let generation = window.lock_poke_generation;
+        assert_eq!(generation, 1, "the event still bumps the generation");
+        assert!(window.due_lock_poke(generation).is_none());
+        assert!(!settle_lock_pokes(&mut window, generation));
+        // The completion path stays harmless too (log-only).
+        drop(window.update(Message::LockPokeFinished(false)));
     }
 }
