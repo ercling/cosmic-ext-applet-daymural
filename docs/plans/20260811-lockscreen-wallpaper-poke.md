@@ -409,21 +409,24 @@ while it shows the default".
 - Modify: `src/lockwatch.rs`
 - Modify: `Cargo.toml` (add zbus — first task that uses it)
 
-- [ ] add `zbus = { version = "5", default-features = false, features = ["tokio"] }`;
+- [x] add `zbus = { version = "5", default-features = false, features = ["tokio"] }`;
       verify `Cargo.lock` unchanged except the new direct-dep edge
-- [ ] add minimal `#[zbus::proxy]` traits (Manager: `GetSessionByPID`,
+      (verified: the diff adds only `"zbus"` to this crate's dependency
+      list; zbus stays 5.18.0)
+- [x] add minimal `#[zbus::proxy]` traits (Manager: `GetSessionByPID`,
       `GetSession`, `PrepareForSleep` signal; Session: `Lock` signal)
-- [ ] add `subscription() -> Subscription<LockEvent>` per Technical Details:
+      (`gen_blocking = false` on both — the blocking API is never used)
+- [x] add `subscription() -> Subscription<LockEvent>` per Technical Details:
       `run_with` + `TypeId` identity, session resolution with the
       `GetSessionByPID` → `$XDG_SESSION_ID` fallback, merged `Lock` +
       `PrepareForSleep` streams mapped through `sleep_edge_to_event`,
       transient-vs-permanent failure handling (inner ~30 s backoff loop vs
       warn-once-and-park), stream never returns `None`, `tracing` `debug`
       per event
-- [ ] mark the stream fn with the repo's untestable-plumbing exemption
+- [x] mark the stream fn with the repo's untestable-plumbing exemption
       comment (system bus cannot be faked hermetically; every decision it
       makes lives in the already-tested pure fns)
-- [ ] run `just check` — must pass before task 4
+- [x] run `just check` — must pass before task 4
 
 ### Task 4: Wire pokes into the app (`app.rs`)
 

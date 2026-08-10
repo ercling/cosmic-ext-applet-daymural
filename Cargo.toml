@@ -60,6 +60,12 @@ tokio = { version = "1", features = ["macros", "rt", "time"] }
 ron = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# System-bus lock/resume watch (`src/lockwatch.rs`). Feature shape matches how
+# libcosmic enables zbus (its `tokio` feature sets `zbus?/tokio`); default
+# features would drag the whole `async-io` executor stack in. Cargo.lock
+# already resolves zbus 5.18.0 through libcosmic — this edge changes nothing
+# else there.
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
 tempfile = "3"

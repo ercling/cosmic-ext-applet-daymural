@@ -24,17 +24,20 @@
 // pinned libcosmic rev and the greeter's; the mechanism-proof test below
 // pins the premise against future bumps.
 //
-// This module holds the pure decisions only; the zbus subscription stream
-// (Task 3) and the app wiring (Task 4) build on it.
+// This module holds the pure decisions ([`toggle_wallpapers`],
+// [`sleep_edge_to_event`]) and the zbus [`subscription`] stream that feeds
+// them; the app wiring (Task 4) builds on both.
 
+use std::any::TypeId;
 use std::collections::HashSet;
 use std::time::Duration;
 
+use cosmic::iced::Subscription;
+use cosmic::iced::futures::channel::mpsc;
+use cosmic::iced::futures::{SinkExt, StreamExt, future, stream};
 use cosmic_bg_config::Source;
+use zbus::zvariant::OwnedObjectPath;
 
-// TODO(lockwatch Task 3/4): remove these allows when the subscription stream
-// and the app.rs wiring consume the items (they are test-only until then).
-#[allow(dead_code)]
 /// A lock-relevant event observed on the system bus.
 ///
 /// There is deliberately **no `Unlocked` variant**: nothing on this system
@@ -61,6 +64,7 @@ pub enum LockEvent {
 /// slow lock. Both pokes are full toggles — a "normalize-only" final poke
 /// would write nothing when the first poke fired too early and left the
 /// list canonical, get deduped, and lose the heal.
+// TODO(lockwatch Task 4): remove the allow when app.rs arms the ladder.
 #[allow(dead_code)]
 pub const POKE_DELAYS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(4)];
 
@@ -130,12 +134,213 @@ pub fn toggle_wallpapers(list: Vec<(String, Source)>) -> Option<Vec<(String, Sou
 /// `None` — a state write racing suspend is useless, the locker rebuild it
 /// would trigger happens while the displays are off, and the resume edge
 /// follows anyway.
-#[allow(dead_code)]
 pub fn sleep_edge_to_event(start: bool) -> Option<LockEvent> {
     if start {
         None
     } else {
         Some(LockEvent::Resumed)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// logind subscription stream.
+//
+// UNTESTED PLUMBING (same exemption class as `wallpaper::apply`): the system
+// bus cannot be faked hermetically from this crate — zbus offers no injectable
+// transport, and a mock bus daemon would be exactly the kind of non-hermetic
+// fixture the test suite bans. Every decision the stream makes lives in the
+// already-tested pure fns above (`sleep_edge_to_event`, and downstream
+// `toggle_wallpapers` via `wallpaper::poke_state`); the stream itself only
+// connects, resolves, and forwards.
+
+/// Minimal hand-written slice of `org.freedesktop.login1.Manager`: session
+/// resolution plus the suspend/resume signal. Deliberately not a generated
+/// drop-in — the full interface is enormous and everything else is noise.
+/// `gen_blocking = false`: the blocking API is never used here, and with
+/// `default-features = false` it may not even be compiled in.
+#[zbus::proxy(
+    interface = "org.freedesktop.login1.Manager",
+    default_service = "org.freedesktop.login1",
+    default_path = "/org/freedesktop/login1",
+    gen_blocking = false
+)]
+trait Manager {
+    fn get_session_by_pid(&self, pid: u32) -> zbus::Result<OwnedObjectPath>;
+
+    fn get_session(&self, session_id: &str) -> zbus::Result<OwnedObjectPath>;
+
+    /// `PrepareForSleep(true)` fires before suspend, `(false)` after resume.
+    /// cosmic-greeter locks on suspend through this same signal, so a
+    /// suspend lock may never emit a session `Lock` — the resume edge is the
+    /// reliable trigger (see [`LockEvent::Resumed`]).
+    #[zbus(signal)]
+    fn prepare_for_sleep(&self, start: bool) -> zbus::Result<()>;
+}
+
+/// Minimal slice of `org.freedesktop.login1.Session`: the `Lock` signal
+/// only. No default path — the session object path is resolved at runtime
+/// ([`resolve_session`]) and set through the proxy builder.
+#[zbus::proxy(
+    interface = "org.freedesktop.login1.Session",
+    default_service = "org.freedesktop.login1",
+    gen_blocking = false
+)]
+trait Session {
+    /// Emitted by `loginctl lock-session` — the COSMIC lock keybinding and
+    /// `cosmic-idle` both go through it on this system.
+    #[zbus(signal)]
+    fn lock(&self) -> zbus::Result<()>;
+}
+
+/// Backoff between reconnect attempts after a transient D-Bus failure.
+const TRANSIENT_RETRY: Duration = Duration::from_secs(30);
+
+/// How a single connect-and-listen attempt ended.
+enum WatchEnd {
+    /// The subscription's receiver is gone — iced tore the stream down.
+    Closed,
+    /// This process has no logind session (e.g. running under
+    /// `user@.service` with no session scope). Permanent for the life of
+    /// the process: warn **once** and park — an infinite warn loop is not
+    /// acceptable, and there is no lock screen to heal without a session.
+    NoSession(String),
+    /// Anything else — bus unreachable, proxy failure, signal stream ended
+    /// (bus restart). Retry with backoff.
+    Transient(String),
+}
+
+/// Identity token for [`Subscription::run_with`] (cosmic-greeter's own
+/// logind subscription uses the same `TypeId` pattern).
+struct LockWatchSubscription;
+
+/// The lock-watch subscription: yields a [`LockEvent`] per session `Lock`
+/// signal and per logind resume edge. Steady state is fully signal-driven —
+/// no polling, no wakeups. The stream **never finishes** (iced does not
+/// restart a finished subscription): transient failures loop with a
+/// [`TRANSIENT_RETRY`] backoff inside [`watch`], and a no-session
+/// environment parks on a pending future after one warning.
+// TODO(lockwatch Task 4): remove the allow when app.rs merges this into the
+// application subscription (the seed also keeps `LockEvent` and
+// `sleep_edge_to_event` live for dead-code analysis until then).
+#[allow(dead_code)]
+pub fn subscription() -> Subscription<LockEvent> {
+    Subscription::run_with(TypeId::of::<LockWatchSubscription>(), |_| {
+        cosmic::iced::stream::channel(4, watch)
+    })
+}
+
+/// Outer driver: reconnect/park policy around [`connect_and_forward`].
+async fn watch(mut output: mpsc::Sender<LockEvent>) {
+    loop {
+        match connect_and_forward(&mut output).await {
+            WatchEnd::Closed => return,
+            WatchEnd::NoSession(reason) => {
+                tracing::warn!(
+                    "no logind session for this process ({reason}); \
+                     lock-screen wallpaper pokes are disabled for this run"
+                );
+                // Park forever — never return (a finished subscription
+                // stream is never restarted by iced).
+                future::pending::<()>().await;
+            }
+            WatchEnd::Transient(reason) => {
+                tracing::debug!(
+                    "logind lock watch failed ({reason}); \
+                     retrying in {TRANSIENT_RETRY:?}"
+                );
+                tokio::time::sleep(TRANSIENT_RETRY).await;
+            }
+        }
+    }
+}
+
+/// One attempt: connect to the system bus, resolve our session, then
+/// forward merged `Lock` + `PrepareForSleep` signals until a stream ends.
+async fn connect_and_forward(output: &mut mpsc::Sender<LockEvent>) -> WatchEnd {
+    let conn = match zbus::Connection::system().await {
+        Ok(conn) => conn,
+        Err(err) => {
+            return WatchEnd::Transient(format!("system bus connection failed: {err}"));
+        }
+    };
+    let manager = match ManagerProxy::new(&conn).await {
+        Ok(manager) => manager,
+        Err(err) => return WatchEnd::Transient(format!("logind manager proxy failed: {err}")),
+    };
+
+    // The bus is demonstrably up (the proxy built), so both resolution
+    // paths failing means "this process has no logind session" — the
+    // permanent class, not the transient one.
+    let session_path = match resolve_session(&manager).await {
+        Ok(path) => path,
+        Err(reason) => return WatchEnd::NoSession(reason),
+    };
+
+    let session_builder = match SessionProxy::builder(&conn).path(session_path.clone()) {
+        Ok(builder) => builder,
+        Err(err) => {
+            return WatchEnd::Transient(format!("bad session path {session_path}: {err}"));
+        }
+    };
+    let session = match session_builder.build().await {
+        Ok(session) => session,
+        Err(err) => return WatchEnd::Transient(format!("session proxy failed: {err}")),
+    };
+
+    let lock_stream = match session.receive_lock().await {
+        Ok(stream) => stream,
+        Err(err) => return WatchEnd::Transient(format!("subscribing to Lock failed: {err}")),
+    };
+    let sleep_stream = match manager.receive_prepare_for_sleep().await {
+        Ok(stream) => stream,
+        Err(err) => {
+            return WatchEnd::Transient(format!("subscribing to PrepareForSleep failed: {err}"));
+        }
+    };
+
+    tracing::debug!(session = %session_path, "logind lock watch connected");
+
+    let mut merged = stream::select(
+        lock_stream.map(|_signal| Some(LockEvent::Locked)),
+        sleep_stream.map(|signal| match signal.args() {
+            Ok(args) => sleep_edge_to_event(args.start),
+            Err(err) => {
+                tracing::debug!("undecodable PrepareForSleep payload: {err}");
+                None
+            }
+        }),
+    );
+    while let Some(maybe_event) = merged.next().await {
+        let Some(event) = maybe_event else { continue };
+        tracing::debug!(?event, "logind lock event");
+        if output.send(event).await.is_err() {
+            return WatchEnd::Closed;
+        }
+    }
+
+    // Both signal streams ended: the bus connection dropped (e.g. a dbus
+    // broker restart). Reconnect.
+    WatchEnd::Transient("signal streams ended (bus connection lost)".to_owned())
+}
+
+/// Resolve this process's logind session object path:
+/// `Manager.GetSessionByPID(our pid)` first (verified live: the panel's PID
+/// resolves through its session scope), falling back to `$XDG_SESSION_ID` →
+/// `Manager.GetSession`. `Err` carries the human-readable evidence trail for
+/// the one-time no-session warning.
+async fn resolve_session(manager: &ManagerProxy<'_>) -> Result<OwnedObjectPath, String> {
+    let pid_err = match manager.get_session_by_pid(std::process::id()).await {
+        Ok(path) => return Ok(path),
+        Err(err) => err,
+    };
+    match std::env::var("XDG_SESSION_ID") {
+        Ok(id) => match manager.get_session(&id).await {
+            Ok(path) => Ok(path),
+            Err(err) => Err(format!(
+                "GetSessionByPID: {pid_err}; GetSession({id:?}): {err}"
+            )),
+        },
+        Err(_) => Err(format!("GetSessionByPID: {pid_err}; $XDG_SESSION_ID unset")),
     }
 }
 
