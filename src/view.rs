@@ -479,8 +479,10 @@ fn nav_button<'a>(
 /// Goes through [`crate::tooltip`] (a real wayland popup) rather than the
 /// plain `widget::tooltip` overlay, which would clip to the popup surface —
 /// the same reason the dropdowns use `popup_dropdown` (see CLAUDE.md). It pins
-/// the one non-obvious argument: `parent_id` is *our* popup, so the tooltip
-/// parents to that rather than to the panel.
+/// the two non-obvious arguments: `parent_id` is *our* popup, so the tooltip
+/// parents to that rather than to the panel; and the suppression flag comes
+/// from [`tooltip_suppressed`], so the popup ledger's dropdown interlock (see
+/// that helper's doc) applies to every tooltip built here.
 fn popup_tooltip<'a>(
     window: &'a Window,
     content: impl Into<Element<'a, Message>>,

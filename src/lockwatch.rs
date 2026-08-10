@@ -173,6 +173,21 @@ pub fn sleep_edge_to_event(start: bool) -> Option<LockEvent> {
     gen_blocking = false
 )]
 trait Manager {
+    /// logind exports the acronym-cased `GetSessionByPID`; zbus's default
+    /// snake→Pascal conversion capitalizes only the first letter of each
+    /// `_` segment and emits `GetSessionByPid`, which logind's D-Bus
+    /// policy rejects with `org.freedesktop.DBus.Error.AccessDenied` (its
+    /// busconfig allowlists only the real member names — the error is not
+    /// even `UnknownMethod`). Hence the explicit name override, pinned by
+    /// `logind_pid_method_name_override_is_pinned` below; every *other*
+    /// member in this file matches its introspected name under the default
+    /// conversion (verified against `busctl introspect` 2026-08-11).
+    /// Without the override, resolution silently fell through to the
+    /// `$XDG_SESSION_ID` fallback — and, absent that too, retried as
+    /// [`WatchEnd::Transient`]: `AccessDenied` is not a session-absence
+    /// error ([`is_session_absence`]), so the misname could degrade but
+    /// never permanently park the watch.
+    #[zbus(name = "GetSessionByPID")]
     fn get_session_by_pid(&self, pid: u32) -> zbus::Result<OwnedObjectPath>;
 
     fn get_session(&self, session_id: &str) -> zbus::Result<OwnedObjectPath>;
@@ -372,12 +387,18 @@ fn is_session_absence(error: &zbus::Error) -> bool {
 /// evidence trail.
 async fn resolve_session(manager: &ManagerProxy<'_>) -> Result<OwnedObjectPath, WatchEnd> {
     let pid_err = match manager.get_session_by_pid(std::process::id()).await {
-        Ok(path) => return Ok(path),
+        Ok(path) => {
+            tracing::debug!(resolved_via = "GetSessionByPID", "logind session resolved");
+            return Ok(path);
+        }
         Err(error) => error,
     };
     match std::env::var("XDG_SESSION_ID") {
         Ok(id) => match manager.get_session(&id).await {
-            Ok(path) => Ok(path),
+            Ok(path) => {
+                tracing::debug!(resolved_via = "GetSession", "logind session resolved");
+                Ok(path)
+            }
             Err(error) => {
                 let trail = format!("GetSessionByPID: {pid_err}; GetSession({id:?}): {error}");
                 if is_session_absence(&pid_err) && is_session_absence(&error) {
@@ -550,6 +571,23 @@ mod tests {
         assert!(!is_session_absence(&zbus::Error::Failure(
             "connection reset".to_owned()
         )));
+    }
+
+    #[test]
+    fn logind_pid_method_name_override_is_pinned() {
+        // zbus's default snake→Pascal conversion emits `GetSessionByPid`,
+        // but logind exports the acronym-cased `GetSessionByPID` and its
+        // D-Bus policy rejects the misnamed call with `AccessDenied` (see
+        // the proxy doc). The generated proxy offers no reflection over its
+        // member names and a live-bus assertion would not be hermetic, so
+        // pin the source attribute itself — same class as the i18n tests
+        // scanning `app.rs`/`view.rs` for message-id references.
+        let source = include_str!("lockwatch.rs");
+        assert!(
+            source.contains(r#"#[zbus(name = "GetSessionByPID")]"#),
+            "get_session_by_pid needs its explicit zbus name override: the \
+             default conversion emits `GetSessionByPid`, which logind rejects"
+        );
     }
 
     #[test]

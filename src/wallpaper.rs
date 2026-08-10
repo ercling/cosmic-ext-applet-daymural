@@ -11,8 +11,12 @@
 //
 // Note on types: cosmic-bg-config depends on its own `cosmic-config`
 // instance (unpinned git source, distinct from libcosmic's rev-pinned one),
-// so its error type cannot be named from this crate. Everything here goes
-// through cosmic-bg-config's public API and maps errors into a local type.
+// so its error type cannot be named from this crate. The *config* side
+// (`apply` and friends) goes through cosmic-bg-config's public API and maps
+// errors into a local type; the lock-screen *state* poke deliberately does
+// not — it reads/writes the raw `wallpapers` key through our pinned
+// `cosmic_config` instance instead (see `poke_state` for why the two-instance
+// split forces that and why the bytes are identical either way).
 
 use std::fmt;
 use std::path::{Path, PathBuf};
