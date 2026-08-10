@@ -60,14 +60,21 @@ const DELAY: Duration = Duration::from_millis(100);
 /// upstream's arrangement for a *panel button*, which this applet no longer has
 /// a tooltip on (see `app::Window::view`).
 ///
-/// Upstream's `has_popup` flag has no counterpart here: it exists to suppress a
-/// panel button's tooltip while its popup is open, and with no panel tooltip
-/// left there is nothing to suppress.
+/// `suppressed` gates the popup the same way upstream's `has_popup` flag does
+/// (`Core::applet_tooltip` passes `(!has_popup).then_some(..)` as the widget's
+/// `settings`), but for a different reason: upstream hides a *panel button's*
+/// tooltip while its popup is open, whereas here it keeps a tooltip from arming
+/// while a dropdown menu is mapped. Both would be children of the same popup,
+/// i.e. siblings on one xdg-shell stack, and only the topmost of a stack may be
+/// destroyed — see the popup ledger in `app.rs`. Note it withholds the
+/// *settings closure*, not the widget: the wrapped button stays in the tree with
+/// its state intact and simply can never create a popup.
 pub fn tooltip<'a>(
     core: &cosmic::Core,
     content: impl Into<Element<'a, Message>>,
     label: impl Into<Cow<'static, str>>,
     parent_id: Option<window::Id>,
+    suppressed: bool,
 ) -> Element<'a, Message> {
     let window_id = window_id();
     let (popup_anchor, gravity) = away_from_panel(core.applet.anchor);
@@ -75,7 +82,7 @@ pub fn tooltip<'a>(
 
     widget::wayland::tooltip::widget::Tooltip::<Message, Message>::new(
         content,
-        Some(move |bounds: Rectangle| SctkPopupSettings {
+        (!suppressed).then_some(move |bounds: Rectangle| SctkPopupSettings {
             parent: parent_id.unwrap_or(window::Id::RESERVED),
             id: window_id,
             grab: false,

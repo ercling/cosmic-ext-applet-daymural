@@ -358,24 +358,30 @@ now stale and is corrected in Task 6.
 - Modify: `src/tooltip.rs`
 - Modify: `src/view.rs`
 
-- [ ] give `crate::tooltip::tooltip` a `suppressed: bool` parameter that gates
+- [x] give `crate::tooltip::tooltip` a `suppressed: bool` parameter that gates
       the settings closure — `(!suppressed).then_some(move |bounds| ..)`,
       matching `Core::applet_tooltip` (`libcosmic src/applet/mod.rs:308`) —
       rather than returning bare content, so the widget stays in the tree and
       the wrapped button keeps its state
-- [ ] pass `window.dropdown_open` from `view::popup_tooltip`
+- [x] pass `window.dropdown_open` from `view::popup_tooltip`
       (`src/view.rs:484`)
-- [ ] update the `src/tooltip.rs` doc comment at l. 54-56, which currently
+- [x] update the `src/tooltip.rs` doc comment at l. 54-56, which currently
       states upstream's `has_popup` flag "has no counterpart here" — it now
       has one, for a different reason (sibling-popup avoidance, not panel
       button suppression)
-- [ ] verify the `fl!` call sites at `src/view.rs:323`/`474` are untouched so
+- [x] verify the `fl!` call sites at `src/view.rs:323`/`474` are untouched so
       `every_message_id_is_referenced_by_the_ui` still sees every id
-- [ ] write a test that the tooltip is suppressed exactly while a dropdown is
+- [x] write a test that the tooltip is suppressed exactly while a dropdown is
       open, asserted through the ledger (after a dropdown create message the
       suppression input is `true`; after its destroy it is `false`) rather than
       as a tautology over the field
-- [ ] run `just check` - must pass before task 5
+- [x] run `just check` - must pass before task 5
+
+[decision] `view::popup_tooltip` reads the ledger through a named pure helper
+`view::tooltip_suppressed(window)` rather than passing `window.dropdown_open`
+inline. It is what the plan's "asserted through the ledger, not as a tautology
+over the field" test needs a name for, and it carries the *why* (sibling of the
+menu on one xdg-shell stack) at the point the view decides.
 
 ### Task 5: Verify acceptance criteria
 

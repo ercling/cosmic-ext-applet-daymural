@@ -486,7 +486,27 @@ fn popup_tooltip<'a>(
     content: impl Into<Element<'a, Message>>,
     text: impl Into<Cow<'static, str>>,
 ) -> Element<'a, Message> {
-    crate::tooltip::tooltip(&window.core, content, text, window.popup)
+    crate::tooltip::tooltip(
+        &window.core,
+        content,
+        text,
+        window.popup,
+        tooltip_suppressed(window),
+    )
+}
+
+/// Whether a hover tooltip must be kept from arming right now.
+///
+/// A tooltip and a dropdown menu are both children of `window.popup`, i.e.
+/// siblings on one xdg-shell stack where only the topmost may be destroyed —
+/// the crash this rule exists to prevent. `app.rs`'s popup ledger closes an
+/// already-open tooltip when a menu is created (the interlock); this is the
+/// other half, stopping a *new* one from arming while the menu is up.
+///
+/// Read off the ledger's `dropdown_open`, so it is the ledger — not the view —
+/// that decides when the window opens and closes.
+fn tooltip_suppressed(window: &Window) -> bool {
+    window.dropdown_open
 }
 
 #[cfg(test)]
@@ -738,6 +758,49 @@ mod tests {
         assert_eq!(
             format_updated(at(2026, 12, 31, 23, 50), at(2027, 1, 1, 0, 10)),
             "Updated yesterday at 23:50"
+        );
+    }
+
+    /// A `popup_dropdown` create/destroy pair, as the menu widget publishes
+    /// them. The settings payloads are opaque (`Arc<Box<dyn Any + ..>>`) and
+    /// never executed — `update` only inspects the variant.
+    fn dropdown_create() -> cosmic::surface::Action {
+        use std::any::Any;
+        use std::sync::Arc;
+
+        let opaque = || Arc::new(Box::new(()) as Box<dyn Any + Send + Sync>);
+        cosmic::surface::Action::Popup(opaque(), opaque(), None)
+    }
+
+    fn dropdown_destroy() -> cosmic::surface::Action {
+        cosmic::surface::Action::DestroyPopup(cosmic::iced::window::Id::unique())
+    }
+
+    /// Tooltips are suppressed exactly while a dropdown menu is mapped — the
+    /// second half of the single-child invariant (the interlock in `app.rs`
+    /// closes an *already open* tooltip; this stops a new one arming).
+    ///
+    /// Driven through the ledger rather than by poking `dropdown_open`, so it
+    /// asserts the wiring from the menu's own surface actions to the view, not
+    /// the field's own value.
+    #[test]
+    fn a_tooltip_is_suppressed_exactly_while_a_dropdown_is_open() {
+        use cosmic::Application as _;
+
+        let mut window = Window::default();
+        window.popup = Some(cosmic::iced::window::Id::unique());
+        assert!(!tooltip_suppressed(&window), "nothing is open yet");
+
+        drop(window.update(Message::DropdownSurface(dropdown_create())));
+        assert!(
+            tooltip_suppressed(&window),
+            "no tooltip may arm as a sibling of an open menu"
+        );
+
+        drop(window.update(Message::DropdownSurface(dropdown_destroy())));
+        assert!(
+            !tooltip_suppressed(&window),
+            "the menu is gone — hovering works again"
         );
     }
 }
