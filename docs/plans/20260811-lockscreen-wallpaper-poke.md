@@ -353,12 +353,12 @@ while it shows the default".
 - Create: `src/lockwatch.rs` (module + `#[cfg(test)]` tests)
 - Modify: `src/main.rs` (declare module)
 
-- [ ] create `src/lockwatch.rs` with `LockEvent { Locked, Resumed }`,
+- [x] create `src/lockwatch.rs` with `LockEvent { Locked, Resumed }`,
       `POKE_DELAYS`, `toggle_wallpapers`, `sleep_edge_to_event` — each
       doc-commented with the cosmic-greeter#511 rationale, the dedupe
       finding, the cosmic-bg RMW finding, the first-entry/append-at-end
       invariant, and why there is no `Unlocked` variant
-- [ ] write tests for `toggle_wallpapers`:
+- [x] write tests for `toggle_wallpapers`:
       `canonical_list_gets_a_trailing_duplicate` (also asserts `!=` input;
       cover single-output, multi-output, and a `Color` source),
       `toggling_twice_on_a_canonical_list_is_the_identity`,
@@ -368,13 +368,13 @@ while it shows the default".
       `unnamed_output_duplicates_normalize_to_one` (the legitimate
       `[("",s),("",s)]` cosmic-bg shape — removal is still a change),
       `empty_list_is_not_poked`
-- [ ] write test `sleep_edge_to_event` (`false` → `Resumed`, `true` → `None`)
-- [ ] write the mechanism-proof test (Testing Strategy): mirror
+- [x] write test `sleep_edge_to_event` (`false` → `Resumed`, `true` → `None`)
+- [x] write the mechanism-proof test (Testing Strategy): mirror
       `#[derive(Default, CosmicConfigEntry)]` struct on a tempdir
       `Config::with_custom_path`; assert an identical rewrite reports no
       changed keys and a toggled write reports `wallpapers` changed — this
       pins the dedupe premise against future libcosmic bumps
-- [ ] run `just check` — must pass before task 2
+- [x] run `just check` — must pass before task 2
 
 ### Task 2: State poke with injectable Config (`wallpaper.rs`)
 

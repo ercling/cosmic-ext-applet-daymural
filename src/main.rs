@@ -5,6 +5,7 @@ mod catalogue;
 mod config;
 mod fsutil;
 mod localize;
+mod lockwatch;
 mod schedule;
 #[cfg(test)]
 mod testutil;
