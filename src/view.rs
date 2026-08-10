@@ -499,12 +499,15 @@ fn popup_tooltip<'a>(
 ///
 /// A tooltip and a dropdown menu are both children of `window.popup`, i.e.
 /// siblings on one xdg-shell stack where only the topmost may be destroyed —
-/// the crash this rule exists to prevent. `app.rs`'s popup ledger closes an
-/// already-open tooltip when a menu is created (the interlock); this is the
-/// other half, stopping a *new* one from arming while the menu is up.
+/// the crash this rule exists to prevent. `app.rs`'s popup ledger destroys any
+/// open tooltip when a menu is created (the interlock) and drops everything the
+/// tooltip publishes while one is up; this is the front half, keeping the
+/// widget from publishing at all.
 ///
 /// Read off the ledger's `dropdown_open`, so it is the ledger — not the view —
-/// that decides when the window opens and closes.
+/// that decides when the window opens and closes. Kept as a named helper (not
+/// an inline field read) so the argument has the "why" attached at the one call
+/// site and the transition is directly assertable.
 fn tooltip_suppressed(window: &Window) -> bool {
     window.dropdown_open
 }
@@ -761,24 +764,11 @@ mod tests {
         );
     }
 
-    /// A `popup_dropdown` create/destroy pair, as the menu widget publishes
-    /// them. The settings payloads are opaque (`Arc<Box<dyn Any + ..>>`) and
-    /// never executed — `update` only inspects the variant.
-    fn dropdown_create() -> cosmic::surface::Action {
-        use std::any::Any;
-        use std::sync::Arc;
-
-        let opaque = || Arc::new(Box::new(()) as Box<dyn Any + Send + Sync>);
-        cosmic::surface::Action::Popup(opaque(), opaque(), None)
-    }
-
-    fn dropdown_destroy() -> cosmic::surface::Action {
-        cosmic::surface::Action::DestroyPopup(cosmic::iced::window::Id::unique())
-    }
+    use crate::testutil::surface::{dropdown_create, dropdown_destroy};
 
     /// Tooltips are suppressed exactly while a dropdown menu is mapped — the
-    /// second half of the single-child invariant (the interlock in `app.rs`
-    /// closes an *already open* tooltip; this stops a new one arming).
+    /// front half of the single-child invariant (the interlock in `app.rs`
+    /// destroys an *already open* tooltip; this stops a new one arming).
     ///
     /// Driven through the ledger rather than by poking `dropdown_open`, so it
     /// asserts the wiring from the menu's own surface actions to the view, not
@@ -801,6 +791,28 @@ mod tests {
         assert!(
             !tooltip_suppressed(&window),
             "the menu is gone — hovering works again"
+        );
+    }
+
+    /// Every tooltip in the popup must be built by [`popup_tooltip`], which is
+    /// the only place `suppressed` is fed from the ledger. A call site reaching
+    /// [`crate::tooltip::tooltip`] directly would pass its own (probably
+    /// `false`) flag and could arm a tooltip beside an open menu — the crash.
+    /// Guard test in the style of `localize`'s message-id scan, since nothing
+    /// in the type system forbids the direct call.
+    ///
+    /// The needle is assembled with `concat!` so this test does not match
+    /// itself.
+    #[test]
+    fn tooltips_are_only_ever_built_through_popup_tooltip() {
+        const SOURCE: &str = include_str!("view.rs");
+        const NEEDLE: &str = concat!("crate::tooltip", "::tooltip(");
+
+        let calls = SOURCE.matches(NEEDLE).count();
+        assert_eq!(
+            calls, 1,
+            "the tooltip constructor must be called exactly once in view.rs, \
+             inside `popup_tooltip`; found {calls}"
         );
     }
 }

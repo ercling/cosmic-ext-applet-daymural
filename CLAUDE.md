@@ -80,22 +80,28 @@ the pinned rev before coding against remembered names.
   the prune's `thumbs::reconcile` sweep is deferred: fetched entries only join
   the catalogue at `RefreshFinished`, so an unconditional sweep deletes what
   the in-flight pass just wrote. Every pass ends in a sweep of its own.
+  It also owns the **popup ledger** — the `dropdown_open` field, the
+  `TooltipSurface`/`DropdownSurface` messages, `on_popup_closed` /
+  `on_tooltip_surface` / `on_dropdown_surface` and the free `destroy_tooltip`
+  task — which holds the at-most-one-child invariant on `window.popup`. See
+  "UI conventions → Popup stack".
 - `src/view.rs` — popup UI (thumbnail, title/copyright, About link, prev/next/
   newest/refresh controls, shuffle + accent + retention rows, status footer —
   the accent toggler also renders in the empty-catalogue branch, so a modified
   theme can be switched off with no images) plus the pure
   display helpers (`displayed`/`prev_target`/`next_target`/`newest_target`,
-  `format_updated`, dropdown index↔value mappings) which *are* unit-tested; iced
-  view code itself is exempt from tests.
+  `format_updated`, dropdown index↔value mappings, `tooltip_suppressed`) which
+  *are* unit-tested; iced view code itself is exempt from tests.
 - `src/tooltip.rs` — the hover tooltip, as its own wayland popup: upstream's
   `Core::applet_tooltip` plumbing (positioner, 100 ms delay, one shared surface
   id) re-implemented so the tooltip *surface* can be styled — upstream paints it
   in the popup's own background colour, which made the label unreadable over the
   popup. The only call sites are in `view.rs` (`popup_tooltip`, reached from
-  the About button and every `nav_button`) — `app.rs` builds none, the panel
-  button deliberately has no tooltip. `tooltip(..)`'s `suppressed` argument is
-  upstream's `has_popup` shape, used here for the popup-stack invariant (see
-  "UI conventions").
+  the clickable thumbnail and every `nav_button` — prev/next/newest/refresh;
+  the About link is a plain `menu_button` with no tooltip) — `app.rs` builds
+  none, the panel button deliberately has no tooltip. `tooltip(..)`'s
+  `suppressed` argument is upstream's `has_popup` shape, used here for the
+  popup-stack invariant (see "UI conventions").
 - `src/bing.rs` — Bing API types + parsing (fixture:
   `tests/fixtures/hpimagearchive.json`), title/copyright derivation
   (`split_copyright` — Bing's own `title` field is the literal `"Info"`), pure
@@ -302,14 +308,21 @@ the pinned rev before coding against remembered names.
   strobe), `fetch_count(retention_days)`, `retention_reduced`.
 - `src/testutil.rs` — test-only loopback HTTP mock server (`spawn_mock`) and
   in-memory JPEG factory; all network branches are tested hermetically, nothing
-  ever reaches the real Bing.
+  ever reaches the real Bing. Its `surface` submodule holds the popup-ledger
+  test surface shared by `app::tests` and `view::tests`: builders for the
+  `cosmic::surface::Action`s the ledger routes, and `emitted(task)` — which
+  drains a returned `Task` into an ordered `Vec<Emitted>`. Assert **emissions**,
+  not just `dropdown_open`: the flag is set by a statement separate from the
+  `surface_task(..)` calls, so flag-only tests keep passing with every destroy
+  deleted (they did).
 
 Design decisions, live-verified Bing/cosmic-bg facts, and per-task
 implementation notes live in `docs/plans/` (`20260807-cosmic-bing-wallpaper-applet.md`
 for the applet itself, `20260808-ux-polish-lockscreen-i18n.md` for tooltips /
 disabled styling / i18n / theme conformance, `20260808-accent-from-wallpaper.md`
-plus its `-notes.md` for the accent feature — each in `docs/plans/` or, once
-archived, `docs/plans/completed/`). Gotchas recorded there worth knowing: the
+plus its `-notes.md` for the accent feature, `20260810-popup-destroy-order-crash.md`
+for the popup-stack invariant and its libcosmic source-line evidence — each in
+`docs/plans/` or, once archived, `docs/plans/completed/`). Gotchas recorded there worth knowing: the
 `zune-jpeg` `log`-feature workaround in `Cargo.toml`, the transitive
 `cosmic-config` pin living only in `Cargo.lock`, and the live-verified
 lock-screen propagation chain (applet → cosmic-bg config → cosmic-bg state →
@@ -360,8 +373,9 @@ surface. Two cases, same rule:
   (an overlay) and no longer `Core::applet_tooltip` — see `src/tooltip.rs` for
   why upstream's copy is unusable here (its surface is painted in the *same*
   colour as the popup, so the label had no readable background). Inside the
-  popup call `view::popup_tooltip(window, content, text)`, which pins
-  `parent_id: window.popup` (parent to the popup, not the panel).
+  popup call `view::popup_tooltip(window, content, text)`, which pins the two
+  non-obvious arguments: `parent_id: window.popup` (parent to the popup, not
+  the panel) and `suppressed: tooltip_suppressed(window)` (see "Popup stack").
   **The panel button deliberately has no tooltip** (`app::Window::view`):
   status applets don't announce their own name on hover, and ours was the only
   tray icon doing it. libcosmic's applet example does wrap the panel button —
@@ -373,8 +387,9 @@ Everything parented to it — the tooltip and either dropdown menu — is a
 *sibling* on one xdg-shell stack, and the protocol only permits destroying the
 **topmost** popup of a stack; violating it is a fatal `xdg_popup was destroyed
 while it was not the topmost popup` (the 2026-08-10 crash, plan
-`docs/plans/20260810-popup-destroy-order-crash.md`). Two libcosmic facts make
-the invariant the only actionable rule — verified against the pinned rev:
+`20260810-popup-destroy-order-crash.md` in `docs/plans/` or, once archived,
+`docs/plans/completed/`). Two libcosmic facts make the invariant the only
+actionable rule — verified against the pinned rev:
 
 - the runtime's `Action::Destroy`
   (`iced/winit/src/platform_specific/wayland/event_loop/state.rs`) descends
@@ -386,19 +401,35 @@ the invariant the only actionable rule — verified against the pinned rev:
   ourselves, so no ordering function can be written.
 
 With one child the runtime's own descent is already correct. The invariant is
-held by a ledger on `Window` (`tooltip_open` / `dropdown_open` /
-`tooltip_destroy_deferred`) and three rules — see `Window::on_tooltip_surface`,
-`on_dropdown_surface`, `on_popup_closed`, `clear_popup_ledger` in `app.rs`:
+held by **one bit** on `Window` (`dropdown_open`) plus one idempotent task —
+see `Window::on_tooltip_surface`, `on_dropdown_surface`, `on_popup_closed` and
+the free `destroy_tooltip` in `app.rs`:
 
-- **Interlock** — a dropdown create with a tooltip open chains
-  `destroy_popup(tooltip::window_id())` *ahead* of the forwarded create
-  (chained, never batched): that instant is the last moment the tooltip is
-  legally topmost.
+- **`destroy_tooltip()` is idempotent** — the runtime's `Destroy` arm logs
+  `"No popup to destroy"` and returns *before touching state* for an unmapped
+  id. That is what removes the need for a second flag: emit it whenever a
+  tooltip *might* be mapped instead of tracking whether one is. (A "tooltip
+  open" flag could only be set on the widget's `Action::Task` — arming, not
+  creation, since the create the delayed future resolves to goes straight to
+  the runtime and never back through `Message` — and five tooltip widgets
+  publishing arm/leave in *widget-tree* order rather than pointer order make
+  such a flag wrong exactly when it matters.)
+- **Interlock** — a dropdown create chains `destroy_tooltip()` *ahead* of the
+  forwarded create (chained, never batched): that instant is the last moment a
+  tooltip is legally topmost. Unconditional, and legal either way — no tooltip
+  mapped is the no-op, and a tooltip that reached the surface while a menu was
+  already up was mapped *above* it, i.e. is itself topmost.
 - **Suppression** — while `dropdown_open`, `view::tooltip_suppressed` makes
-  `tooltip(..)` withhold its settings closure, so no tooltip can arm.
-- **Deferral** — a tooltip destroy arriving while `dropdown_open` is held back
-  (it would target a non-topmost popup) and flushed after the dropdown's
-  destroy. Deferred, never dropped: dropping one strands a mapped tooltip.
+  `tooltip(..)` withhold its settings closure, so no tooltip can arm. In the
+  real pointer flow this is the rule that actually holds the invariant: the
+  widget publishes `on_leave` on the `CursorMoved` that takes the pointer off
+  the control, which necessarily precedes clicking a dropdown button.
+- **Drop, then re-emit** — while `dropdown_open`, *everything* the tooltip
+  publishes is dropped (a create would map a second child; a destroy would
+  target a non-topmost popup). Nothing is lost, because a dropdown destroy —
+  and any `PopupClosed` — chains `destroy_tooltip()` *after* the menu is gone.
+  This is the old "deferral" collapsed into the destroy's idempotence; don't
+  reintroduce a `tooltip_destroy_deferred` flag.
 
 Rules for touching any of this:
 
@@ -409,28 +440,38 @@ Rules for touching any of this:
   with `Arc::try_unwrap`, so a surviving clone makes it log
   `"Invalid settings for popup"` and create nothing — silently, logging being
   off by default. Match by reference, move the value into `surface_task`.
-- **`tooltip_open` means "armed", not "mapped"**, and is biased toward `true`.
-  The observable signal is the widget's `Action::Task` (with `.delay(..)` set
-  the resolved create goes straight to the runtime, never back through
-  `Message`), whose future may still resolve to `Ignore`. A false positive
-  costs one destroy the runtime no-ops (`"No popup to destroy"`); a false
-  negative strands a real tooltip — hence the bias.
-- **Closing our own popup must clear the ledger** (`clear_popup_ledger`, called
-  from both paths that end it). Only *compositor*-initiated dismissal produces
-  `PopupEvent::Done` → `Message::PopupClosed`; the explicit `Action::Destroy`
-  in `TogglePopup` emits no event, so without the manual clear a stale
-  `dropdown_open` suppresses every tooltip for the rest of the session.
-- `PopupClosed` fires for *every* popup and is the only signal for a dropdown
-  dismissed by grab loss (it publishes no `DestroyPopup`). An id that is
-  neither `self.popup` nor `tooltip::window_id()` is by elimination a menu.
-- **Residual path, not closed by this work — don't read it as a regression.**
-  Compositor-initiated dismissal is out of reach:
+- **`PopupClosed` fires for *every* popup we lose, self-initiated destroys
+  included.** The `Destroy` arm sends `PopupEvent::Done` for each popup it
+  tears down, byte for byte the same emission the compositor path makes, and it
+  is translated against the winit-side `surface_ids` map, not the state's own
+  (`…/wayland/sctk_event.rs`, `…/wayland/mod.rs`). Do **not** write "an
+  explicit destroy sends no event" — an earlier revision of this file did, and
+  it is false at the pinned rev. `PopupClosed` is still the *only* signal for a
+  dropdown dismissed by grab loss, which publishes no `DestroyPopup`.
+- **`TogglePopup` clears the ledger itself** — not because no event comes, but
+  because it comes *late*, after `self.popup.take()`, so the "ours" row can no
+  longer match it. Both `on_popup_closed` branches (ours / by-elimination) end
+  in the same clear-and-sweep, which is what makes that misclassification —
+  and a stale id for any popup already gone — harmless.
+- **`dropdown_open` is one bool, biased toward `true`.** A spurious `true` only
+  pauses tooltips; a spurious `false` lets one arm beside a mapped menu. It
+  cannot count two menus, so a create and a destroy from the *two different*
+  rows landing in one pass (create first) can end with the bit clear while a
+  menu is mapped; recovery is upstream's own, since a popup create destroys
+  everything above its requested parent (`state.rs`, `parent_mismatch`).
+- **Residual paths, not closed by this work — don't read either as a
+  regression.** (a) Compositor-initiated dismissal is out of reach:
   `…/handlers/shell/xdg_popup.rs::done` walks only *up* the parent chain and
   never collects children, and our popup has `grab: true` while the tooltip has
   `grab: false` (so it is outside the grab chain). A click outside can still
   make the compositor destroy the parent with the tooltip mapped, and
-  `PopupClosed` only reaches us afterwards. If a protocol error reappears, note
-  **which surface id** it names before concluding the ledger broke.
+  `PopupClosed` only reaches us afterwards — this is the **most likely** cause
+  of the reported error, not a leftover. (b) The arm→create gap: the interlock
+  fires while the tooltip's 100 ms future is still pending, so it is a no-op
+  and the future can still map the tooltip after the menu; the widget re-checks
+  `is_hovered` at resolution, so only a no-leave activation (touch/keyboard)
+  survives. If a protocol error reappears, note **which surface id** it names
+  before concluding the ledger broke.
 
 Disabled icon buttons: the theme's own disabled styling is a **no-op** for
 `Button::Icon` — `on_disabled` differs from `on` in alpha only, and the SVG

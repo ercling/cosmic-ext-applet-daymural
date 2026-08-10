@@ -37,6 +37,8 @@ from the GNOME extension is picked up as-is — no re-downloads.
 - **Tooltips** — every icon-only control in the popup (prev/next/newest/refresh,
   thumbnail) names what it does on hover; unavailable buttons are visibly dimmed.
   The panel button itself stays silent, like COSMIC's own status applets.
+  Hover tooltips pause while a *Shuffle every* or *Keep images* menu is open
+  (both are popups over the same surface, and only one may be open at a time).
 - **Localized** — the UI follows your desktop language, with catalogues for the
   73 locales COSMIC itself ships (see [Translations](#translations)).
 
@@ -149,6 +151,13 @@ Bing's UHD images are roughly **5 MB each**. Expect about:
   home is no obstacle — and hands the bytes to the unprivileged greeter over
   D-Bus. Under any other display manager (GDM, SDDM, …) the login screen keeps
   its own background and nothing the applet does can reach it.
+- **A popup dismissed by the compositor while a tooltip is visible can still
+  kill the applet** (`xdg_popup was destroyed while it was not the topmost
+  popup`; the panel then restarts it). The applet keeps at most one popup open
+  under its own popup so it never destroys them out of order itself, but this
+  path is inside libcosmic: when the compositor dismisses the popup — a click
+  outside it — the runtime tears the parent down without collecting the tooltip
+  child, and we are only told afterwards. Rare, and self-recovering.
 - Market is auto-detected, resolution is fixed at UHD, and the download folder
   is fixed at `~/Pictures/BingWallpaper`.
 

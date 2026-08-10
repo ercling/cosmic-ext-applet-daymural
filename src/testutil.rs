@@ -156,3 +156,113 @@ pub fn tiny_jpeg(width: u32, height: u32) -> Vec<u8> {
         .expect("encode in-memory jpeg");
     buf.into_inner()
 }
+
+/// The popup-ledger side of the test surface: builders for the
+/// `cosmic::surface::Action`s `app::Window::on_tooltip_surface` /
+/// `on_dropdown_surface` route, plus a collector for the actions a returned
+/// task actually emits.
+///
+/// Shared because `app::tests` and `view::tests` both drive the ledger through
+/// `Window::update`, and because the ledger's whole job is *emission order* —
+/// asserting the `Window` flags alone would keep passing with every destroy
+/// deleted.
+pub mod surface {
+    use std::any::Any;
+    use std::sync::Arc;
+
+    use crate::app::Message;
+
+    /// A `popup_dropdown` create. The settings payloads are opaque
+    /// (`Arc<Box<dyn Any + ..>>`) and never executed here — the ledger only
+    /// inspects the variant.
+    pub fn dropdown_create() -> cosmic::surface::Action {
+        cosmic::surface::Action::Popup(opaque(), opaque(), None)
+    }
+
+    /// The `AppPopup` shape of the same create. `popup_dropdown` mints
+    /// `Action::Popup` at the pinned rev, so this arm is defensive — but the
+    /// two are distinct variants, and a create falling through the catch-all
+    /// would map a menu with the ledger believing nothing is open.
+    pub fn app_dropdown_create() -> cosmic::surface::Action {
+        cosmic::surface::Action::AppPopup(opaque(), opaque(), None)
+    }
+
+    /// A menu closing. Its id is minted inside the widget, so it is neither
+    /// our popup's nor the tooltip's.
+    pub fn dropdown_destroy() -> cosmic::surface::Action {
+        cosmic::surface::Action::DestroyPopup(cosmic::iced::window::Id::unique())
+    }
+
+    /// The arm signal the tooltip widget actually publishes: with a delay set
+    /// it emits `Action::Task`, and the create the future resolves to never
+    /// comes back through `Message`.
+    pub fn tooltip_arm() -> cosmic::surface::Action {
+        cosmic::surface::Action::Task(Arc::new(cosmic::iced::Task::none))
+    }
+
+    /// The tooltip's `on_close`, naming the one shared tooltip surface.
+    pub fn tooltip_destroy() -> cosmic::surface::Action {
+        cosmic::surface::Action::DestroyPopup(crate::tooltip::window_id())
+    }
+
+    fn opaque() -> Arc<Box<dyn Any + Send + Sync>> {
+        Arc::new(Box::new(()) as Box<dyn Any + Send + Sync>)
+    }
+
+    /// One surface action a task emitted, classified for assertions (the
+    /// payloads are opaque and the ids are `unique()`, so the variant plus
+    /// "is it the tooltip surface?" is everything that can be checked).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Emitted {
+        /// A destroy naming [`crate::tooltip::window_id`].
+        DestroyTooltip,
+        /// A destroy naming anything else (our popup, a menu).
+        DestroyOther,
+        /// A popup create, in either variant.
+        Create,
+        /// The tooltip widget's delayed-create task.
+        Arm,
+        /// Anything else.
+        Other,
+    }
+
+    impl Emitted {
+        fn of(action: &cosmic::surface::Action) -> Self {
+            match action {
+                cosmic::surface::Action::DestroyPopup(id) if *id == crate::tooltip::window_id() => {
+                    Self::DestroyTooltip
+                }
+                cosmic::surface::Action::DestroyPopup(_) => Self::DestroyOther,
+                cosmic::surface::Action::Popup(..) | cosmic::surface::Action::AppPopup(..) => {
+                    Self::Create
+                }
+                cosmic::surface::Action::Task(_) => Self::Arm,
+                _ => Self::Other,
+            }
+        }
+    }
+
+    /// Every surface action `task` emits, **in order**.
+    ///
+    /// This is the only way to see what the ledger decided: the flags it sets
+    /// are separate statements from the `surface_task(..)` calls, so a test
+    /// that asserts flags alone passes with the emissions deleted.
+    pub async fn emitted(task: cosmic::app::Task<Message>) -> Vec<Emitted> {
+        use cosmic::iced::futures::StreamExt as _;
+
+        let Some(stream) = cosmic::iced::runtime::task::into_stream(task) else {
+            return Vec::new();
+        };
+        stream
+            .filter_map(|action| async move {
+                match action {
+                    cosmic::iced::runtime::Action::Output(cosmic::Action::Cosmic(
+                        cosmic::app::Action::Surface(action),
+                    )) => Some(Emitted::of(&action)),
+                    _ => None,
+                }
+            })
+            .collect()
+            .await
+    }
+}

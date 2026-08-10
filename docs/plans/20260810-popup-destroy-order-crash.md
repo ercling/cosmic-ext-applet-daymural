@@ -70,9 +70,20 @@ regardless of what else is open, and its `on_close` (`src/tooltip.rs:103`) fires
 dropdown sits above it. All tooltip call sites share one `WINDOW_ID`
 (`src/tooltip.rs:37`).
 
-### Residual path, not closed by this plan
+### Residual paths, not closed by this plan
 
-Compositor-initiated dismissal is outside our reach.
+> **Read this before interpreting the soak.** Review (2026-08-11) established
+> that the runtime *already* refuses to map two children: on any popup create
+> `state.rs` computes `parent_mismatch` from the last entry of `self.popups`
+> and, on mismatch, legally destroys every popup above the requested parent
+> (topmost-first) before retrying the create 30 ms later. So the two-children
+> state this plan targets is hard to reach from the *create* side, and the
+> failure that actually matches the reported error is a **live child at
+> parent-destroy time** — path (a) below. It is the more likely cause of the
+> eleven journal hits, not a leftover. A reappearing error is therefore not
+> evidence that the ledger broke.
+
+**(a) Compositor-initiated dismissal** is outside our reach.
 `iced/winit/src/platform_specific/wayland/handlers/shell/xdg_popup.rs::done`
 walks **up** the parent chain (`PopupParent::Popup`) and breaks at a
 layer-surface/window parent — it never collects children. Our applet popup has
@@ -83,6 +94,15 @@ Maintaining the single-child invariant narrows this (the tooltip is short-lived
 and self-destroys on leave) but does not eliminate it. If the soak still shows
 protocol errors, note **which** surface id they name before concluding the fix
 failed.
+
+**(b) The arm→create gap.** The tooltip's create is produced by a 100 ms
+delayed future that bypasses `Message` entirely, so a dropdown create arriving
+inside that window chains a `destroy_popup(tooltip)` that is a no-op, and the
+future can still map the tooltip *after* the menu. The widget re-checks
+`is_hovered` at resolution (`widget/wayland/tooltip/widget.rs`), which closes
+the pointer-driven case — moving the pointer toward the dropdown button
+publishes `on_leave` first — so only a no-leave activation (touch/keyboard)
+survives, and upstream's `parent_mismatch` cleanup covers even that.
 
 ## Context (from discovery)
 
@@ -255,6 +275,24 @@ Task 3.
 
 ### Ledger transitions
 
+**Revised 2026-08-11 after review** — the three-flag ledger below the line was
+replaced by a single `dropdown_open` bit plus the idempotent `destroy_tooltip()`
+task; see "Post-review revision". Current table:
+
+| message | action variant | effect |
+|---|---|---|
+| `TooltipSurface` | anything, `dropdown_open` | **drop it** (no forward, no emission) |
+| `TooltipSurface` | anything, `!dropdown_open` | forward untouched |
+| `DropdownSurface` | `Popup`/`AppPopup` | `dropdown_open = true`; chain `destroy_tooltip()` **before** the forwarded create |
+| `DropdownSurface` | `DestroyPopup(_)` | `dropdown_open = false`; forward, then chain `destroy_tooltip()` |
+| `DropdownSurface` | anything else | forward untouched |
+| `PopupClosed(id)` | `id == tooltip::window_id()` | nothing |
+| `PopupClosed(id)` | `id == self.popup` | clear `self.popup`, `dropdown_open = false`, `destroy_tooltip()` |
+| `PopupClosed(id)` | any other id | `dropdown_open = false`, `destroy_tooltip()` |
+| `TogglePopup` | popup open | `dropdown_open = false`, then destroy `self.popup` |
+
+<details><summary>Superseded three-flag table (as implemented in Tasks 1-5)</summary>
+
 | message | action variant | effect |
 |---|---|---|
 | `TooltipSurface` | `Task(..)` | `tooltip_open = true`, forward |
@@ -265,6 +303,8 @@ Task 3.
 | `PopupClosed(id)` | `id == self.popup` | clear `self.popup` and **all** flags |
 | `PopupClosed(id)` | `id == tooltip::window_id()` | `tooltip_open = false` |
 | `PopupClosed(id)` | any other id | `dropdown_open = false`, flush a deferred tooltip destroy |
+
+</details>
 
 Every transition logs at `debug` through `tracing` (silent by default), so a
 future protocol error can be read off the journal against the popup sequence
@@ -434,20 +474,32 @@ as the untested variant would fall through to the catch-all, map a menu, and
 leave the ledger believing nothing is open — precisely the two-children state
 the invariant forbids. Added `an_app_popup_dropdown_create_interlocks_the_same_way`.
 
-➕ **Gap 2 (defect) — `TogglePopup` left the ledger stale.** The
+➕ **Gap 2 — `TogglePopup` left the ledger stale.** The
 `PopupClosed(id) | id == self.popup` row cannot fire for a popup we close
-ourselves: `TogglePopup` `take()`s `self.popup` before emitting the destroy, and
-the runtime's `Action::Destroy`
-(`iced/winit/src/platform_specific/wayland/event_loop/state.rs:1392`) sends no
-event at all — it drains `self.popups` and emits only subsurface teardown.
-`PopupEvent::Done` comes from *compositor*-initiated dismissal only. So closing
-the popup by clicking the panel icon while a dropdown was open left
-`dropdown_open == true` forever: tooltips suppressed for the rest of the
-session, and any tooltip destroy deferred with nothing left to flush it. Fixed
-by extracting `Window::clear_popup_ledger` and calling it from both paths that
-end our popup; covered by `closing_our_own_popup_resets_the_ledger`. Add this
-to the manual soak: open a dropdown, close the popup from the panel icon,
-reopen it, and confirm tooltips still appear.
+ourselves: `TogglePopup` `take()`s `self.popup` before emitting the destroy, so
+by the time the `Done` arrives the id no longer matches and the close is read
+as a menu's. Closing the popup from the panel icon while a dropdown was open
+therefore left `dropdown_open == true` until some other close cleared it —
+tooltips paused, tooltip destroys swallowed. Fixed by clearing the bit in
+`TogglePopup` itself; covered by `closing_our_own_popup_clears_the_ledger` and
+`a_late_close_for_a_popup_we_already_took_is_harmless`. Add this to the manual
+soak: open a dropdown, close the popup from the panel icon, reopen it, and
+confirm tooltips still appear.
+
+> ⚠️ **Correction (2026-08-11 review).** This gap was originally written up as a
+> defect whose cause was "the runtime's `Action::Destroy` sends no event at
+> all". **That premise is false at the pinned rev** and was propagated into
+> `CLAUDE.md` and the code comments before being corrected. `state.rs`'s
+> `Destroy` arm runs `for popup in to_destroy.into_iter().rev() { … send_event(
+> … PopupEventVariant::Done …) }` for *every* popup it tears down — byte for
+> byte the compositor path's emission (`handlers/shell/xdg_popup.rs`) — and
+> `sctk_event.rs` translates it against the winit-side `surface_ids` map, not
+> the just-cleared `state.id_map`, so `src/app/cosmic.rs` turns it into
+> `Action::SurfaceClosed(id)` → `Message::PopupClosed`. Self-initiated destroys
+> **do** come back, for the popup and each child taken with it. The fix stands;
+> only its justification changed (late delivery, not no delivery), and both
+> `on_popup_closed` branches were made to do the same thing so the
+> misclassification is harmless rather than merely unlikely.
 
 ### Task 6: [Final] Update documentation
 
@@ -492,6 +544,56 @@ reopen it, and confirm tooltips still appear.
 `just check`: fmt + clippy `-D warnings` clean, 271 tests pass (docs-only
 change, no code touched, so no new tests — the i18n guard tests are unaffected,
 `CLAUDE.md` holds no `fl!` ids).
+
+## Post-review revision (2026-08-11)
+
+Code review of the finished branch produced 7 major + 29 minor findings. Three
+of them converged on the same conclusion from opposite directions — one asking
+for *more* guarding on the tooltip flags (the interlock could fire a destroy
+for a non-topmost tooltip when a menu was already open), one showing the flags
+were unreliable anyway (five tooltip widgets share one surface id and publish
+arm/leave in widget-tree order, not pointer order), one asking for the flags to
+be deleted as unnecessary bookkeeping. The resolution taken was the third,
+which subsumes the first two:
+
+- **`tooltip_open` and `tooltip_destroy_deferred` are gone.** The ledger is now
+  the single `dropdown_open` bit. Both flags only ever decided whether to emit
+  `destroy_popup(tooltip::window_id())`, which the runtime already treats as a
+  no-op for an unmapped id — so it is emitted unconditionally instead: ahead of
+  every dropdown create, after every dropdown destroy, and after every
+  `PopupClosed` that is not the tooltip's own.
+- **The deferral became a drop.** While `dropdown_open`, *every* tooltip action
+  is dropped rather than only its destroy being held; the unconditional
+  post-menu destroy is what makes that lossless.
+- **The interlock is unconditional** and legal in both directions: no tooltip
+  mapped → no-op; a tooltip mapped over an already-open menu → it is itself the
+  topmost, so destroying it is allowed.
+- **`clear_popup_ledger` was inlined** into the one bit each caller now clears.
+- **`on_popup_closed`'s two non-tooltip branches were merged.** Stale ids —
+  a `Done` for a popup `TogglePopup` already took, or for a menu that closed
+  before another opened — cannot be distinguished from a live menu's close, so
+  both branches were made to do the same clear-and-sweep, which makes the
+  misclassification harmless instead of merely improbable.
+- **Emissions are now asserted.** The previous tests only read the flags, which
+  are set by statements separate from the `surface_task(..)` calls: deleting
+  every destroy left all 271 tests green. `testutil::surface::emitted(task)`
+  drains a returned `Task` into an ordered `Vec<Emitted>`, and the ledger tests
+  assert the full sequence (`[DestroyTooltip, Create]`, `[DestroyOther,
+  DestroyTooltip]`, `[]`). Verified by mutation: removing the interlock destroy,
+  the post-menu destroy, or the drop each fails tests.
+- **The `surface::Action` builders moved to `src/testutil.rs`**, ending the
+  duplicate copies in `app::tests` and `view::tests`.
+
+Net: 269 tests (was 271 — five ledger tests replaced by seven emission-asserting
+ones, and the two flag-only duplicates dropped), ~90 fewer lines of ledger code
+and comments. `just check` clean.
+
+Documentation corrected in the same pass: the false "`Action::Destroy` emits no
+event" premise (see the Gap 2 correction above) in `CLAUDE.md`, this plan and
+the code comments; `CLAUDE.md`'s tooltip bullet listing "the About button" as a
+tooltip call site (it is the thumbnail and the four `nav_button`s); the plan
+inventory and the hardcoded plan path in `CLAUDE.md`; the `README.md` tooltip
+bullet and its "Limitations" section.
 
 ## Post-Completion
 
