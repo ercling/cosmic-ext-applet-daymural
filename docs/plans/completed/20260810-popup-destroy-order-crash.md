@@ -535,6 +535,15 @@ confirm tooltips still appear.
   popup (Task 5's Gap 2 — `Action::Destroy` emits no event, only compositor
   dismissal produces `PopupClosed`). The residual `popup_done` path closes the
   rule, framed as "note which surface id it names".
+
+  > ⚠️ **Correction (2026-08-11).** This bullet records the Task 6 text as
+  > written, and two of its claims were later superseded: `tooltip_open` and
+  > `clear_popup_ledger` no longer exist (the post-review revision below
+  > reduced the ledger to the single `dropdown_open` bit with unconditional
+  > tooltip destroys), and "`Action::Destroy` emits no event" is false at the
+  > pinned rev (see the Gap 2 correction above — self-initiated destroys *do*
+  > deliver `PopupClosed`, just late). The current rules live in `CLAUDE.md`'s
+  > **UI conventions → Popup stack**, which was rewritten accordingly.
 - The `src/tooltip.rs` architecture bullet drops the false "`app.rs` builds
   tooltips too" and gains the `suppressed` parameter.
 - The accent bullet's "remaining exposure" paragraph records that the exposure

@@ -581,12 +581,30 @@ mod tests {
         // the proxy doc). The generated proxy offers no reflection over its
         // member names and a live-bus assertion would not be hermetic, so
         // pin the source attribute itself — same class as the i18n tests
-        // scanning `app.rs`/`view.rs` for message-id references.
+        // scanning `app.rs`/`view.rs` for message-id references. Scan only
+        // the production half of the file (everything before this tests
+        // module): the needle also appears in this very test, so a
+        // whole-file `contains` would match its own assertion literal and
+        // keep passing with the production attribute deleted.
         let source = include_str!("lockwatch.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("lockwatch.rs declares its tests module under #[cfg(test)]")
+            .0;
+        let after_attribute = production
+            .split_once(r#"#[zbus(name = "GetSessionByPID")]"#)
+            .expect(
+                "get_session_by_pid needs its explicit zbus name override: the \
+                 default conversion emits `GetSessionByPid`, which logind rejects",
+            )
+            .1;
+        // Adjacency: the override must sit directly on the declaration it
+        // pins, not merely exist somewhere in the file.
+        let next_line = after_attribute.lines().nth(1).unwrap_or("").trim_start();
         assert!(
-            source.contains(r#"#[zbus(name = "GetSessionByPID")]"#),
-            "get_session_by_pid needs its explicit zbus name override: the \
-             default conversion emits `GetSessionByPid`, which logind rejects"
+            next_line.starts_with("fn get_session_by_pid"),
+            "the GetSessionByPID override must immediately precede \
+             `fn get_session_by_pid`, found: {next_line:?}"
         );
     }
 
