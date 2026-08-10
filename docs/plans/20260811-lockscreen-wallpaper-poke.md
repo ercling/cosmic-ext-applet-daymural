@@ -470,23 +470,38 @@ while it shows the default".
 
 ### Task 5: Verify acceptance criteria
 
-- [ ] re-read Overview: lock signal → ladder of two pokes; resume → same;
+- [x] re-read Overview: lock signal → ladder of two pokes; resume → same;
       each poke toggles the value (never an identical write); the toggle
       normalizes before appending (self-healing); empty/unread state never
       written; generation replaces pending ladders; no new user-visible
       strings (i18n guards untouched)
-- [ ] verify edge cases: D-Bus unavailable at startup (applet still works,
+      (verified against code: both `LockEvent` variants route to
+      `arm_lock_pokes` → one task per `POKE_DELAYS` rung; `poke_state`
+      fresh-reads then `toggle_wallpapers` — normalize-first, empty → `None`,
+      read error → `Ok(false)` skip; `due_lock_poke` drops stale
+      generations; `git diff main...HEAD -- i18n/` empty, no `fl!` in
+      `lockwatch.rs`)
+- [x] verify edge cases: D-Bus unavailable at startup (applet still works,
       warn logged once or retry armed per failure class); no-session
       environment parks quietly; rapid lock/relock (last ladder wins,
       duplicated rest shape accepted and cleaned by the next poke)
-- [ ] run full suite: `just check` (fmt + clippy `-D warnings` + tests)
-- [ ] run the binary once (`cargo run`) with
+      (verified: `WatchEnd::Transient` → 30 s backoff loop, debug-logged;
+      `WatchEnd::NoSession` → one `warn` then `future::pending()` park,
+      stream never finishes; relock covered by
+      `a_second_lock_event_invalidates_the_first_ladder` and
+      `stale_post_change_shape_is_normalized_away`)
+- [x] run full suite: `just check` (fmt + clippy `-D warnings` + tests)
+      (290 tests pass, fmt + clippy clean)
+- [x] run the binary once (`cargo run`) with
       `RUST_LOG=cosmic_bing_wallpaper=debug` **with a warm
       `~/Pictures/BingWallpaper`** (a cold start triggers a real Bing fetch
       and a wallpaper apply ~5 s in — CLAUDE.md) and confirm the
       subscription connects and logs no errors; do **not** trigger a real
       lock from automation — that locks the user's session (manual check is
       Post-Completion)
+      (ran 15 s under `timeout`, warm dir with 8 images: logged
+      `logind lock watch connected session=/org/freedesktop/login1/session/_32`,
+      no lockwatch/poke errors, no fetch; no lock triggered)
 
 ### Task 6: [Final] Update documentation
 
