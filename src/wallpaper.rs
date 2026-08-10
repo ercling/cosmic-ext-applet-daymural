@@ -158,8 +158,8 @@ pub fn poke_state(config: &cosmic::cosmic_config::Config) -> Result<bool, Wallpa
 
     let list: Vec<(String, Source)> = match config.get(WALLPAPERS_KEY) {
         Ok(list) => list,
-        Err(err) => {
-            tracing::debug!("state poke skipped: cannot read `{WALLPAPERS_KEY}`: {err}");
+        Err(error) => {
+            tracing::debug!("state poke skipped: cannot read `{WALLPAPERS_KEY}`: {error}");
             return Ok(false);
         }
     };
@@ -167,7 +167,7 @@ pub fn poke_state(config: &cosmic::cosmic_config::Config) -> Result<bool, Wallpa
         Some(toggled) => {
             config
                 .set(WALLPAPERS_KEY, toggled)
-                .map_err(|err| WallpaperError(format!("cosmic-bg state write error: {err}")))?;
+                .map_err(|error| WallpaperError(format!("cosmic-bg state write error: {error}")))?;
             Ok(true)
         }
         None => Ok(false),
@@ -192,8 +192,8 @@ pub fn poke_state_handle() -> Option<cosmic::cosmic_config::Config> {
         cosmic_bg_config::state::State::version(),
     ) {
         Ok(config) => Some(config),
-        Err(err) => {
-            tracing::warn!("cannot open cosmic-bg state for lock pokes: {err}");
+        Err(error) => {
+            tracing::warn!("cannot open cosmic-bg state for lock pokes: {error}");
             None
         }
     }
@@ -548,27 +548,38 @@ mod tests {
         assert!(!is_inside(dir, dir));
     }
 
+    #[test]
+    fn is_inside_rejects_parent_dir_traversal() {
+        let dir = Path::new("/home/u/Pictures/BingWallpaper");
+        // Lexically "starts with" the dir but resolves outside it — a
+        // foreign wallpaper spelled this way must not count as ours (it
+        // would get clobbered by auto-apply).
+        assert!(!is_inside(
+            Path::new("/home/u/Pictures/BingWallpaper/../Documents/x.jpg"),
+            dir
+        ));
+        // Even a `..` that resolves back inside is rejected — conservative.
+        assert!(!is_inside(
+            Path::new("/home/u/Pictures/BingWallpaper/sub/../a.jpg"),
+            dir
+        ));
+    }
+
     mod poke {
         //! [`poke_state`] against a tempdir-rooted `Config::with_custom_path`
-        //! handle — the same injection seam `app.rs` uses in Task 4. Writes
-        //! are asserted by **inode** (`MetadataExt::ino` — cosmic-config's
-        //! `set` commits an `AtomicFile`, i.e. temp+rename, so every real
-        //! write is a new inode), never by mtime — the flakiness class
-        //! `thumbs.rs` abandoned (timestamp ties cannot distinguish
-        //! "unchanged" from "changed").
+        //! handle — the same injection seam `app.rs` uses in Task 4. Write
+        //! assertions go by inode, via
+        //! [`crate::testutil::bg_wallpapers_inode`] (the inode-vs-mtime
+        //! rationale lives on that helper).
 
         use super::*;
         use crate::lockwatch::toggle_wallpapers;
         use crate::testutil::{
             bg_path_source as path_source, bg_state_config as state_config,
-            bg_wallpapers_key_file as key_file, read_only_trees, restore_dir_permissions,
+            bg_wallpapers_inode as inode, bg_wallpapers_key_file as key_file, read_only_trees,
+            restore_dir_permissions,
         };
         use cosmic::cosmic_config::ConfigSet;
-
-        fn inode(path: &Path) -> u64 {
-            use std::os::unix::fs::MetadataExt as _;
-            std::fs::metadata(path).expect("stat key file").ino()
-        }
 
         fn read_wallpapers(config: &cosmic::cosmic_config::Config) -> Vec<(String, Source)> {
             use cosmic::cosmic_config::ConfigGet as _;
@@ -581,12 +592,12 @@ mod tests {
             let config = state_config(dir.path());
             let canonical = vec![("all".to_owned(), path_source("a"))];
             config.set("wallpapers", &canonical).expect("seed state");
-            let seeded_inode = inode(&key_file(dir.path()));
+            let seeded_inode = inode(dir.path());
 
             let wrote = poke_state(&config).expect("poke must succeed");
             assert!(wrote, "a canonical list must be written back toggled");
             assert_ne!(
-                inode(&key_file(dir.path())),
+                inode(dir.path()),
                 seeded_inode,
                 "a write must have landed (atomic rename = new inode)"
             );
@@ -643,12 +654,12 @@ mod tests {
             let config = state_config(dir.path());
             let empty: Vec<(String, Source)> = Vec::new();
             config.set("wallpapers", &empty).expect("seed empty state");
-            let seeded_inode = inode(&key_file(dir.path()));
+            let seeded_inode = inode(dir.path());
 
             let wrote = poke_state(&config).expect("empty state must not error");
             assert!(!wrote, "nothing to heal — no write");
             assert_eq!(
-                inode(&key_file(dir.path())),
+                inode(dir.path()),
                 seeded_inode,
                 "the key file must be untouched"
             );
@@ -671,11 +682,11 @@ mod tests {
 
             // Unreadable key (corrupt RON): same skip, file untouched.
             std::fs::write(key_file(dir.path()), b"not valid ron [").expect("write garbage");
-            let garbage_inode = inode(&key_file(dir.path()));
+            let garbage_inode = inode(dir.path());
             let wrote = poke_state(&config).expect("unreadable key must not error");
             assert!(!wrote);
             assert_eq!(
-                inode(&key_file(dir.path())),
+                inode(dir.path()),
                 garbage_inode,
                 "the unreadable file must be untouched"
             );
@@ -716,7 +727,7 @@ mod tests {
             let config = state_config(dir.path());
             let canonical = vec![("all".to_owned(), path_source("a"))];
             config.set("wallpapers", &canonical).expect("seed state");
-            let seeded_inode = inode(&key_file(dir.path()));
+            let seeded_inode = inode(dir.path());
 
             let key_dir = key_file(dir.path())
                 .parent()
@@ -728,28 +739,11 @@ mod tests {
 
             result.expect_err("a failed state write must surface, not be swallowed");
             assert_eq!(
-                inode(&key_file(dir.path())),
+                inode(dir.path()),
                 seeded_inode,
                 "the seeded value must be untouched"
             );
             assert_eq!(read_wallpapers(&config), canonical);
         }
-    }
-
-    #[test]
-    fn is_inside_rejects_parent_dir_traversal() {
-        let dir = Path::new("/home/u/Pictures/BingWallpaper");
-        // Lexically "starts with" the dir but resolves outside it — a
-        // foreign wallpaper spelled this way must not count as ours (it
-        // would get clobbered by auto-apply).
-        assert!(!is_inside(
-            Path::new("/home/u/Pictures/BingWallpaper/../Documents/x.jpg"),
-            dir
-        ));
-        // Even a `..` that resolves back inside is rejected — conservative.
-        assert!(!is_inside(
-            Path::new("/home/u/Pictures/BingWallpaper/sub/../a.jpg"),
-            dir
-        ));
     }
 }

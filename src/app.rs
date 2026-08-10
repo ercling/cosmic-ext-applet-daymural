@@ -5641,7 +5641,7 @@ mod tests {
         }
     }
 
-    fn seed_bg_wallpapers(window: &Window, list: &Vec<(String, Source)>) {
+    fn seed_bg_wallpapers(window: &Window, list: &[(String, Source)]) {
         use cosmic_config::ConfigSet as _;
         window
             .poke_config
@@ -5822,22 +5822,13 @@ mod tests {
     /// — every rung permanently stale — would pass the whole suite).
     /// Paused tokio time auto-advances the rung sleeps.
     async fn armed_rung_generations(task: app::Task<Message>) -> Vec<u64> {
-        use cosmic::iced::futures::StreamExt as _;
-
-        let Some(stream) = cosmic::iced::runtime::task::into_stream(task) else {
-            return Vec::new();
-        };
-        stream
-            .filter_map(|action| async move {
-                match action {
-                    cosmic::iced::runtime::Action::Output(cosmic::Action::App(
-                        Message::LockPokeDue(generation),
-                    )) => Some(generation),
-                    _ => None,
-                }
-            })
-            .collect()
-            .await
+        crate::testutil::drained_task_outputs(task, |action| match action {
+            cosmic::iced::runtime::Action::Output(cosmic::Action::App(Message::LockPokeDue(
+                generation,
+            ))) => Some(generation),
+            _ => None,
+        })
+        .await
     }
 
     #[tokio::test(start_paused = true)]

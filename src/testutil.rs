@@ -162,6 +162,12 @@ pub fn bg_state_config(root: &Path) -> cosmic::cosmic_config::Config {
 
 /// Where `with_custom_path` puts the lock poke's key file:
 /// `<root>/cosmic/<name>/v<version>/wallpapers`.
+///
+/// The `"wallpapers"` literal here — and in the raw `get`/`set` calls of the
+/// tests using these helpers — is a **deliberate pin** of cosmic-bg's
+/// on-disk key name. Production goes through `wallpaper::WALLPAPERS_KEY`;
+/// tests spell the string out so a drift in that const breaks them instead
+/// of silently retargeting them.
 pub fn bg_wallpapers_key_file(root: &Path) -> PathBuf {
     root.join("cosmic")
         .join(cosmic_bg_config::NAME)
@@ -198,6 +204,32 @@ pub fn tiny_jpeg(width: u32, height: u32) -> Vec<u8> {
     img.write_to(&mut buf, image::ImageFormat::Jpeg)
         .expect("encode in-memory jpeg");
     buf.into_inner()
+}
+
+/// Every runtime action an update's returned `Task` would emit, classified
+/// by `pick` (a `None` is dropped), **in order** — the drain skeleton shared
+/// by [`surface::emitted`] and `app::tests`' poke-rung collector. A `Task`
+/// returned from `update()` is never polled in unit tests, so this is the
+/// only way to observe what it would actually emit.
+pub async fn drained_task_outputs<M, T>(
+    task: cosmic::app::Task<M>,
+    mut pick: impl FnMut(cosmic::iced::runtime::Action<cosmic::Action<M>>) -> Option<T>,
+) -> Vec<T>
+where
+    M: Send + 'static,
+{
+    use cosmic::iced::futures::StreamExt as _;
+
+    let Some(mut stream) = cosmic::iced::runtime::task::into_stream(task) else {
+        return Vec::new();
+    };
+    let mut picked = Vec::new();
+    while let Some(action) = stream.next().await {
+        if let Some(item) = pick(action) {
+            picked.push(item);
+        }
+    }
+    picked
 }
 
 /// The popup-ledger side of the test surface: builders for the
@@ -291,21 +323,12 @@ pub mod surface {
     /// are separate statements from the `surface_task(..)` calls, so a test
     /// that asserts flags alone passes with the emissions deleted.
     pub async fn emitted(task: cosmic::app::Task<Message>) -> Vec<Emitted> {
-        use cosmic::iced::futures::StreamExt as _;
-
-        let Some(stream) = cosmic::iced::runtime::task::into_stream(task) else {
-            return Vec::new();
-        };
-        stream
-            .filter_map(|action| async move {
-                match action {
-                    cosmic::iced::runtime::Action::Output(cosmic::Action::Cosmic(
-                        cosmic::app::Action::Surface(action),
-                    )) => Some(Emitted::of(&action)),
-                    _ => None,
-                }
-            })
-            .collect()
-            .await
+        super::drained_task_outputs(task, |action| match action {
+            cosmic::iced::runtime::Action::Output(cosmic::Action::Cosmic(
+                cosmic::app::Action::Surface(action),
+            )) => Some(Emitted::of(&action)),
+            _ => None,
+        })
+        .await
     }
 }

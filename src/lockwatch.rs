@@ -278,13 +278,13 @@ async fn watch(mut output: mpsc::Sender<LockEvent>) {
 async fn connect_and_forward(output: &mut mpsc::Sender<LockEvent>) -> WatchEnd {
     let conn = match zbus::Connection::system().await {
         Ok(conn) => conn,
-        Err(err) => {
-            return WatchEnd::Transient(format!("system bus connection failed: {err}"));
+        Err(error) => {
+            return WatchEnd::Transient(format!("system bus connection failed: {error}"));
         }
     };
     let manager = match ManagerProxy::new(&conn).await {
         Ok(manager) => manager,
-        Err(err) => return WatchEnd::Transient(format!("logind manager proxy failed: {err}")),
+        Err(error) => return WatchEnd::Transient(format!("logind manager proxy failed: {error}")),
     };
 
     // Building the proxy makes no bus round-trip, so a resolution failure
@@ -299,23 +299,23 @@ async fn connect_and_forward(output: &mut mpsc::Sender<LockEvent>) -> WatchEnd {
 
     let session_builder = match SessionProxy::builder(&conn).path(session_path.clone()) {
         Ok(builder) => builder,
-        Err(err) => {
-            return WatchEnd::Transient(format!("bad session path {session_path}: {err}"));
+        Err(error) => {
+            return WatchEnd::Transient(format!("bad session path {session_path}: {error}"));
         }
     };
     let session = match session_builder.build().await {
         Ok(session) => session,
-        Err(err) => return WatchEnd::Transient(format!("session proxy failed: {err}")),
+        Err(error) => return WatchEnd::Transient(format!("session proxy failed: {error}")),
     };
 
     let lock_stream = match session.receive_lock().await {
         Ok(stream) => stream,
-        Err(err) => return WatchEnd::Transient(format!("subscribing to Lock failed: {err}")),
+        Err(error) => return WatchEnd::Transient(format!("subscribing to Lock failed: {error}")),
     };
     let sleep_stream = match manager.receive_prepare_for_sleep().await {
         Ok(stream) => stream,
-        Err(err) => {
-            return WatchEnd::Transient(format!("subscribing to PrepareForSleep failed: {err}"));
+        Err(error) => {
+            return WatchEnd::Transient(format!("subscribing to PrepareForSleep failed: {error}"));
         }
     };
 
@@ -325,8 +325,8 @@ async fn connect_and_forward(output: &mut mpsc::Sender<LockEvent>) -> WatchEnd {
         lock_stream.map(|_signal| Some(LockEvent::Locked)),
         sleep_stream.map(|signal| match signal.args() {
             Ok(args) => sleep_edge_to_event(args.start),
-            Err(err) => {
-                tracing::debug!("undecodable PrepareForSleep payload: {err}");
+            Err(error) => {
+                tracing::debug!("undecodable PrepareForSleep payload: {error}");
                 None
             }
         }),
@@ -351,9 +351,9 @@ async fn connect_and_forward(output: &mut mpsc::Sender<LockEvent>) -> WatchEnd {
 /// timeout, a dropped connection — says nothing about whether a session
 /// exists and must retry as [`WatchEnd::Transient`]: parking on one of
 /// those would permanently disable the workaround over a hiccup.
-fn is_session_absence(err: &zbus::Error) -> bool {
+fn is_session_absence(error: &zbus::Error) -> bool {
     matches!(
-        err,
+        error,
         zbus::Error::MethodError(name, _, _)
             if matches!(
                 name.as_str(),
@@ -373,14 +373,14 @@ fn is_session_absence(err: &zbus::Error) -> bool {
 async fn resolve_session(manager: &ManagerProxy<'_>) -> Result<OwnedObjectPath, WatchEnd> {
     let pid_err = match manager.get_session_by_pid(std::process::id()).await {
         Ok(path) => return Ok(path),
-        Err(err) => err,
+        Err(error) => error,
     };
     match std::env::var("XDG_SESSION_ID") {
         Ok(id) => match manager.get_session(&id).await {
             Ok(path) => Ok(path),
-            Err(err) => {
-                let trail = format!("GetSessionByPID: {pid_err}; GetSession({id:?}): {err}");
-                if is_session_absence(&pid_err) && is_session_absence(&err) {
+            Err(error) => {
+                let trail = format!("GetSessionByPID: {pid_err}; GetSession({id:?}): {error}");
+                if is_session_absence(&pid_err) && is_session_absence(&error) {
                     Err(WatchEnd::NoSession(trail))
                 } else {
                     Err(WatchEnd::Transient(trail))
@@ -401,13 +401,7 @@ async fn resolve_session(manager: &ManagerProxy<'_>) -> Result<OwnedObjectPath, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-
-    fn path_source(name: &str) -> Source {
-        Source::Path(PathBuf::from(format!(
-            "/home/u/Pictures/BingWallpaper/{name}.jpg"
-        )))
-    }
+    use crate::testutil::bg_path_source as path_source;
 
     fn color_source() -> Source {
         Source::Color(cosmic_bg_config::Color::Single([0.1, 0.2, 0.3]))
