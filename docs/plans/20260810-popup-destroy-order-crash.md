@@ -303,20 +303,20 @@ that preceded it.
 - Modify: `src/tooltip.rs`
 - Modify: `src/app.rs`
 
-- [ ] change `crate::tooltip::tooltip` to emit `Message::TooltipSurface` for
+- [x] change `crate::tooltip::tooltip` to emit `Message::TooltipSurface` for
       both its `on_close` message (l. 103) and its surface-action mapper
       (l. 104)
-- [ ] add `Message::TooltipSurface(..)` and handle the three tooltip rows of
+- [x] add `Message::TooltipSurface(..)` and handle the three tooltip rows of
       the ledger table: arm on `Action::Task`, forward-and-clear on destroy,
       defer the destroy while `dropdown_open`
-- [ ] match the action **by reference** and move it into `surface_task` — add
+- [x] match the action **by reference** and move it into `surface_task` — add
       a comment that cloning it makes `Arc::try_unwrap` fail and silently
       creates nothing
-- [ ] log each transition at `debug` via `tracing`
-- [ ] write tests: `Action::Task` sets `tooltip_open`; a destroy with
+- [x] log each transition at `debug` via `tracing`
+- [x] write tests: `Action::Task` sets `tooltip_open`; a destroy with
       `dropdown_open == false` clears it; a destroy with `dropdown_open == true`
       leaves `tooltip_open` set and sets `tooltip_destroy_deferred`
-- [ ] run `just check` - must pass before task 3
+- [x] run `just check` - must pass before task 3
 
 ### Task 3: Route dropdown surface actions and add the interlock
 

@@ -109,8 +109,13 @@ pub fn tooltip<'a>(
                 SURFACE_ID.clone(),
             ))
         },
-        Message::Surface(cosmic::surface::Action::DestroyPopup(window_id)),
-        Message::Surface,
+        // Both go to `TooltipSurface`, not the blind `Surface` forwarder: the
+        // popup ledger in `app.rs` has to see the arm and the destroy to hold
+        // the single-child invariant on our popup (a tooltip and a dropdown
+        // menu are siblings there, and destroying a non-topmost sibling is a
+        // fatal protocol error).
+        Message::TooltipSurface(cosmic::surface::Action::DestroyPopup(window_id)),
+        Message::TooltipSurface,
     )
     .delay(DELAY)
     .into()
