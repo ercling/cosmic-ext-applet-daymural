@@ -117,6 +117,84 @@ pub fn apply(path: &Path) -> Result<(), WallpaperError> {
     Ok(())
 }
 
+/// The single cosmic-bg *state* key the lock-screen poke rewrites.
+const WALLPAPERS_KEY: &str = "wallpapers";
+
+// TODO(lockwatch Task 4): remove the allows when app.rs wires the pokes in
+// (until then the fns are exercised by tests only).
+#[allow(dead_code)]
+/// Poke cosmic-bg's *state* so a live lock screen rebuilds its wallpaper
+/// cache — the cosmic-greeter#511 workaround (full rationale in
+/// `lockwatch.rs`). Returns whether a write happened.
+///
+/// The write must be a **value change**: the locker consumes the state
+/// through `cosmic_config::config_state_subscription`, and the
+/// `CosmicConfigEntry` derive's `update_keys` has a value-equality guard —
+/// an identical rewrite fires inotify but delivers nothing (no cache clear,
+/// no rebuild). Hence [`crate::lockwatch::toggle_wallpapers`], applied to a
+/// **fresh read on every poke** — a list captured at lock time would write a
+/// stale value back over a wallpaper change that landed since the event.
+///
+/// A read error skips (`Ok(false)`) rather than writing: the alternative
+/// writes a default over a real value that merely failed to read. An empty
+/// list skips the same way (`toggle_wallpapers` returns `None` — nothing to
+/// heal). Only a *write* failure is an error.
+///
+/// Raw keys, not `cosmic_bg_config::state::State`'s entry API: that API
+/// comes from cosmic-bg-config's own `cosmic-config` instance, whose traits
+/// this crate cannot name (see module comment; `Cargo.lock` carries both
+/// packages — same commit today, still distinct). The RON bytes are
+/// identical either way (same commit, same serializer), so raw
+/// `ConfigGet::get`/`ConfigSet::set` through **our** pinned instance write
+/// exactly what cosmic-bg and the greeter read — and the handle stays
+/// injectable via `Config::with_custom_path` for tests.
+pub fn poke_state(config: &cosmic::cosmic_config::Config) -> Result<bool, WallpaperError> {
+    use cosmic::cosmic_config::{ConfigGet, ConfigSet};
+
+    let list: Vec<(String, Source)> = match config.get(WALLPAPERS_KEY) {
+        Ok(list) => list,
+        Err(err) => {
+            tracing::debug!("state poke skipped: cannot read `{WALLPAPERS_KEY}`: {err}");
+            return Ok(false);
+        }
+    };
+    match crate::lockwatch::toggle_wallpapers(list) {
+        Some(toggled) => {
+            config
+                .set(WALLPAPERS_KEY, toggled)
+                .map_err(|err| WallpaperError(format!("cosmic-bg state write error: {err}")))?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+#[allow(dead_code)]
+/// The production handle for [`poke_state`]: cosmic-bg's state context,
+/// built once in `init` and cloned into poke tasks. `None` (with a warning)
+/// when it cannot be opened — every poke is then a no-op.
+///
+/// Test note: like [`apply`], this is untestable context plumbing —
+/// `Config::new_state` always roots in the real user state dir
+/// (`~/.local/state/cosmic/…`), so tests inject a tempdir-rooted
+/// `Config::with_custom_path` handle into [`poke_state`] instead; nothing
+/// here makes a decision. Side effect worth knowing: `new_state`
+/// `create_dir_all`s cosmic-bg's state dir — harmless on a machine that
+/// never ran cosmic-bg (the dir stays empty, and the absent `wallpapers`
+/// key makes every poke skip).
+pub fn poke_state_handle() -> Option<cosmic::cosmic_config::Config> {
+    match cosmic::cosmic_config::Config::new_state(
+        cosmic_bg_config::NAME,
+        cosmic_bg_config::state::State::version(),
+    ) {
+        Ok(config) => Some(config),
+        Err(err) => {
+            tracing::warn!("cannot open cosmic-bg state for lock pokes: {err}");
+            None
+        }
+    }
+}
+
 /// What cosmic-bg currently displays, as far as its config can tell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CurrentWallpaper {
@@ -464,6 +542,188 @@ mod tests {
         ));
         assert!(!is_inside(Path::new("/home/u/Pictures"), dir));
         assert!(!is_inside(dir, dir));
+    }
+
+    mod poke {
+        //! [`poke_state`] against a tempdir-rooted `Config::with_custom_path`
+        //! handle — the same injection seam `app.rs` uses in Task 4. Writes
+        //! are asserted by **inode** (`MetadataExt::ino` — cosmic-config's
+        //! `set` commits an `AtomicFile`, i.e. temp+rename, so every real
+        //! write is a new inode), never by mtime — the flakiness class
+        //! `thumbs.rs` abandoned (timestamp ties cannot distinguish
+        //! "unchanged" from "changed").
+
+        use super::*;
+        use crate::lockwatch::toggle_wallpapers;
+        use cosmic::cosmic_config::{ConfigGet, ConfigSet};
+        use std::os::unix::fs::MetadataExt;
+
+        /// Mirrors cosmic-bg's real state identity (name + version) so the
+        /// raw-key layout under the tempdir matches production shape; the
+        /// custom path keeps it hermetic.
+        fn state_config(dir: &Path) -> cosmic::cosmic_config::Config {
+            cosmic::cosmic_config::Config::with_custom_path(
+                cosmic_bg_config::NAME,
+                cosmic_bg_config::state::State::version(),
+                dir.to_path_buf(),
+            )
+            .expect("create tempdir-rooted state config")
+        }
+
+        /// Where `with_custom_path` puts the key file:
+        /// `<dir>/cosmic/<name>/v<version>/wallpapers`.
+        fn key_file(dir: &Path) -> PathBuf {
+            dir.join("cosmic")
+                .join(cosmic_bg_config::NAME)
+                .join(format!("v{}", cosmic_bg_config::state::State::version()))
+                .join("wallpapers")
+        }
+
+        fn inode(path: &Path) -> u64 {
+            std::fs::metadata(path).expect("stat key file").ino()
+        }
+
+        fn read_wallpapers(config: &cosmic::cosmic_config::Config) -> Vec<(String, Source)> {
+            config.get("wallpapers").expect("read wallpapers key")
+        }
+
+        fn path_source(name: &str) -> Source {
+            Source::Path(PathBuf::from(format!(
+                "/home/u/Pictures/BingWallpaper/{name}.jpg"
+            )))
+        }
+
+        #[test]
+        fn poke_toggles_the_wallpapers_key() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let config = state_config(dir.path());
+            let canonical = vec![("all".to_owned(), path_source("a"))];
+            config.set("wallpapers", &canonical).expect("seed state");
+            let seeded_inode = inode(&key_file(dir.path()));
+
+            let wrote = poke_state(&config).expect("poke must succeed");
+            assert!(wrote, "a canonical list must be written back toggled");
+            assert_ne!(
+                inode(&key_file(dir.path())),
+                seeded_inode,
+                "a write must have landed (atomic rename = new inode)"
+            );
+            // The written value is exactly the toggle of the input — and it
+            // parses back as Vec<(String, Source)>, i.e. what every state
+            // consumer deserializes.
+            assert_eq!(
+                read_wallpapers(&config),
+                toggle_wallpapers(canonical).expect("canonical toggles")
+            );
+        }
+
+        #[test]
+        fn second_poke_restores_the_canonical_value() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let config = state_config(dir.path());
+            let canonical = vec![
+                ("DP-1".to_owned(), path_source("a")),
+                ("HDMI-1".to_owned(), path_source("b")),
+            ];
+            config.set("wallpapers", &canonical).expect("seed state");
+
+            assert!(poke_state(&config).expect("first poke"));
+            assert!(poke_state(&config).expect("second poke"));
+            assert_eq!(
+                read_wallpapers(&config),
+                canonical,
+                "toggle twice on a canonical list = identity"
+            );
+        }
+
+        #[test]
+        fn poke_normalizes_a_stale_two_entry_shape() {
+            // The shape cosmic-bg's RMW `save_state` leaves after a genuine
+            // wallpaper change lands over our resting duplicate.
+            let dir = tempfile::tempdir().expect("tempdir");
+            let config = state_config(dir.path());
+            let stale = vec![
+                ("all".to_owned(), path_source("new")),
+                ("all".to_owned(), path_source("old")),
+            ];
+            config.set("wallpapers", &stale).expect("seed state");
+
+            assert!(poke_state(&config).expect("poke"));
+            assert_eq!(
+                read_wallpapers(&config),
+                vec![("all".to_owned(), path_source("new"))]
+            );
+        }
+
+        #[test]
+        fn poke_skips_an_empty_state() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let config = state_config(dir.path());
+            let empty: Vec<(String, Source)> = Vec::new();
+            config.set("wallpapers", &empty).expect("seed empty state");
+            let seeded_inode = inode(&key_file(dir.path()));
+
+            let wrote = poke_state(&config).expect("empty state must not error");
+            assert!(!wrote, "nothing to heal — no write");
+            assert_eq!(
+                inode(&key_file(dir.path())),
+                seeded_inode,
+                "the key file must be untouched"
+            );
+        }
+
+        #[test]
+        fn poke_skips_an_absent_or_unreadable_key() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let config = state_config(dir.path());
+
+            // Absent key (a machine that never ran cosmic-bg): skip, and —
+            // critically — never create the file (that would write a default
+            // over a value that merely failed to read).
+            let wrote = poke_state(&config).expect("absent key must not error");
+            assert!(!wrote);
+            assert!(
+                !key_file(dir.path()).exists(),
+                "a skip must not create the key file"
+            );
+
+            // Unreadable key (corrupt RON): same skip, file untouched.
+            std::fs::write(key_file(dir.path()), b"not valid ron [").expect("write garbage");
+            let garbage_inode = inode(&key_file(dir.path()));
+            let wrote = poke_state(&config).expect("unreadable key must not error");
+            assert!(!wrote);
+            assert_eq!(
+                inode(&key_file(dir.path())),
+                garbage_inode,
+                "the unreadable file must be untouched"
+            );
+        }
+
+        #[test]
+        fn poke_writes_the_freshly_read_value() {
+            // The wallpaper can change between the lock event and the poke
+            // (daily auto-apply, shuffle): the poke must toggle what is on
+            // disk *now*, never a value captured earlier.
+            let dir = tempfile::tempdir().expect("tempdir");
+            let config = state_config(dir.path());
+            let original = vec![("all".to_owned(), path_source("original"))];
+            config.set("wallpapers", &original).expect("seed state");
+            assert!(poke_state(&config).expect("first poke"));
+
+            // External rewrite between the two pokes (cosmic-bg applying a
+            // new wallpaper).
+            let changed = vec![("all".to_owned(), path_source("changed"))];
+            config
+                .set("wallpapers", &changed)
+                .expect("external rewrite");
+
+            assert!(poke_state(&config).expect("second poke"));
+            assert_eq!(
+                read_wallpapers(&config),
+                toggle_wallpapers(changed).expect("canonical toggles"),
+                "the second poke must toggle the freshly read value"
+            );
+        }
     }
 
     #[test]

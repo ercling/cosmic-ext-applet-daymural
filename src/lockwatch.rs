@@ -100,7 +100,6 @@ pub const POKE_DELAYS: [Duration; 2] = [Duration::from_secs(1), Duration::from_s
 /// unnamed outputs both keyed `""` (a legitimate `save_state` product)
 /// normalize to one entry — a delivered change, and cosmic-bg re-pushes
 /// what it needs on its next tick.
-#[allow(dead_code)]
 pub fn toggle_wallpapers(list: Vec<(String, Source)>) -> Option<Vec<(String, Source)>> {
     if list.is_empty() {
         return None;

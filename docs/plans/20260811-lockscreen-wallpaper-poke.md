@@ -381,17 +381,17 @@ while it shows the default".
 **Files:**
 - Modify: `src/wallpaper.rs`
 
-- [ ] add `poke_state(config: &cosmic_config::Config) -> Result<bool, WallpaperError>`:
+- [x] add `poke_state(config: &cosmic_config::Config) -> Result<bool, WallpaperError>`:
       raw `ConfigGet::get::<Vec<(String, Source)>>(config, "wallpapers")` —
       skip (Ok(false)) on read error or `None` from `toggle_wallpapers` —
       else `ConfigSet::set` the toggled list; doc-comment cites the
       two-instance constraint (module comment, `Cargo.lock`) and the
       value-change requirement
-- [ ] add `poke_state_handle() -> Option<cosmic_config::Config>` (prod
+- [x] add `poke_state_handle() -> Option<cosmic_config::Config>` (prod
       handle via `Config::new_state(cosmic_bg_config::NAME,
       State::version())`), with the same untestable-context exemption
       comment style as `apply`, noting the `create_dir_all` side effect
-- [ ] write tests (tempdir `Config::with_custom_path`, assert by **inode**
+- [x] write tests (tempdir `Config::with_custom_path`, assert by **inode**
       (`MetadataExt::ino`) — never mtime, the flakiness class `thumbs.rs`
       abandoned): `poke_toggles_the_wallpapers_key` (inode changed, value =
       toggled input, parses as `Vec<(String, Source)>`),
@@ -401,7 +401,7 @@ while it shows the default".
       `poke_skips_an_absent_or_unreadable_key` (no file created),
       `poke_writes_the_freshly_read_value` (externally rewrite the key
       between two pokes; the second poke toggles the *new* value)
-- [ ] run `just check` — must pass before task 3
+- [x] run `just check` — must pass before task 3
 
 ### Task 3: logind subscription stream (`lockwatch.rs`)
 
