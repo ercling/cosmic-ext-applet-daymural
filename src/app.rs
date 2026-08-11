@@ -70,34 +70,43 @@ pub struct Window {
     /// The open popup's window id (the interval dropdown needs it as the
     /// parent surface of its menu popup).
     pub(crate) popup: Option<window::Id>,
-    /// Whether a dropdown menu popup is mapped — the whole popup ledger (see
-    /// "UI conventions → Popup stack" in `CLAUDE.md`).
+    /// How many dropdown menu popups are believed to be mapped — the whole
+    /// popup ledger (see "UI conventions → Popup stack" in `CLAUDE.md`), read
+    /// through [`Window::dropdown_open`].
     ///
-    /// One bit is enough because the only thing the invariant needs is "may a
-    /// tooltip be arming or destroyed right now?", and the *other* side of
-    /// every decision — the tooltip surface — is destroyed by an idempotent
-    /// task ([`destroy_tooltip`]) that needs no state of its own. A menu's
-    /// window id is minted inside the widget and cannot be read at creation,
-    /// so presence is also all that can be tracked.
+    /// A *count*, not a bool, because the ledger has no ids to work with: a
+    /// menu's window id is minted inside the widget and is never visible here,
+    /// so a create and a close can only be paired by arithmetic. The upstream
+    /// pairing is exact — every popup the runtime tears down is removed from
+    /// `self.popups` first (both `…/handlers/shell/xdg_popup.rs::done` and the
+    /// `Action::Destroy` arm in `…/event_loop/state.rs`), so one mapped popup
+    /// yields at most one `Done` — which makes "creates minus closes" the right
+    /// quantity. With a single bool a `Done` for an *already gone* menu
+    /// delivered after a newer create would clear it with a menu still mapped:
+    /// tooltips un-paused beside a live sibling, which is the two-children
+    /// state the invariant forbids. That is the mirror of the stale-*request*
+    /// hazard below, and only a count answers both.
     ///
-    /// Biased toward `true`: a spurious `true` only pauses tooltips, while a
-    /// spurious `false` lets one arm beside a mapped menu — the two-children
-    /// state the invariant forbids. It is set optimistically on the create,
-    /// which the runtime can still drop (it retries a deferred create five
-    /// times at 30 ms and then gives up, and `get_popup` failures only log);
-    /// tooltips then stay paused until the next thing that clears the bit.
+    /// Saturating in both directions, and biased toward "open": a spurious
+    /// non-zero only pauses tooltips, while a spurious zero lets one arm beside
+    /// a mapped menu. It is incremented optimistically on the create, which the
+    /// runtime can still drop (it retries a deferred create five times at 30 ms
+    /// and then gives up, and `get_popup` failures only log); tooltips then
+    /// stay paused until the count is reset.
     ///
-    /// **Only two things clear it**, both of which are evidence that a menu is
-    /// really gone: a `PopupClosed` ([`Window::on_popup_closed`]) and closing
-    /// our own popup ([`Message::TogglePopup`]). A `DestroyPopup` *request*
-    /// deliberately does not — the two rows share one message and a widget
-    /// left with a stale `is_open` (grab-loss dismissal never reaches its
-    /// `ButtonPressed` arm, and `Row::update` dispatches to every child
-    /// regardless of `capture_event`) emits a destroy for a popup that is
-    /// already gone, in the same pass as the *other* row's create. That
-    /// no-op destroy produces no `Done`, so leaving the bit alone here is
-    /// exactly right; a real destroy is announced back as `PopupClosed`.
-    pub(crate) dropdown_open: bool,
+    /// **Only three things lower it**, all of which are evidence that a menu is
+    /// really gone: a `PopupClosed` for an unknown surface decrements
+    /// ([`Window::on_popup_closed`]), and our own popup ending — its
+    /// `PopupClosed` or [`Message::TogglePopup`] — resets it to zero, since
+    /// every child dies with it. A `DestroyPopup` *request* deliberately does
+    /// not — the two rows share one message and a widget left with a stale
+    /// `is_open` (grab-loss dismissal never reaches its `ButtonPressed` arm,
+    /// and `Row::update` dispatches to every child regardless of
+    /// `capture_event`) emits a destroy for a popup that is already gone, in
+    /// the same pass as the *other* row's create. That no-op destroy produces
+    /// no `Done`, so leaving the count alone here is exactly right; a real
+    /// destroy is announced back as `PopupClosed`.
+    pub(crate) dropdowns_open: u32,
     /// Applet settings (shuffle, retention). Defaults when the config context
     /// is unavailable.
     pub(crate) config: AppletConfig,
@@ -454,6 +463,12 @@ fn destroy_tooltip() -> app::Task<Message> {
 }
 
 impl Window {
+    /// Whether a dropdown menu is believed to be mapped — the ledger's one
+    /// question ([`Window::dropdowns_open`], whose doc carries the rules).
+    pub(crate) fn dropdown_open(&self) -> bool {
+        self.dropdowns_open > 0
+    }
+
     /// A popup surface closed: ours, the tooltip's, or a dropdown menu's.
     ///
     /// `PopupClosed` fires for popups we destroy ourselves as well as for
@@ -472,22 +487,26 @@ impl Window {
             return Task::none();
         }
         if self.popup == Some(id) {
+            // Our popup takes every child with it, so the count goes to zero
+            // whatever it held.
             tracing::debug!("popup closed: our own popup");
             self.popup = None;
+            self.dropdowns_open = 0;
         } else {
             // By elimination: a dropdown menu. Its window id is minted inside
             // the widget (`window::Id::unique()` into private state) and is
             // never visible to us at creation. A *stale* id lands here too —
             // the `Done` for a popup `TogglePopup` already took out of
-            // `self.popup`, or one for a menu that closed before another
-            // opened — which is why both branches end the same way: clearing
-            // the bit is the conservative direction (a menu still mapped is
-            // recovered by the runtime, which destroys popups above a create's
-            // requested parent), and the tooltip destroy is a no-op unless one
-            // is really mapped.
+            // `self.popup`, or one for a menu that had already closed — so
+            // this is a *decrement*, not a clear: a `Done` that arrives after
+            // a newer create still belongs to the create it pairs with, and
+            // clearing would leave the count at zero with that newer menu
+            // mapped. The saturating floor is what makes the misclassified
+            // ids harmless — an extra close can never push the ledger below
+            // "nothing open".
             tracing::debug!("popup closed: a dropdown menu");
+            self.dropdowns_open = self.dropdowns_open.saturating_sub(1);
         }
-        self.dropdown_open = false;
         // Our popup dying does *not* take a mapped tooltip with it on the
         // compositor path (`…/handlers/shell/xdg_popup.rs::done` collects the
         // dismissed popup's *ancestors* and no children), so the orphan is
@@ -512,7 +531,7 @@ impl Window {
     /// surviving clone makes it log `"Invalid settings for popup"` and create
     /// nothing — silently, since logging is off by default.
     fn on_tooltip_surface(&self, action: cosmic::surface::Action) -> app::Task<Message> {
-        if self.dropdown_open {
+        if self.dropdown_open() {
             tracing::debug!("tooltip surface action dropped behind an open dropdown: {action:?}");
             return Task::none();
         }
@@ -546,19 +565,19 @@ impl Window {
                 // *above* an already-open menu it is the topmost, so the
                 // destroy is legal either way.
                 tracing::debug!("dropdown opened");
-                self.dropdown_open = true;
+                self.dropdowns_open = self.dropdowns_open.saturating_add(1);
                 before = destroy_tooltip();
             }
             cosmic::surface::Action::DestroyPopup(_) => {
-                // The bit is deliberately *not* cleared here — see the field's
-                // doc. Both rows publish through this one message, and a row
-                // whose widget kept a stale `is_open` (grab loss dismisses the
-                // menu without ever reaching its `ButtonPressed` arm) emits a
-                // destroy for an already-dead popup in the same pass as the
-                // other row's create; clearing here would leave the bit false
-                // with a menu mapped, which is the state the invariant
-                // forbids. A destroy that really tears a menu down comes back
-                // as `PopupClosed`, and that is what clears it.
+                // The count is deliberately *not* lowered here — see the
+                // field's doc. Both rows publish through this one message, and
+                // a row whose widget kept a stale `is_open` (grab loss
+                // dismisses the menu without ever reaching its `ButtonPressed`
+                // arm) emits a destroy for an already-dead popup in the same
+                // pass as the other row's create; decrementing here would end
+                // that pass at zero with a menu mapped, which is the state the
+                // invariant forbids. A destroy that really tears a menu down
+                // comes back as `PopupClosed`, and that is what decrements.
                 tracing::debug!("dropdown destroy forwarded");
                 // Ordered after the menu's own destroy: only then is a tooltip
                 // topmost again. Unconditional, so it also collects a tooltip
@@ -2086,7 +2105,7 @@ impl cosmic::Application for Window {
         let mut window = Self {
             core,
             popup: None,
-            dropdown_open: false,
+            dropdowns_open: 0,
             config,
             config_context,
             catalogue,
@@ -2137,10 +2156,11 @@ impl cosmic::Application for Window {
                     // (`PopupEvent::Done` → [`Message::PopupClosed`], see
                     // [`Window::on_popup_closed`]), but only asynchronously,
                     // and by then the id no longer matches `self.popup`. So
-                    // the ledger is cleared here rather than left to a row
-                    // that can no longer fire: a stale `dropdown_open` would
-                    // pause every tooltip for the rest of the session.
-                    self.dropdown_open = false;
+                    // the ledger is reset here rather than left to a row that
+                    // can no longer fire: a stale count would pause every
+                    // tooltip for the rest of the session. Zero, not a
+                    // decrement — every child dies with our popup.
+                    self.dropdowns_open = 0;
                     return cosmic::surface::surface_task(cosmic::surface::action::destroy_popup(
                         popup_id,
                     ));
@@ -3841,7 +3861,8 @@ mod tests {
         tooltip_destroy,
     };
 
-    /// Our popup's own close: the id is dropped, the ledger is cleared, and a
+    /// Our popup's own close: the id is dropped, the ledger is reset to zero
+    /// (every child dies with it, whatever the count held), and a
     /// possibly-orphaned tooltip is swept.
     ///
     /// The sweep is for the compositor path — `…/handlers/shell/xdg_popup.rs`'s
@@ -3856,18 +3877,18 @@ mod tests {
         let mut window = Window::default();
         let ours = window::Id::unique();
         window.popup = Some(ours);
-        window.dropdown_open = true;
+        window.dropdowns_open = 1;
 
         let task = window.update(Message::PopupClosed(ours));
 
         assert_eq!(window.popup, None);
-        assert!(!window.dropdown_open);
+        assert!(!window.dropdown_open());
         assert_eq!(emitted(task).await, vec![Emitted::DestroyTooltip]);
     }
 
     /// The tooltip's own close names the shared tooltip surface. It says
-    /// nothing about menus, so the ledger must not move — a cleared
-    /// `dropdown_open` would un-pause tooltips beside a mapped menu.
+    /// nothing about menus, so the ledger must not move — a decrement here
+    /// would un-pause tooltips beside a mapped menu.
     #[tokio::test]
     async fn popup_closed_for_the_tooltip_surface_changes_nothing() {
         use cosmic::Application as _;
@@ -3875,12 +3896,12 @@ mod tests {
         let mut window = Window::default();
         let ours = window::Id::unique();
         window.popup = Some(ours);
-        window.dropdown_open = true;
+        window.dropdowns_open = 1;
 
         let task = window.update(Message::PopupClosed(crate::tooltip::window_id()));
 
         assert_eq!(window.popup, Some(ours), "a tooltip close it is, not ours");
-        assert!(window.dropdown_open, "a dropdown close it is not");
+        assert!(window.dropdown_open(), "a dropdown close it is not");
         assert!(emitted(task).await.is_empty(), "nothing to destroy");
     }
 
@@ -3894,12 +3915,12 @@ mod tests {
         let mut window = Window::default();
         let ours = window::Id::unique();
         window.popup = Some(ours);
-        window.dropdown_open = true;
+        window.dropdowns_open = 1;
 
         let task = window.update(Message::PopupClosed(window::Id::unique()));
 
         assert_eq!(window.popup, Some(ours), "another surface is not ours");
-        assert!(!window.dropdown_open);
+        assert!(!window.dropdown_open());
         assert_eq!(
             emitted(task).await,
             vec![Emitted::DestroyTooltip],
@@ -3907,10 +3928,44 @@ mod tests {
         );
     }
 
+    /// The overlapping-lifetimes case a single bool cannot survive: a `Done`
+    /// for a menu that is already gone is delivered *after* a newer menu was
+    /// created. Clearing on it would leave tooltips un-paused beside the live
+    /// menu — the two-children state the invariant forbids — so the ledger
+    /// counts instead, and the newer create still stands after the older
+    /// close. The trailing unpaired close pins the saturating floor: an extra
+    /// `Done` (a stale id for something already gone) can never push the
+    /// count below "nothing open", which is what keeps the by-elimination
+    /// misclassification harmless.
+    #[tokio::test]
+    async fn a_close_for_an_earlier_menu_leaves_a_newer_one_recorded() {
+        use cosmic::Application as _;
+
+        let mut window = Window::default();
+        window.popup = Some(window::Id::unique());
+
+        drop(window.update(Message::DropdownSurface(dropdown_create())));
+        drop(window.update(Message::DropdownSurface(dropdown_create())));
+        assert_eq!(window.dropdowns_open, 2, "two creates, two menus");
+
+        let task = window.update(Message::PopupClosed(window::Id::unique()));
+        assert_eq!(emitted(task).await, vec![Emitted::DestroyTooltip]);
+        assert!(
+            window.dropdown_open(),
+            "the older menu's close says nothing about the newer one"
+        );
+
+        drop(window.update(Message::PopupClosed(window::Id::unique())));
+        assert!(!window.dropdown_open(), "now every menu is accounted for");
+
+        drop(window.update(Message::PopupClosed(window::Id::unique())));
+        assert_eq!(window.dropdowns_open, 0, "the count saturates at zero");
+    }
+
     /// The stale-id case the by-elimination rule cannot distinguish: the
     /// `Done` for a popup `TogglePopup` already took out of `self.popup`
-    /// arrives later and is read as a menu. Harmless by construction — both
-    /// branches end in the same clear-and-sweep.
+    /// arrives later and is read as a menu. Harmless because `TogglePopup`
+    /// already reset the count and the decrement saturates at zero.
     #[tokio::test]
     async fn a_late_close_for_a_popup_we_already_took_is_harmless() {
         use cosmic::Application as _;
@@ -3924,7 +3979,7 @@ mod tests {
         let task = window.update(Message::PopupClosed(ours));
 
         assert_eq!(window.popup, None);
-        assert!(!window.dropdown_open);
+        assert!(!window.dropdown_open());
         assert_eq!(emitted(task).await, vec![Emitted::DestroyTooltip]);
     }
 
@@ -3946,7 +4001,7 @@ mod tests {
         ] {
             let task = window.update(Message::TooltipSurface(action));
             assert_eq!(emitted(task).await, vec![expected]);
-            assert!(!window.dropdown_open, "the tooltip route never opens one");
+            assert!(!window.dropdown_open(), "the tooltip route never opens one");
         }
     }
 
@@ -3961,7 +4016,7 @@ mod tests {
 
         let mut window = Window::default();
         window.popup = Some(window::Id::unique());
-        window.dropdown_open = true;
+        window.dropdowns_open = 1;
 
         for action in [tooltip_arm(), tooltip_destroy(), dropdown_create()] {
             let task = window.update(Message::TooltipSurface(action));
@@ -3969,7 +4024,7 @@ mod tests {
                 emitted(task).await.is_empty(),
                 "nothing may reach the runtime under an open menu"
             );
-            assert!(window.dropdown_open);
+            assert!(window.dropdown_open());
         }
     }
 
@@ -3986,7 +4041,7 @@ mod tests {
 
             let task = window.update(Message::DropdownSurface(create));
 
-            assert!(window.dropdown_open);
+            assert!(window.dropdown_open());
             assert_eq!(
                 emitted(task).await,
                 vec![Emitted::DestroyTooltip, Emitted::Create],
@@ -4005,11 +4060,11 @@ mod tests {
 
         let mut window = Window::default();
         window.popup = Some(window::Id::unique());
-        window.dropdown_open = true;
+        window.dropdowns_open = 1;
 
         let task = window.update(Message::DropdownSurface(dropdown_create()));
 
-        assert!(window.dropdown_open);
+        assert!(window.dropdown_open());
         assert_eq!(
             emitted(task).await,
             vec![Emitted::DestroyTooltip, Emitted::Create]
@@ -4027,7 +4082,7 @@ mod tests {
 
         let task = window.update(Message::DropdownSurface(tooltip_arm()));
 
-        assert!(!window.dropdown_open, "no create, no menu");
+        assert!(!window.dropdown_open(), "no create, no menu");
         assert_eq!(emitted(task).await, vec![Emitted::Arm]);
     }
 
@@ -4044,12 +4099,12 @@ mod tests {
 
         let mut window = Window::default();
         window.popup = Some(window::Id::unique());
-        window.dropdown_open = true;
+        window.dropdowns_open = 1;
 
         let task = window.update(Message::DropdownSurface(dropdown_destroy()));
 
         assert!(
-            window.dropdown_open,
+            window.dropdown_open(),
             "the request is not the close; `PopupClosed` clears the bit"
         );
         assert_eq!(
@@ -4091,7 +4146,7 @@ mod tests {
         );
 
         assert!(
-            window.dropdown_open,
+            window.dropdown_open(),
             "the menu the create mapped is still up, so tooltips stay paused"
         );
     }
@@ -4099,20 +4154,20 @@ mod tests {
     /// Clicking the panel icon closes our popup with an explicit destroy. The
     /// runtime *does* announce that back as `PopupClosed`, but asynchronously
     /// and with an id `self.popup` no longer holds, so the ledger is cleared
-    /// on the spot — a stale `dropdown_open` would pause every later tooltip.
+    /// on the spot — a stale count would pause every later tooltip.
     #[tokio::test]
     async fn closing_our_own_popup_clears_the_ledger() {
         use cosmic::Application as _;
 
         let mut window = Window::default();
         window.popup = Some(window::Id::unique());
-        window.dropdown_open = true;
+        window.dropdowns_open = 1;
 
         let task = window.update(Message::TogglePopup);
 
         assert_eq!(window.popup, None);
         assert!(
-            !window.dropdown_open,
+            !window.dropdown_open(),
             "a stale dropdown would pause tooltips for the rest of the session"
         );
         assert_eq!(
@@ -4152,13 +4207,13 @@ mod tests {
             vec![Emitted::DestroyOther, Emitted::DestroyTooltip],
             "the dropped destroy is re-emitted once it is legal"
         );
-        assert!(window.dropdown_open, "the request is not yet the close");
+        assert!(window.dropdown_open(), "the request is not yet the close");
 
         // The runtime announces the teardown, and only that re-opens the
         // tooltip window.
         let task = window.update(Message::PopupClosed(window::Id::unique()));
         assert_eq!(emitted(task).await, vec![Emitted::DestroyTooltip]);
-        assert!(!window.dropdown_open);
+        assert!(!window.dropdown_open());
     }
 
     #[test]

@@ -307,20 +307,22 @@ Task 3.
 ### Ledger transitions
 
 **Revised 2026-08-11 after review** — the three-flag ledger below the line was
-replaced by a single `dropdown_open` bit plus the idempotent `destroy_tooltip()`
-task; see "Post-review revision". Current table:
+replaced by the single saturating `dropdowns_open` count (a bit until the third
+review pass) plus the idempotent `destroy_tooltip()` task; see "Post-review
+revision" and "Third review pass". Current table, with
+`dropdown_open() == (dropdowns_open > 0)`:
 
 | message | action variant | effect |
 |---|---|---|
-| `TooltipSurface` | anything, `dropdown_open` | **drop it** (no forward, no emission) |
-| `TooltipSurface` | anything, `!dropdown_open` | forward untouched |
-| `DropdownSurface` | `Popup`/`AppPopup` | `dropdown_open = true`; chain `destroy_tooltip()` **before** the forwarded create |
+| `TooltipSurface` | anything, `dropdown_open()` | **drop it** (no forward, no emission) |
+| `TooltipSurface` | anything, `!dropdown_open()` | forward untouched |
+| `DropdownSurface` | `Popup`/`AppPopup` | `dropdowns_open += 1` (saturating); chain `destroy_tooltip()` **before** the forwarded create |
 | `DropdownSurface` | `DestroyPopup(_)` | forward, then chain `destroy_tooltip()` — **ledger untouched** (see the second review revision) |
 | `DropdownSurface` | anything else | forward untouched |
 | `PopupClosed(id)` | `id == tooltip::window_id()` | nothing |
-| `PopupClosed(id)` | `id == self.popup` | clear `self.popup`, `dropdown_open = false`, `destroy_tooltip()` |
-| `PopupClosed(id)` | any other id | `dropdown_open = false`, `destroy_tooltip()` |
-| `TogglePopup` | popup open | `dropdown_open = false`, then destroy `self.popup` |
+| `PopupClosed(id)` | `id == self.popup` | clear `self.popup`, `dropdowns_open = 0`, `destroy_tooltip()` |
+| `PopupClosed(id)` | any other id | `dropdowns_open -= 1` (saturating), `destroy_tooltip()` |
+| `TogglePopup` | popup open | `dropdowns_open = 0`, then destroy `self.popup` |
 
 <details><summary>Superseded three-flag table (as implemented in Tasks 1-5)</summary>
 
@@ -665,6 +667,41 @@ confirmed against the pinned libcosmic rev and acted on.
   expected to keep failing.
 - **The upstream-report item now names that bug first**, with the one-line fix
   and a minimal repro, instead of only the two secondary holes.
+
+### Third review pass (2026-08-11)
+
+One actionable finding, the mirror of the second pass's stale-*request* bug:
+`on_popup_closed` cleared the bit unconditionally for any non-tooltip id, so a
+`Done` for an already-gone menu (or for a popup `TogglePopup` had already
+taken) delivered *after* a newer create ended the pass with the bit clear and a
+menu mapped — tooltips un-paused beside a live sibling. The bit carried neither
+an id nor a count, so nothing could tell the two apart.
+
+- **`dropdown_open` became `dropdowns_open`, a saturating `u32`** read through
+  `Window::dropdown_open()`. Menu window ids are minted inside the widget and
+  never visible here, so creates and closes can only be paired by arithmetic —
+  and the pairing is exact upstream: every popup torn down is removed from
+  `self.popups` before its `Done` is pushed (both `xdg_popup.rs::done` and the
+  `Action::Destroy` arm in `event_loop/state.rs`), so one mapped popup yields
+  at most one `Done`. The earlier objection to a counter — "a menu close
+  signals both `DestroyPopup` and `PopupClosed`, so it double-decrements" — no
+  longer applies now that the `DestroyPopup` arm does not touch the ledger.
+- **Create increments; `PopupClosed` for an unknown id decrements; our own
+  popup ending (its `PopupClosed` or `TogglePopup`) resets to zero**, since
+  every child dies with it. The saturating floor is what keeps the
+  by-elimination misclassification harmless: an unpaired `Done` can never push
+  the ledger below "nothing open".
+- Regression test `a_close_for_an_earlier_menu_leaves_a_newer_one_recorded`
+  (create, create, close → still recorded; close → closed; a further unpaired
+  close → still zero). `CLAUDE.md`'s "Popup stack" rules were updated to the
+  count semantics.
+
+The other finding of that round was informational: the branch still does not
+fix the upstream ancestor-first destroy order (residual path (a)). The only
+real remedy is repointing the rev-pinned libcosmic dependency at a fork
+carrying the one-line `to_destroy.reverse()`, which was judged out of scope for
+a review-fix pass — see "Residual paths" above and the upstream-report item
+below.
 
 ## Post-Completion
 

@@ -80,7 +80,7 @@ the pinned rev before coding against remembered names.
   the prune's `thumbs::reconcile` sweep is deferred: fetched entries only join
   the catalogue at `RefreshFinished`, so an unconditional sweep deletes what
   the in-flight pass just wrote. Every pass ends in a sweep of its own.
-  It also owns the **popup ledger** — the `dropdown_open` field, the
+  It also owns the **popup ledger** — the `dropdowns_open` count, the
   `TooltipSurface`/`DropdownSurface` messages, `on_popup_closed` /
   `on_tooltip_surface` / `on_dropdown_surface` and the free `destroy_tooltip`
   task — which holds the at-most-one-child invariant on `window.popup`. See
@@ -351,9 +351,9 @@ the pinned rev before coding against remembered names.
   test surface shared by `app::tests` and `view::tests`: builders for the
   `cosmic::surface::Action`s the ledger routes, and `emitted(task)` — which
   drains a returned `Task` into an ordered `Vec<Emitted>`. Assert **emissions**,
-  not just `dropdown_open`: the flag is set by a statement separate from the
-  `surface_task(..)` calls, so flag-only tests keep passing with every destroy
-  deleted (they did).
+  not just `dropdowns_open`: the count is moved by a statement separate from
+  the `surface_task(..)` calls, so ledger-only tests keep passing with every
+  destroy deleted (they did).
 
 Design decisions, live-verified Bing/cosmic-bg facts, and per-task
 implementation notes live in `docs/plans/` (`20260807-cosmic-bing-wallpaper-applet.md`
@@ -459,7 +459,7 @@ On the create side upstream is partly self-healing already (a create whose
 requested parent is not the last entry of `self.popups` destroys everything
 above it, topmost-first, then retries — `state.rs`, `parent_mismatch`), so the
 ledger's real job is the destroys and the ordering, not the creates. The
-invariant is held by **one bit** on `Window` (`dropdown_open`) plus one
+invariant is held by **one counter** on `Window` (`dropdowns_open`) plus one
 idempotent task — see `Window::on_tooltip_surface`, `on_dropdown_surface`,
 `on_popup_closed` and the free `destroy_tooltip` in `app.rs`:
 
@@ -477,12 +477,12 @@ idempotent task — see `Window::on_tooltip_surface`, `on_dropdown_surface`,
   tooltip is legally topmost. Unconditional, and legal either way — no tooltip
   mapped is the no-op, and a tooltip that reached the surface while a menu was
   already up was mapped *above* it, i.e. is itself topmost.
-- **Suppression** — while `dropdown_open`, `view::tooltip_suppressed` makes
+- **Suppression** — while `Window::dropdown_open()`, `view::tooltip_suppressed` makes
   `tooltip(..)` withhold its settings closure, so no tooltip can arm. In the
   real pointer flow this is the rule that actually holds the invariant: the
   widget publishes `on_leave` on the `CursorMoved` that takes the pointer off
   the control, which necessarily precedes clicking a dropdown button.
-- **Drop, then re-emit** — while `dropdown_open`, *everything* the tooltip
+- **Drop, then re-emit** — while `Window::dropdown_open()`, *everything* the tooltip
   publishes is dropped (a create would map a second child; a destroy would
   target a non-topmost popup). Nothing is lost, because a dropdown destroy —
   and any `PopupClosed` — chains `destroy_tooltip()` *after* the menu is gone.
@@ -506,23 +506,32 @@ Rules for touching any of this:
   explicit destroy sends no event" — an earlier revision of this file did, and
   it is false at the pinned rev. `PopupClosed` is still the *only* signal for a
   dropdown dismissed by grab loss, which publishes no `DestroyPopup`.
-- **`TogglePopup` clears the ledger itself** — not because no event comes, but
+- **`TogglePopup` resets the ledger itself** — not because no event comes, but
   because it comes *late*, after `self.popup.take()`, so the "ours" row can no
-  longer match it. Both `on_popup_closed` branches (ours / by-elimination) end
-  in the same clear-and-sweep, which is what makes that misclassification —
-  and a stale id for any popup already gone — harmless.
-- **`dropdown_open` is one bool, biased toward `true`, and only a *close*
-  clears it.** A spurious `true` only pauses tooltips; a spurious `false` lets
-  one arm beside a mapped menu. The create sets it; `PopupClosed` and
-  `TogglePopup` clear it; a `DestroyPopup` **request deliberately does not**.
-  Both rows publish through one `Message::DropdownSurface`, and a widget left
-  with a stale `is_open` (grab-loss dismissal never reaches its `ButtonPressed`
-  arm, and `iced`'s `Row::update` hands the event to *every* child regardless
-  of `capture_event`) emits a destroy for an already-dead popup in the same
-  pass as the *other* row's create — clearing on the request would end that
-  pass with the bit false and a menu mapped. A stale destroy is a runtime
-  no-op, so it emits no `Done`; a real one always does. Don't "simplify" this
-  back into the destroy arm.
+  longer match it. Every child dies with our popup, so both that path and the
+  "ours" row of `on_popup_closed` reset the count to zero; the
+  by-elimination row *decrements* instead, and the saturating floor is what
+  makes a late id for a popup already gone harmless.
+- **`dropdowns_open` is a saturating count, biased toward "open", and only a
+  *close* lowers it.** A spurious non-zero only pauses tooltips; a spurious
+  zero lets one arm beside a mapped menu. It is a count and not a bool because
+  menu window ids are minted inside the widget and never visible here, so
+  creates and closes can only be paired by arithmetic — and a `Done` for an
+  *already gone* menu can be delivered after a newer create, which a bool would
+  read as "nothing open" with a menu mapped. The pairing is exact upstream:
+  every popup torn down is removed from `self.popups` first (both
+  `…/handlers/shell/xdg_popup.rs::done` and the `Action::Destroy` arm), so one
+  mapped popup yields at most one `Done`. The create increments; `PopupClosed`
+  decrements (or resets, for our own popup) and `TogglePopup` resets; a
+  `DestroyPopup` **request deliberately does not**. Both rows publish through
+  one `Message::DropdownSurface`, and a widget left with a stale `is_open`
+  (grab-loss dismissal never reaches its `ButtonPressed` arm, and `iced`'s
+  `Row::update` hands the event to *every* child regardless of `capture_event`)
+  emits a destroy for an already-dead popup in the same pass as the *other*
+  row's create — decrementing on the request would end that pass at zero with a
+  menu mapped. A stale destroy is a runtime no-op, so it emits no `Done`; a
+  real one always does. Don't "simplify" this back into the destroy arm, and
+  don't collapse the count back into a bool.
 - **Residual paths, not closed by this work — don't read either as a
   regression.** (a) **Compositor-initiated dismissal is an upstream
   destroy-order bug, and it needs no second child.**

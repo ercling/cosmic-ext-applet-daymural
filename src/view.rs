@@ -506,12 +506,12 @@ fn popup_tooltip<'a>(
 /// tooltip publishes while one is up; this is the front half, keeping the
 /// widget from publishing at all.
 ///
-/// Read off the ledger's `dropdown_open`, so it is the ledger — not the view —
+/// Read off the ledger's open-menu count, so it is the ledger — not the view —
 /// that decides when the window opens and closes. Kept as a named helper (not
 /// an inline field read) so the argument has the "why" attached at the one call
 /// site and the transition is directly assertable.
 fn tooltip_suppressed(window: &Window) -> bool {
-    window.dropdown_open
+    window.dropdown_open()
 }
 
 #[cfg(test)]
@@ -772,7 +772,7 @@ mod tests {
     /// front half of the single-child invariant (the interlock in `app.rs`
     /// destroys an *already open* tooltip; this stops a new one arming).
     ///
-    /// Driven through the ledger rather than by poking `dropdown_open`, so it
+    /// Driven through the ledger rather than by poking its count, so it
     /// asserts the wiring from the menu's own surface actions to the view, not
     /// the field's own value. Note which event re-opens the window: the
     /// menu's `PopupClosed`, not its destroy *request* — a request can be a
