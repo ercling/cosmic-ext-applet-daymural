@@ -91,8 +91,21 @@ pub struct Window {
     /// non-zero only pauses tooltips, while a spurious zero lets one arm beside
     /// a mapped menu. It is incremented optimistically on the create, which the
     /// runtime can still drop (it retries a deferred create five times at 30 ms
-    /// and then gives up, and `get_popup` failures only log); tooltips then
-    /// stay paused until the count is reset.
+    /// and then gives up — reachable whenever the main thread stalls past
+    /// ~150 ms with `state.destroyed` still populated, e.g. by the tooltip
+    /// destroy the interlock just emitted — a `pending_popup` that a second
+    /// deferred create *replaces* is dropped with no retry at all, and
+    /// `get_popup` failures only log). Tooltips then stay paused for the rest
+    /// of that popup session.
+    ///
+    /// **That phantom unit must not outlive the session that leaked it**, and
+    /// this is the one bound the ledger owes the user: the count is zeroed when
+    /// the session ends, but its units are re-booked as an owed close (below),
+    /// and an owed close that nothing will ever pay silently swallows the *next*
+    /// session's live menu close instead — one dropped create would otherwise
+    /// kill hover tooltips for the rest of the process. Both bookings are
+    /// therefore bounded by evidence that the ended session is fully drained:
+    /// see [`ClosingPopup::menus_owed`] and [`Window::stale_menu_closes`].
     ///
     /// **Only three things lower it**, all of which are evidence that a menu is
     /// really gone: a `PopupClosed` for an unknown surface decrements
@@ -109,9 +122,12 @@ pub struct Window {
     /// no `Done`, so leaving the count alone here is exactly right; a real
     /// destroy is announced back as `PopupClosed`.
     dropdowns_open: u32,
-    /// How many **menu** `PopupClosed` events are still owed by an ended popup
-    /// session — the anonymous half of the popup-session generation counter,
-    /// kept as a debt because those events carry no generation to compare.
+    /// How many **menu** `PopupClosed` events are still owed by a popup session
+    /// a *compositor dismissal* ended — the anonymous debt of the "ours" row of
+    /// [`Window::on_popup_closed`], kept as a count because those events carry
+    /// no generation to compare. The self-initiated ending books its menus on
+    /// the closing popup's own entry instead ([`ClosingPopup::menus_owed`]),
+    /// because there the ending *is* keyed.
     ///
     /// The other generation counters in this file (`timer_generation`,
     /// `shuffle_generation`, `accent_generation`) can stamp their own message
@@ -125,33 +141,27 @@ pub struct Window {
     /// touched. Our own popup's late close is **not** counted here; its id is
     /// known, so it is booked into [`Window::closing_popups`] instead.
     ///
-    /// **The delivery really is asynchronous, so this is not theoretical.**
-    /// Verified against the pinned libcosmic rev, a self-initiated destroy
-    /// travels: `update()` → `Task` → the runtime's event queue →
-    /// `run_action` → `PlatformSpecific::send_action` → a
-    /// `calloop::channel::Sender` → **a separate `std::thread`** running the
-    /// sctk event loop (`…/platform_specific/wayland/event_loop/mod.rs`,
-    /// `SctkEventLoop::new` spawns it) → the `Action::Destroy` arm in
-    /// `…/event_loop/state.rs`, which pushes a `PopupEventVariant::Done` per
-    /// torn-down popup through `send_event` → an unbounded `Control` channel →
-    /// back onto the same event queue `update()` is driven from. Four queue
-    /// hops and a thread boundary: nothing sequences those `Done`s ahead of
-    /// messages already queued behind the destroy, so a reopen plus a fresh
-    /// menu create *can* be processed first (they only need to be sitting in
-    /// the queue when the closing click is handled — an input burst, or one
-    /// stalled frame). Without this debt the stale `Done`s would decrement the
-    /// **new** session's menu count to zero with its menu mapped, un-pausing
-    /// tooltips beside a live sibling — the two-children state the whole
-    /// invariant forbids.
+    /// **Discarded when the next session's popup id is adopted**
+    /// ([`Window::adopt_popup`]) — the bound that keeps an unpayable unit from
+    /// outliving its session (see [`Window::dropdowns_open`]). Sound because
+    /// this debt is booked only on the compositor path, and there the ending is
+    /// *not* asynchronous with respect to later input: `…/handlers/shell/
+    /// xdg_popup.rs::done` pushes a `Done` for every popup of the dismissed
+    /// chain into `self.sctk_events` in one call, and the sctk thread drains
+    /// that vec into the same `events_sender` channel that carries pointer
+    /// events (`…/wayland/event_loop/mod.rs`, `for e in
+    /// state.state.sctk_events.drain(..)`). So the whole chain's closes are
+    /// queued ahead of the click that could open the next popup, and that click
+    /// is still two message rounds away from adopting an id — anything still
+    /// owed here by then is a menu that never mapped.
     ///
     /// Paying a debt can only *withhold* a decrement, so the ledger stays
-    /// biased toward "open" (see [`Window::dropdowns_open`]): a debt that is
-    /// never paid — the upstream create-drop case, where the `Done` we counted
-    /// on never comes — only pauses tooltips, never un-pauses them.
+    /// biased toward "open" (see [`Window::dropdowns_open`]).
     stale_menu_closes: u32,
     /// Our own popups whose destroy has been requested but whose `PopupClosed`
-    /// has not been delivered yet — the *keyed* half of the debt described on
-    /// [`Window::stale_menu_closes`], and the reason that field says "menu".
+    /// has not been delivered yet, each carrying the menu closes its teardown
+    /// still owes — the *keyed* half of the popup-session debt, and the reason
+    /// [`Window::stale_menu_closes`] says "menu".
     ///
     /// [`Message::TogglePopup`] takes `self.popup` before emitting the destroy,
     /// so the `Done` that comes back four queues and a thread later can no
@@ -183,7 +193,7 @@ pub struct Window {
     /// unclaimed entry is never evicted: it costs a `u64` and nothing else,
     /// while evicting one would hand its `Done` back to the by-elimination row
     /// — the un-pausing direction this whole ledger refuses to take.
-    closing_popups: Vec<window::Id>,
+    closing_popups: Vec<ClosingPopup>,
     /// Applet settings (shuffle, retention). Defaults when the config context
     /// is unavailable.
     pub(crate) config: AppletConfig,
@@ -274,6 +284,32 @@ pub struct Window {
     /// no-op. Tests inject a tempdir-rooted `Config::with_custom_path`
     /// handle (mirroring `config_context`).
     poke_config: Option<cosmic_config::Config>,
+}
+
+/// One entry of [`Window::closing_popups`]: a popup of ours whose destroy has
+/// been requested and whose `PopupClosed` is still outstanding, plus the menu
+/// closes that teardown still owes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClosingPopup {
+    /// The popup's own id — the only thing that settles this entry.
+    id: window::Id,
+    /// Menu closes owed by the session this popup ended: one per menu counted
+    /// when [`Message::TogglePopup`] took it. They are **anonymous** (a menu's
+    /// id is minted inside the widget), so any unrecognised close pays one
+    /// before [`Window::dropdowns_open`] is touched — but they die with this
+    /// entry when `id`'s own close arrives, and that is what stops a menu
+    /// create the runtime dropped from becoming permanent debt.
+    ///
+    /// The discard is evidence-based, not a heuristic: the `Action::Destroy`
+    /// arm (`…/wayland/event_loop/state.rs`) collects the popup **and its
+    /// children** into `to_destroy`, reverses, and then iterates
+    /// `.into_iter().rev()`, so it `send_event`s each child's `Done` *before*
+    /// the parent's, into one unbounded channel. By the time the id named here
+    /// comes back, every close that teardown will ever emit has already been
+    /// delivered; a unit still owed is a menu that never mapped. (Only the
+    /// order within this one teardown is relied on — not any ordering against
+    /// the rest of the queue, which is exactly what the debt exists for.)
+    menus_owed: u32,
 }
 
 /// What the single in-flight accent theme task ([`Window::accent_inflight`])
@@ -571,6 +607,10 @@ impl Window {
             // whatever it held — but each of those children still owes a
             // `Done` (the compositor `done`s the whole grab chain), and those
             // belong to the session that just ended, not to the next one.
+            // Anonymously, there being no id to key them to, and only until the
+            // next session's popup is adopted — by then the whole chain's
+            // closes have been delivered, so a unit still standing is a menu
+            // that never mapped ([`Window::stale_menu_closes`]).
             self.popup = None;
             self.stale_menu_closes = self.stale_menu_closes.saturating_add(self.dropdowns_open);
             self.dropdowns_open = 0;
@@ -578,30 +618,52 @@ impl Window {
                 "popup closed: our own popup (dropdowns open: 0, menu closes owed: {})",
                 self.stale_menu_closes
             );
-        } else if let Some(index) = self.closing_popups.iter().position(|&open| open == id) {
+        } else if let Some(index) = self.closing_popups.iter().position(|open| open.id == id) {
             // A popup of ours that `TogglePopup` already took, announcing its
             // destroy back to us long after the fact (see the field doc for the
             // delivery trace). Its id was booked, so it is settled by name and
             // charged to nothing — never to the live count, and never to the
             // anonymous menu debt, which a popup that was never mapped would
             // leave owed forever.
-            self.closing_popups.remove(index);
+            //
+            // Its own session's menus are settled with it: upstream emits every
+            // child's `Done` ahead of the parent's within one teardown
+            // ([`ClosingPopup::menus_owed`]), so anything still owed here is a
+            // menu that never mapped — a create the runtime dropped. Left
+            // standing it would swallow the *next* live menu close and strand
+            // `dropdowns_open` at one with nothing mapped, session after
+            // session.
+            let settled = self.closing_popups.remove(index);
             tracing::debug!(
-                "popup closed: a popup of ours already taken (dropdowns open: {}, popups closing: {})",
+                "popup closed: a popup of ours already taken, discarding {} unpayable menu close(s) (dropdowns open: {}, popups closing: {})",
+                settled.menus_owed,
                 self.dropdowns_open,
                 self.closing_popups.len()
             );
         } else if self.stale_menu_closes > 0 {
-            // A menu close owed by an ended popup session — see the field doc
-            // for why it can land here long after the session was reset, and
-            // after a fresh popup and menu were opened. It says nothing about
-            // the menus of the *current* session, so pay the debt and leave the
-            // live count alone.
+            // A menu close owed by a session a compositor dismissal ended — see
+            // the field doc for why it can land here after the session was
+            // reset. It says nothing about the menus of the *current* session,
+            // so pay the debt and leave the live count alone.
             self.stale_menu_closes -= 1;
             tracing::debug!(
-                "popup closed: a menu owed by an ended session (dropdowns open: {}, menu closes owed: {})",
+                "popup closed: a menu owed by a dismissed session (dropdowns open: {}, menu closes owed: {})",
                 self.dropdowns_open,
                 self.stale_menu_closes
+            );
+        } else if let Some(owing) = self
+            .closing_popups
+            .iter_mut()
+            .find(|closing| closing.menus_owed > 0)
+        {
+            // A menu close owed by a session `TogglePopup` ended, whose popup's
+            // own `Done` has not come back yet — same rule as the row above,
+            // only keyed to the popup that owes it.
+            owing.menus_owed -= 1;
+            tracing::debug!(
+                "popup closed: a menu owed by a popup still closing (dropdowns open: {}, that popup still owes: {})",
+                self.dropdowns_open,
+                owing.menus_owed
             );
         } else {
             // By elimination: a dropdown menu of the current session. Its
@@ -670,6 +732,20 @@ impl Window {
     /// anonymous debt, and the count never dips below the number of mapped
     /// menus — resetting it would be the un-pausing direction.
     fn adopt_popup(&mut self, new_id: window::Id) {
+        // A new session begins, so the *anonymous* debt of a session a
+        // compositor dismissal ended is settled by definition: that path queues
+        // the whole chain's closes in one `done()` call, ahead of the very
+        // click that led here ([`Window::stale_menu_closes`]). Anything left is
+        // a menu that never mapped — a create the runtime dropped — and would
+        // otherwise swallow this session's first live menu close and pause its
+        // tooltips for good.
+        if self.stale_menu_closes > 0 {
+            tracing::debug!(
+                "new popup session: discarding {} unpayable menu close(s) from a dismissed session",
+                self.stale_menu_closes
+            );
+            self.stale_menu_closes = 0;
+        }
         if let Some(displaced) = self.popup.replace(new_id) {
             // By id, like the `TogglePopup` path and for the same reason: this
             // popup may never have mapped at all (see
@@ -677,7 +753,13 @@ impl Window {
             // swallow a live menu's close instead of sitting unclaimed. It
             // cannot already be booked — the only other writer of `self.popup`
             // clears it in the same step that books it, and ids are unique.
-            self.closing_popups.push(displaced);
+            // Nothing is subtracted from the live count here, so this entry
+            // owes no menu closes: whatever the displaced popup takes with it
+            // is still counted and pairs with its own `Done`.
+            self.closing_popups.push(ClosingPopup {
+                id: displaced,
+                menus_owed: 0,
+            });
             tracing::debug!(
                 "popup create displaced an earlier popup, booked by name (dropdowns open: {}, popups closing: {})",
                 self.dropdowns_open,
@@ -2342,16 +2424,20 @@ impl cosmic::Application for Window {
                     // the next one: without the debt they would decrement a
                     // reopened session's count with its menu still up. One per
                     // menu that was mapped, anonymously — a menu's id is minted
-                    // inside the widget ([`Window::stale_menu_closes`]) — plus
-                    // our own popup, which the `Action::Destroy` arm also emits
-                    // a `Done` for and whose id we *do* know, so it is booked
-                    // by name ([`Window::closing_popups`]): a create that never
-                    // mapped leaves a destroy that emits nothing, and an
-                    // anonymous unit for it would swallow a live menu's close
-                    // instead of going unclaimed.
-                    self.stale_menu_closes =
-                        self.stale_menu_closes.saturating_add(self.dropdowns_open);
-                    self.closing_popups.push(popup_id);
+                    // inside the widget — plus our own popup, which the
+                    // `Action::Destroy` arm also emits a `Done` for and whose id
+                    // we *do* know: a create that never mapped leaves a destroy
+                    // that emits nothing, and an anonymous unit for it would
+                    // swallow a live menu's close instead of going unclaimed.
+                    //
+                    // Both go on one entry, which is what bounds the anonymous
+                    // half: this popup's own `Done` comes back *after* every
+                    // child close that teardown will emit, so whatever is still
+                    // owed then never existed ([`ClosingPopup::menus_owed`]).
+                    self.closing_popups.push(ClosingPopup {
+                        id: popup_id,
+                        menus_owed: self.dropdowns_open,
+                    });
                     self.dropdowns_open = 0;
                     return cosmic::surface::surface_task(cosmic::surface::action::destroy_popup(
                         popup_id,
@@ -4184,7 +4270,10 @@ mod tests {
         assert_eq!(window.popup, None, "taken before the destroy is emitted");
         assert_eq!(
             window.closing_popups,
-            vec![ours],
+            vec![ClosingPopup {
+                id: ours,
+                menus_owed: 0
+            }],
             "our popup still owes its own, and it is owed by name"
         );
         assert_eq!(window.stale_menu_closes, 0, "no menu was mapped");
@@ -4221,7 +4310,10 @@ mod tests {
         drop(window.update(Message::TogglePopup));
         assert_eq!(
             window.closing_popups,
-            vec![phantom],
+            vec![ClosingPopup {
+                id: phantom,
+                menus_owed: 0
+            }],
             "owed by name, so no other close can settle it"
         );
 
@@ -4241,7 +4333,10 @@ mod tests {
         );
         assert_eq!(
             window.closing_popups,
-            vec![phantom],
+            vec![ClosingPopup {
+                id: phantom,
+                menus_owed: 0
+            }],
             "the unpayable debt is still outstanding, and cost nothing"
         );
     }
@@ -4277,7 +4372,10 @@ mod tests {
         assert_eq!(window.popup, Some(second), "the later create wins");
         assert_eq!(
             window.closing_popups,
-            vec![first],
+            vec![ClosingPopup {
+                id: first,
+                menus_owed: 0
+            }],
             "the displaced popup is owed by name, not dropped on the floor"
         );
 
@@ -4353,16 +4451,27 @@ mod tests {
         // Panel icon clicked: our popup and its menu are torn down, and each
         // owes a `Done` that has not been delivered yet.
         drop(window.update(Message::TogglePopup));
-        assert_eq!(window.stale_menu_closes, 1, "the menu's, anonymously");
-        assert_eq!(window.closing_popups, vec![first], "our popup's, by name");
+        assert_eq!(
+            window.closing_popups,
+            vec![ClosingPopup {
+                id: first,
+                menus_owed: 1
+            }],
+            "our popup by name, its menu anonymously on the same entry"
+        );
 
         // Reopened and a new menu opened, all before those `Done`s are
         // drained. The open branch's popup id is minted inside the runtime's
-        // closure, which tests never run, so it is set here.
+        // settings closure, which tests never run, so `adopt_popup` — the only
+        // thing that closure does to the ledger — is called directly.
         drop(window.update(Message::TogglePopup));
-        window.popup = Some(window::Id::unique());
+        window.adopt_popup(window::Id::unique());
         drop(window.update(Message::DropdownSurface(dropdown_create())));
         assert_eq!(window.dropdowns_open, 1, "the second session's menu");
+        assert_eq!(
+            window.closing_popups[0].menus_owed, 1,
+            "a new session discards no debt that is still keyed to a popup"
+        );
 
         // Now the first session's two `Done`s arrive: the menu's (an id we
         // never saw) and our old popup's (an id `self.popup` no longer holds).
@@ -4373,12 +4482,110 @@ mod tests {
             window.dropdown_open(),
             "the live menu is still mapped, so tooltips stay paused"
         );
-        assert_eq!(window.stale_menu_closes, 0, "the menu debt is paid");
-        assert!(window.closing_popups.is_empty(), "and ours is settled");
+        assert!(
+            window.closing_popups.is_empty(),
+            "the menu debt is paid and ours is settled"
+        );
 
         // And the live menu's own close still lands normally.
         drop(window.update(Message::PopupClosed(window::Id::unique())));
         assert!(!window.dropdown_open(), "now every menu is accounted for");
+    }
+
+    /// The other side of that debt, and the bound it owes the user: a menu
+    /// create the runtime **drops** (deferred behind a non-empty
+    /// `state.destroyed` — which the interlock's own tooltip destroy populates
+    /// — and then abandoned after five 30 ms retries) is counted but never
+    /// mapped, so no `Done` will ever pay for it.
+    ///
+    /// Unbounded, that phantom unit is re-booked as an owed close when the
+    /// session ends, swallows the *next* session's live menu close, is re-booked
+    /// again when that session ends… and hover tooltips are dead for the rest of
+    /// the process after one transient upstream hiccup. Here the session's debt
+    /// is keyed to the popup that ended it, and our popup's own `Done` comes
+    /// back only after every child close that teardown will emit
+    /// ([`ClosingPopup::menus_owed`]) — so what is left over is discarded with
+    /// it. Three sessions, because the damage this pins is precisely a debt that
+    /// outlives its own session.
+    #[tokio::test]
+    async fn a_dropped_menu_create_owes_nothing_past_the_session_that_leaked_it() {
+        use cosmic::Application as _;
+
+        let mut window = Window::default();
+        window.adopt_popup(window::Id::unique());
+
+        // Session 1: a create the runtime silently drops. The ledger cannot
+        // know, so tooltips stay paused for the rest of this session — the
+        // accepted, safe direction.
+        drop(window.update(Message::DropdownSurface(dropdown_create())));
+        assert!(
+            window.dropdown_open(),
+            "counted optimistically, as designed"
+        );
+
+        for session in 2..=3 {
+            // The panel icon ends the session, booking whatever was counted.
+            let ended = window.popup.expect("a session is open");
+            drop(window.update(Message::TogglePopup));
+
+            // Our popup's `Done`, after every child close that teardown emits.
+            drop(window.update(Message::PopupClosed(ended)));
+            assert!(
+                window.closing_popups.is_empty(),
+                "session {session}: the phantom cannot be owed to anyone"
+            );
+
+            // The next session, with a menu that really maps.
+            drop(window.update(Message::TogglePopup));
+            window.adopt_popup(window::Id::unique());
+            drop(window.update(Message::DropdownSurface(dropdown_create())));
+            assert!(window.dropdown_open(), "session {session}: a live menu");
+
+            drop(window.update(Message::PopupClosed(window::Id::unique())));
+            assert!(
+                !window.dropdown_open(),
+                "session {session}: the live menu's close must reach the count, \
+                 not pay off a phantom — tooltips are dead for good otherwise"
+            );
+        }
+    }
+
+    /// Same phantom, ended the other way: a compositor dismissal reaches the
+    /// "ours" row, which has no id to key its menu debt to and can only count
+    /// it. That debt is discarded when the next session's popup id is adopted —
+    /// sound because `…/handlers/shell/xdg_popup.rs::done` queues the whole
+    /// dismissed chain's closes in one call, ahead of the click that opens the
+    /// next popup ([`Window::stale_menu_closes`]).
+    #[tokio::test]
+    async fn a_dismissed_session_owes_no_menu_closes_once_the_next_popup_opens() {
+        use cosmic::Application as _;
+
+        let mut window = Window::default();
+        let ours = window::Id::unique();
+        window.adopt_popup(ours);
+        drop(window.update(Message::DropdownSurface(dropdown_create())));
+
+        // Clicked outside: the compositor `done`s our popup itself.
+        drop(window.update(Message::PopupClosed(ours)));
+        assert_eq!(
+            window.stale_menu_closes, 1,
+            "the menu's close is still owed, anonymously"
+        );
+
+        window.adopt_popup(window::Id::unique());
+        assert_eq!(
+            window.stale_menu_closes, 0,
+            "by now the dismissal's closes have all been delivered"
+        );
+
+        // So the new session's own menu is accounted for exactly.
+        drop(window.update(Message::DropdownSurface(dropdown_create())));
+        assert!(window.dropdown_open());
+        drop(window.update(Message::PopupClosed(window::Id::unique())));
+        assert!(
+            !window.dropdown_open(),
+            "the live close must decrement, not pay off a dead session's debt"
+        );
     }
 
     /// With no menu mapped the tooltip is the topmost popup, so everything it
@@ -4571,13 +4778,16 @@ mod tests {
             "a stale dropdown would pause tooltips for the rest of the session"
         );
         assert_eq!(
-            window.stale_menu_closes, 1,
-            "the menu's `Done` is still owed, and can only be counted"
+            window.stale_menu_closes, 0,
+            "a self-initiated ending keys its menu debt to the popup it closed"
         );
         assert_eq!(
             window.closing_popups,
-            vec![ours],
-            "ours is still owed too, and its id is known"
+            vec![ClosingPopup {
+                id: ours,
+                menus_owed: 1
+            }],
+            "ours is owed by name, its menu's `Done` counted on the same entry"
         );
         assert_eq!(
             emitted(task).await,

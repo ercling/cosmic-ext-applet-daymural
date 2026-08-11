@@ -176,8 +176,12 @@ Bing's UHD images are roughly **5 MB each**. Expect about:
   both in the same grab chain, the applet popup gets destroyed while the menu
   is still mapped, which is the protocol violation. So it is not rare — it is
   close to deterministic for that one interaction — and no tooltip needs to be
-  involved. Dismissing a menu by picking an entry, or by clicking the dropdown
-  button again, is unaffected. Fixing it needs a libcosmic change.
+  involved. Dismissing a menu by **picking an entry** is unaffected: that click
+  lands inside the menu, the widget asks for the menu's own destroy, and the
+  runtime's other code path handles it correctly. Clicking the **dropdown button
+  again** is *not* unaffected — it is a click outside a grabbing popup, so the
+  compositor dismisses the chain exactly as a click anywhere else does, and it
+  can take the applet down the same way. Fixing it needs a libcosmic change.
 - Market is auto-detected, resolution is fixed at UHD, and the download folder
   is fixed at `~/Pictures/BingWallpaper`.
 

@@ -520,10 +520,12 @@ Rules for touching any of this:
   books one owed close per menu that was mapped, plus (on the `TogglePopup`
   path only) our own popup, whose `Done` is still in flight. The two halves are
   **not** interchangeable:
-  - Menus are **anonymous** (`stale_menu_closes: u32`) of necessity — a menu's
-    id is minted inside the widget, so a stale menu close cannot be told from a
-    live one by inspection, only *counted*.
-  - Our own popup is booked **by id** (`closing_popups: Vec<window::Id>`) and
+  - Menus are **anonymous** of necessity — a menu's id is minted inside the
+    widget, so a stale menu close cannot be told from a live one by inspection,
+    only *counted*. Where the ending is keyed the count rides on it
+    (`ClosingPopup::menus_owed`, the `TogglePopup` path); the compositor's
+    "ours" row has no id to key to and uses the bare `stale_menu_closes: u32`.
+  - Our own popup is booked **by id** (`closing_popups: Vec<ClosingPopup>`) and
     settled only by a `PopupClosed` naming it, because its `Done` may never
     come at all: `self.popup` is set inside the create's *settings* closure,
     which libcosmic runs (`…/src/app/cosmic.rs`, the `Action::AppPopup` arm)
@@ -567,8 +569,33 @@ Rules for touching any of this:
   certified exactly that, and it is false. Without the debt those stale closes
   decrement the *new* session to zero with its menu mapped. Paying a debt can
   only withhold a decrement, so the ledger keeps its "biased toward open"
-  safety: an unpaid debt (the upstream create-drop case) pauses tooltips, it
-  never un-pauses them.
+  safety.
+- **But a debt must never outlive the session that booked it.** A menu create
+  the runtime *drops* (deferred while `state.destroyed` is non-empty — which
+  the interlock's own tooltip destroy populates — then abandoned after five
+  30 ms retries; or a `pending_popup` a second deferred create replaces) is
+  counted and never mapped, so no `Done` will ever pay for it. Re-booked
+  unconditionally at every session end, that one phantom unit swallowed the
+  next session's live menu close, was re-booked from the count it stranded, and
+  killed hover tooltips for the rest of the *process*. Each half is therefore
+  bounded, by evidence and never by a heuristic decrement:
+  - `ClosingPopup::menus_owed` **dies with its entry**. Within one teardown
+    upstream emits every child's `Done` before the parent's (`Action::Destroy`
+    collects popup + children, reverses, then iterates `.into_iter().rev()`,
+    `send_event`ing each), so once the booked id comes back, anything still
+    owed is a menu that never mapped. Only the order *inside* that teardown is
+    relied on — never an ordering against the rest of the queue, which is what
+    the debt exists for.
+  - `stale_menu_closes` is **discarded in `adopt_popup`**, i.e. when the next
+    session's popup id is adopted. It is booked only on the compositor path,
+    and there `…/handlers/shell/xdg_popup.rs::done` queues the whole dismissed
+    chain's closes in one call into `sctk_events`, drained into the same
+    channel that carries pointer events — so they precede the click that opens
+    the next popup, which is still two message rounds from adopting an id.
+
+  Tests: `a_dropped_menu_create_owes_nothing_past_the_session_that_leaked_it`,
+  `a_dismissed_session_owes_no_menu_closes_once_the_next_popup_opens`. Don't
+  "simplify" either bound into a plain decrement or a timeout.
 - **`dropdowns_open` is a saturating count, biased toward "open", and only a
   *close* lowers it.** A spurious non-zero only pauses tooltips; a spurious
   zero lets one arm beside a mapped menu. It is a count and not a bool because
@@ -580,7 +607,7 @@ Rules for touching any of this:
   `…/handlers/shell/xdg_popup.rs::done` and the `Action::Destroy` arm), so one
   mapped popup yields at most one `Done`. The create increments; `PopupClosed`
   decrements (unless it settles a debt first — a `closing_popups` entry by id
-  or a `stale_menu_closes` unit — or names our
+  or a `stale_menu_closes` / `menus_owed` unit — or names our
   own popup, which resets) and `TogglePopup` resets; a
   `DestroyPopup` **request deliberately does not**. Both rows publish through
   one `Message::DropdownSurface`, and a widget left with a stale `is_open`
@@ -606,7 +633,13 @@ Rules for touching any of this:
   `window.popup` **before** the menu — the fatal error, with one child and no
   tooltip anywhere. Nothing on our side can prevent it: we never learn the
   menu's id, and `PopupClosed` only reaches us afterwards. The same shape hits
-  a mapped tooltip when our popup is dismissed. (b) The arm→create gap: the
+  a mapped tooltip when our popup is dismissed. **Clicking the dropdown button
+  again while its own menu is open is this path too** — that click is outside a
+  `grab: true` popup, so the compositor dismisses the chain before the widget's
+  `ButtonPressed` arm can emit an ordered destroy (the same premise that keeps
+  `DestroyPopup` from decrementing). Only *picking an entry* is safe: that
+  click lands inside the menu, and the widget's own destroy takes the correct
+  `Action::Destroy` path. (b) The arm→create gap: the
   interlock fires while the tooltip's 100 ms future is still pending, so it is
   a no-op and the future can still map the tooltip after the menu; the widget
   re-checks `is_hovered` at resolution, so only a no-leave activation

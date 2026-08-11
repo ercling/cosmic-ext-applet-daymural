@@ -334,19 +334,23 @@ popup-session debt; see "Post-review revision", "Third review pass" and
 /// `PopupClosed` for an unknown surface (decrement) and our own popup ending
 /// (reset to zero) lower it — never a `DestroyPopup` *request*.
 dropdowns_open: u32,
-/// How many **menu** `PopupClosed` events are still owed by an **ended**
-/// popup session — the anonymous half of the popup-session generation
-/// counter, kept as a debt because `PopupClosed` carries no generation to
-/// compare and a menu's id is minted inside the widget. Settled before
+/// How many **menu** `PopupClosed` events are still owed by a popup session
+/// a **compositor dismissal** ended — the anonymous debt of the "ours" row,
+/// kept as a count because `PopupClosed` carries no generation to compare
+/// and a menu's id is minted inside the widget. Settled before
 /// `dropdowns_open` is touched, so a `Done` delivered after a reopen and a
-/// fresh menu create cannot decrement the new session.
+/// fresh menu create cannot decrement the new session; **discarded when the
+/// next session's popup id is adopted** (see "Ninth review pass").
 stale_menu_closes: u32,
 /// Our own popups whose destroy was requested but whose `PopupClosed` has
-/// not arrived — the *keyed* half of the same debt. By id, not by count,
-/// because a create that never mapped leaves an id whose destroy emits
-/// nothing: an anonymous unit for it would swallow a live menu's close
-/// instead of going unclaimed (see "Fifth review pass").
-closing_popups: Vec<window::Id>,
+/// not arrived — the *keyed* half of the same debt — each carrying the menu
+/// closes that teardown still owes. By id, not by count, because a create
+/// that never mapped leaves an id whose destroy emits nothing: an anonymous
+/// unit for it would swallow a live menu's close instead of going unclaimed
+/// (see "Fifth review pass"). `menus_owed` dies with its entry, which is
+/// what bounds a dropped create's phantom unit to its own session (see
+/// "Ninth review pass").
+closing_popups: Vec<ClosingPopup>, // { id: window::Id, menus_owed: u32 }
 ```
 
 Nothing tracks the tooltip: `destroy_tooltip()` is idempotent, so it is emitted
@@ -405,10 +409,12 @@ revision" and "Third review pass". Current table, with
 | `DropdownSurface` | anything else | forward untouched |
 | `PopupClosed(id)` | `id == tooltip::window_id()` | nothing |
 | `PopupClosed(id)` | `id == self.popup` | clear `self.popup`, `stale_menu_closes += dropdowns_open`, `dropdowns_open = 0`, `destroy_tooltip()` |
-| `PopupClosed(id)` | `id` in `closing_popups` | remove that entry (a popup of ours already taken), `destroy_tooltip()` |
-| `PopupClosed(id)` | any other id, `stale_menu_closes > 0` | `stale_menu_closes -= 1` (a menu close owed by an ended session), `destroy_tooltip()` |
+| `PopupClosed(id)` | `id` in `closing_popups` | remove that entry (a popup of ours already taken) **and discard its `menus_owed`**, `destroy_tooltip()` |
+| `PopupClosed(id)` | any other id, `stale_menu_closes > 0` | `stale_menu_closes -= 1` (a menu close owed by a dismissed session), `destroy_tooltip()` |
+| `PopupClosed(id)` | any other id, some entry owes menus | that entry's `menus_owed -= 1`, `destroy_tooltip()` |
 | `PopupClosed(id)` | any other id, no debt | `dropdowns_open -= 1` (saturating), `destroy_tooltip()` |
-| `TogglePopup` | popup open | `stale_menu_closes += dropdowns_open`, `closing_popups.push(self.popup)`, `dropdowns_open = 0`, then destroy that popup |
+| `TogglePopup` | popup open | `closing_popups.push(ClosingPopup { id: self.popup, menus_owed: dropdowns_open })`, `dropdowns_open = 0`, then destroy that popup |
+| create settings closure | `adopt_popup(new_id)` | `stale_menu_closes = 0` (a new session), book any displaced id with `menus_owed: 0` |
 
 <details><summary>Superseded three-flag table (as implemented in Tasks 1-5)</summary>
 
@@ -910,6 +916,61 @@ which upstream then really destroys, `Done` and all.
   toggles, two closures, then the displaced popup's close must not touch the
   live menu) and `a_displaced_popup_leaves_its_menus_counted`.
 
+### Ninth review pass (2026-08-11) — a debt that outlived its session
+
+MAJOR, found independently by two reviewers and **confirmed**: a single menu
+create the runtime *drops* left permanent debt, and after it hover tooltips
+inside the popup were dead until the applet restarted.
+
+Mechanism. `dropdowns_open` is incremented optimistically on the create, but a
+create can be abandoned upstream: `…/wayland/event_loop/state.rs` defers it
+while `state.destroyed` is non-empty (the interlock's own tooltip destroy is
+what populates it, cleared only when the main thread returns
+`Action::Dropped`), retries five times at 30 ms, then drops it — and a second
+deferred create *replaces* `pending_popup` with no timer of its own. The
+phantom unit that leaves behind was then re-booked as an owed menu close when
+the session ended (`stale_menu_closes += dropdowns_open`, both on `TogglePopup`
+and on the "ours" row), and nothing ever discarded a debt — only paid it, one
+unit at a time. So the next session's *live* menu close paid the phantom
+instead of decrementing, that session ended with the count at one and no menu
+mapped, and the cycle re-booked itself forever.
+
+The failure direction is the safe one (tooltips suppressed, never armed beside
+a live sibling), which is why it was MAJOR and not CRITICAL — and why the fix
+had to bound the damage **without** ever granting a decrement while a menu may
+be mapped. Both bounds below are evidence, not heuristics:
+
+- **Self-initiated ending (`TogglePopup`).** The menu debt now rides on the
+  closing popup's own entry (`ClosingPopup { id, menus_owed }`) instead of a
+  global counter, and dies with it. Sound because one teardown emits its
+  children's `Done`s *before* the parent's: `Action::Destroy` collects popup +
+  children into `to_destroy`, reverses, then iterates `.into_iter().rev()`,
+  `send_event`ing each in turn into one channel. When the id we booked comes
+  back, every close that teardown will ever emit has already been delivered, so
+  a unit still owed is a menu that never mapped. (Only the order *within* that
+  teardown is relied on — never an ordering against the rest of the queue,
+  which is precisely what the debt exists for; the fourth pass' interleaving
+  test still holds.)
+- **Compositor dismissal (the "ours" row).** No id to key it to, so the count
+  stays — and is discarded when the next session's popup id is adopted
+  (`adopt_popup`). Sound because that path is *not* async with respect to later
+  input: `…/handlers/shell/xdg_popup.rs::done` pushes a `Done` for the whole
+  dismissed chain into `self.sctk_events` in one call, and the sctk thread
+  drains that vec into the same `events_sender` that carries pointer events
+  (`…/wayland/event_loop/mod.rs`), so the chain's closes are queued ahead of
+  the click that opens the next popup — which is still two message rounds from
+  adopting an id.
+
+- Tests `a_dropped_menu_create_owes_nothing_past_the_session_that_leaked_it`
+  (three sessions, because the damage being pinned is *outliving* a session)
+  and `a_dismissed_session_owes_no_menu_closes_once_the_next_popup_opens`. Both
+  fail against the pre-fix arithmetic.
+
+Also this pass, and unrelated to the ledger: the README/soak claim that
+"clicking the dropdown button again" is unaffected was wrong — see
+**Post-Completion**, where it is now listed as an expected residual-path-(a)
+hit rather than something ours to explain.
+
 ## Post-Completion
 
 *Items requiring manual intervention or external systems - no checkboxes,
@@ -929,13 +990,24 @@ informational only*
   — the baseline is 11 hits, the last two on 2026-08-10 at 18:13:02 and
   18:18:02.
 - If an error *does* appear, note which surface id it names **and which of the
-  steps above produced it** before concluding the fix failed. In particular,
-  "dismiss a dropdown by clicking outside it" is expected to keep failing: it
-  is residual path (a), an upstream destroy-order bug that needs neither a
-  tooltip nor a second child, so a hit there is a *confirmation* of the
-  analysis and not a regression of the ledger. A hit on any of the other
-  steps — tooltip interleavings, selecting an entry, clicking the dropdown
-  button again, closing the popup by the panel icon — is ours to explain.
+  steps above produced it** before concluding the fix failed. Two of the steps
+  are expected to keep failing, both being residual path (a) — an upstream
+  destroy-order bug that needs neither a tooltip nor a second child, so a hit
+  there is a *confirmation* of the analysis and not a regression of the ledger:
+  - "dismiss a dropdown by clicking outside it";
+  - **clicking the dropdown button again while its own menu is open** — that
+    click is *also* outside a `grab: true` popup, so the compositor dismisses
+    the chain before the widget's own `ButtonPressed` arm can emit an ordered
+    destroy. (This is the same premise the ledger relies on elsewhere: grab-loss
+    dismissal never reaches that arm, which is why `DestroyPopup` must not
+    decrement — see `a_stale_destroy_after_a_create_leaves_the_menu_recorded`.
+    An earlier revision of this plan and of `README.md` called this interaction
+    unaffected; it is not, and a hit there must not be misattributed to the
+    ledger.)
+
+  A hit on any of the other steps — tooltip interleavings, selecting an entry
+  (that click lands *inside* the menu, so the widget's own destroy is what
+  runs), closing the popup by the panel icon — is ours to explain.
 - Soak for a day of normal use and re-check; the crash was intermittent
   (roughly one per few hours of interaction), so one clean session is not proof.
 - Corroborating signals, not acceptance criteria: no duplicated/overlapping
