@@ -513,15 +513,31 @@ Rules for touching any of this:
   longer match it. Every child dies with our popup, so both that path and the
   "ours" row of `on_popup_closed` reset the count to zero; the
   by-elimination row *decrements* instead.
-- **A popup session's late closes are booked as a debt
-  (`stale_popup_closes`), and paid before the live count is touched.** This is
-  the popup-session generation counter, kept as a debt because `PopupClosed`
-  carries no generation to compare: its payload is a bare `window::Id` handed
-  to us by `on_close_requested`, and a menu's id is minted inside the widget,
-  so a stale close cannot be told from a live one by inspection — only
-  *counted*. Ending a session books one owed close per menu that was mapped,
-  plus (on the `TogglePopup` path only) one for our own popup, whose `Done` is
-  still in flight. **Delivery genuinely is asynchronous** — measured against
+- **A popup session's late closes are booked as a debt, and paid before the
+  live count is touched.** This is the popup-session generation counter, kept
+  as a debt because `PopupClosed` carries no generation to compare: its payload
+  is a bare `window::Id` handed to us by `on_close_requested`. Ending a session
+  books one owed close per menu that was mapped, plus (on the `TogglePopup`
+  path only) our own popup, whose `Done` is still in flight. The two halves are
+  **not** interchangeable:
+  - Menus are **anonymous** (`stale_menu_closes: u32`) of necessity — a menu's
+    id is minted inside the widget, so a stale menu close cannot be told from a
+    live one by inspection, only *counted*.
+  - Our own popup is booked **by id** (`closing_popups: Vec<window::Id>`) and
+    settled only by a `PopupClosed` naming it, because its `Done` may never
+    come at all: `self.popup` is set inside the create's *settings* closure,
+    which libcosmic runs (`…/src/app/cosmic.rs`, the `Action::AppPopup` arm)
+    before the sctk thread is asked for the surface, and a create that then
+    fails — or is dropped after five 30 ms deferrals — is only logged, leaving
+    an id nothing ever mapped; destroying such an id logs `"No popup to
+    destroy"` and emits nothing. An **anonymous** unit for that popup would
+    therefore never be paid by its own `Done` and would swallow the next live
+    menu's close instead, stranding `dropdowns_open` at one with no menu
+    mapped. Don't "simplify" the two halves into one counter. Unclaimed
+    entries are never evicted either: evicting one hands its `Done` back to the
+    by-elimination row, which is the un-pausing direction.
+
+  **Delivery genuinely is asynchronous** — measured against
   the pinned rev, a self-initiated destroy travels `update()` → `Task` → the
   event queue → `run_action` → `PlatformSpecific::send_action` → a
   `calloop::channel::Sender` → **a separate `std::thread`** running the sctk
@@ -547,7 +563,8 @@ Rules for touching any of this:
   every popup torn down is removed from `self.popups` first (both
   `…/handlers/shell/xdg_popup.rs::done` and the `Action::Destroy` arm), so one
   mapped popup yields at most one `Done`. The create increments; `PopupClosed`
-  decrements (unless it settles a `stale_popup_closes` debt first, or names our
+  decrements (unless it settles a debt first — a `closing_popups` entry by id
+  or a `stale_menu_closes` unit — or names our
   own popup, which resets) and `TogglePopup` resets; a
   `DestroyPopup` **request deliberately does not**. Both rows publish through
   one `Message::DropdownSurface`, and a widget left with a stale `is_open`

@@ -241,8 +241,10 @@ three-flag ledger, which the review passes replaced by the single saturating
    dropdown menus believed to be mapped (`dropdown_open() == (dropdowns_open >
    0)`), maintained from the surface actions the two widgets route through us
    plus the `PopupClosed` notifications the compositor sends for every popup —
-   and, since the fourth review pass, `stale_popup_closes`, the closes an
-   *ended* popup session still owes (see "Fourth review pass").
+   and, since the fourth review pass, the closes an *ended* popup session
+   still owes — `stale_menu_closes` for its menus and `closing_popups` for our
+   own popup, split by id-knowability in the fifth pass (see "Fourth review
+   pass" and "Fifth review pass").
 2. **Interlock.** A dropdown create chains a tooltip destroy **first**, ahead
    of forwarding the create — that instant is the last moment a tooltip is
    legally topmost. Unconditional: `destroy_tooltip()` is a no-op when no
@@ -332,12 +334,19 @@ popup-session debt; see "Post-review revision", "Third review pass" and
 /// `PopupClosed` for an unknown surface (decrement) and our own popup ending
 /// (reset to zero) lower it — never a `DestroyPopup` *request*.
 dropdowns_open: u32,
-/// How many `PopupClosed` events are still owed by an **ended** popup
-/// session — the popup-session generation counter, kept as a debt because
-/// `PopupClosed` carries no generation to compare. Settled before
+/// How many **menu** `PopupClosed` events are still owed by an **ended**
+/// popup session — the anonymous half of the popup-session generation
+/// counter, kept as a debt because `PopupClosed` carries no generation to
+/// compare and a menu's id is minted inside the widget. Settled before
 /// `dropdowns_open` is touched, so a `Done` delivered after a reopen and a
 /// fresh menu create cannot decrement the new session.
-stale_popup_closes: u32,
+stale_menu_closes: u32,
+/// Our own popups whose destroy was requested but whose `PopupClosed` has
+/// not arrived — the *keyed* half of the same debt. By id, not by count,
+/// because a create that never mapped leaves an id whose destroy emits
+/// nothing: an anonymous unit for it would swallow a live menu's close
+/// instead of going unclaimed (see "Fifth review pass").
+closing_popups: Vec<window::Id>,
 ```
 
 Nothing tracks the tooltip: `destroy_tooltip()` is idempotent, so it is emitted
@@ -395,10 +404,11 @@ revision" and "Third review pass". Current table, with
 | `DropdownSurface` | `DestroyPopup(_)` | forward, then chain `destroy_tooltip()` — **ledger untouched** (see the second review revision) |
 | `DropdownSurface` | anything else | forward untouched |
 | `PopupClosed(id)` | `id == tooltip::window_id()` | nothing |
-| `PopupClosed(id)` | `id == self.popup` | clear `self.popup`, `stale_popup_closes += dropdowns_open`, `dropdowns_open = 0`, `destroy_tooltip()` |
-| `PopupClosed(id)` | any other id, `stale_popup_closes > 0` | `stale_popup_closes -= 1` (a close owed by an ended session), `destroy_tooltip()` |
+| `PopupClosed(id)` | `id == self.popup` | clear `self.popup`, `stale_menu_closes += dropdowns_open`, `dropdowns_open = 0`, `destroy_tooltip()` |
+| `PopupClosed(id)` | `id` in `closing_popups` | remove that entry (a popup of ours already taken), `destroy_tooltip()` |
+| `PopupClosed(id)` | any other id, `stale_menu_closes > 0` | `stale_menu_closes -= 1` (a menu close owed by an ended session), `destroy_tooltip()` |
 | `PopupClosed(id)` | any other id, no debt | `dropdowns_open -= 1` (saturating), `destroy_tooltip()` |
-| `TogglePopup` | popup open | `stale_popup_closes += dropdowns_open + 1`, `dropdowns_open = 0`, then destroy `self.popup` |
+| `TogglePopup` | popup open | `stale_menu_closes += dropdowns_open`, `closing_popups.push(self.popup)`, `dropdowns_open = 0`, then destroy that popup |
 
 <details><summary>Superseded three-flag table (as implemented in Tasks 1-5)</summary>
 
@@ -807,7 +817,8 @@ frame). With a bare saturating count those two stale `Done`s decrement the
 sibling, the two-children state the whole branch forbids.
 
 - **Fix: a popup-session generation counter, kept as a debt
-  (`Window::stale_popup_closes`).** The project's other generation counters
+  (`Window::stale_menu_closes`, plus `Window::closing_popups` after the fifth
+  pass).** The project's other generation counters
   (`timer_generation`, `shuffle_generation`, `accent_generation`) stamp their
   own message and drop a stale tick; `PopupClosed` cannot — its payload is a
   bare `window::Id` from libcosmic's `on_close_requested`, and a menu's id is
@@ -823,6 +834,41 @@ sibling, the two-children state the whole branch forbids.
   drives exactly the disputed interleaving (menu → `TogglePopup` → reopen →
   menu → both stale `Done`s) and asserts the live menu is still recorded.
   Mutation-verified: disabling the debt branch fails it.
+
+### Fifth review pass (2026-08-11) — the debt for *our* popup is keyed by id
+
+The same external reviewer then scrutinised the debt itself: `TogglePopup`
+booked our own popup's future close as an **anonymous** unit even though that
+popup's id is known, and if the destroy turns out to be a no-op no `Done` ever
+pays it — the stale unit is then consumed by an unrelated *live* menu close.
+The premise checks out at the pinned rev:
+
+| fact | file (pinned rev) |
+|---|---|
+| `self.popup` is set inside the create's *settings* closure, which libcosmic runs **before** the surface is requested (`let settings = settings(&mut self.app);` then `self.get_popup(..)`) | `src/app/cosmic.rs`, the `crate::surface::Action::AppPopup` arm |
+| a failed create is only logged, leaving `self.popup` naming nothing (`Err(err) => log::error!("Failed to create popup. {err:?}")`) | `…/wayland/event_loop/state.rs`, the `popup::Action::Popup` arm |
+| a create deferred behind a parent mismatch is **dropped** after five 30 ms retries — same outcome | same arm, the `calloop` `Timer` with `attempt < 5` |
+| destroying an id nothing mapped emits nothing at all (`None => { log::info!("No popup to destroy"); return Ok(()); }`) | same file, the `popup::Action::Destroy` arm |
+
+So the never-paid unit is reachable, and its cost is `dropdowns_open` stuck at
+one with no menu mapped: tooltips paused for the rest of the popup session.
+That is the *safe* failure direction (stuck suppression, never un-pausing
+beside a live menu), which is why this was a MAJOR and not a CRITICAL — but the
+fix costs nothing and removes it.
+
+- **Fix: split the debt by id-knowability.** `stale_menu_closes: u32` keeps the
+  anonymous menu units (a menu's id is minted inside the widget and is
+  genuinely unobservable), and `closing_popups: Vec<window::Id>` holds our own
+  popups, settled only by a `PopupClosed` naming them. An unclaimed entry is
+  simply never claimed — it consumes nothing.
+- No entry is ever evicted. Evicting a stale one would hand its `Done` back to
+  the by-elimination row, i.e. trade a benign stuck suppression for a possible
+  decrement beside a live menu — the direction this ledger refuses. The cost of
+  keeping it is one `u64` per create that never mapped.
+- Test `a_popup_that_never_mapped_owes_a_debt_no_live_close_can_pay` drives it:
+  a phantom popup id → `TogglePopup` → reopen → menu → the menu's close, which
+  must un-pause tooltips while the phantom's entry stays outstanding.
+  Mutation-verified: booking the popup anonymously again fails it.
 
 ## Post-Completion
 
