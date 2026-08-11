@@ -627,6 +627,65 @@ impl Window {
         destroy_tooltip()
     }
 
+    /// Adopt a freshly minted popup id as `self.popup`, booking any id it
+    /// **displaces** into [`Window::closing_popups`]. The create's *settings*
+    /// closure ([`Message::TogglePopup`]) is the only place `self.popup` is
+    /// ever set, and it goes through here.
+    ///
+    /// Normally it displaces nothing: `TogglePopup` only reaches its create
+    /// branch with `self.popup == None`. But that branch is decided in
+    /// `update()` and the closure runs a whole message round later, so the two
+    /// are not one step. Verified against the pinned rev:
+    ///
+    /// - libcosmic's `update` helper drains **every** queued message before
+    ///   running any of the resulting actions (`iced/winit/src/lib.rs`, `for
+    ///   message in messages.drain(..)` collecting into `actions`, run only
+    ///   after the loop);
+    /// - the create *is* one of those actions — `surface_task` is
+    ///   `crate::task::message(..)`, i.e. an `Action::Output` that `run_action`
+    ///   pushes back onto `messages`, and only the `Action::AppPopup` arm of
+    ///   the next round (`…/src/app/cosmic.rs`: `let settings =
+    ///   settings(&mut self.app);`) runs this closure.
+    ///
+    /// So two panel clicks landing in one drain (an input burst, or one stalled
+    /// frame — the same window that makes late `Done`s possible) both see
+    /// `self.popup == None`, both take the create branch, and the second
+    /// closure lands on the id the first one just set.
+    ///
+    /// The displaced popup is not stale bookkeeping — upstream really destroys
+    /// it. A create whose parent is not the topmost popup takes the
+    /// `parent_mismatch` path and destroys everything above it
+    /// (`…/wayland/event_loop/state.rs`), and that destroy sends a
+    /// `PopupEvent::Done` for every popup it tears down. Left unbooked, that
+    /// `Done` names an id `self.popup` no longer holds and falls through to the
+    /// by-elimination row of [`Window::on_popup_closed`], decrementing a
+    /// *newer* session's live menu count — zero with a menu still mapped, i.e.
+    /// a tooltip armed beside a live sibling, which is the two-children state
+    /// this whole ledger exists to forbid.
+    ///
+    /// `dropdowns_open` is deliberately **not** reset here, unlike the
+    /// `TogglePopup` path: nothing is subtracted, so any menu the displaced
+    /// popup takes with it is still counted and is paid off by its own `Done`
+    /// through the by-elimination row. The arithmetic stays exact with no
+    /// anonymous debt, and the count never dips below the number of mapped
+    /// menus — resetting it would be the un-pausing direction.
+    fn adopt_popup(&mut self, new_id: window::Id) {
+        if let Some(displaced) = self.popup.replace(new_id) {
+            // By id, like the `TogglePopup` path and for the same reason: this
+            // popup may never have mapped at all (see
+            // [`Window::closing_popups`]), and an anonymous unit for it would
+            // swallow a live menu's close instead of sitting unclaimed. It
+            // cannot already be booked — the only other writer of `self.popup`
+            // clears it in the same step that books it, and ids are unique.
+            self.closing_popups.push(displaced);
+            tracing::debug!(
+                "popup create displaced an earlier popup, booked by name (dropdowns open: {}, popups closing: {})",
+                self.dropdowns_open,
+                self.closing_popups.len()
+            );
+        }
+    }
+
     /// A surface action published by the tooltip widget, run through the popup
     /// ledger on its way to the runtime.
     ///
@@ -2302,7 +2361,12 @@ impl cosmic::Application for Window {
                     |_: &Window| Default::default(),
                     |window: &mut Window| {
                         let new_id = window::Id::unique();
-                        window.popup.replace(new_id);
+                        // Never a bare `replace`: a second toggle drained in
+                        // the same round reaches this closure with `self.popup`
+                        // already set, and the id it overwrites is a popup
+                        // upstream is about to destroy — see
+                        // [`Window::adopt_popup`].
+                        window.adopt_popup(new_id);
 
                         window.core.applet.get_popup_settings(
                             window.core.main_window_id().unwrap(),
@@ -4180,6 +4244,88 @@ mod tests {
             vec![phantom],
             "the unpayable debt is still outstanding, and cost nothing"
         );
+    }
+
+    /// The create-side twin of the late-close hazard: `TogglePopup` decides its
+    /// branch in `update()`, but the popup id is minted a message round later,
+    /// in the create's settings closure. libcosmic drains *every* queued
+    /// message before running any of the actions they produced
+    /// (`iced/winit/src/lib.rs`), and the create is one of those actions, so
+    /// two panel clicks in one drain both see `self.popup == None` and both
+    /// open. The second closure then displaces the first popup — which upstream
+    /// destroys for real (the `parent_mismatch` path), announcing a `Done`.
+    /// Unbooked, that `Done` would be charged to the live count by elimination.
+    #[tokio::test]
+    async fn a_second_toggle_in_one_drain_books_the_popup_it_displaces() {
+        use cosmic::Application as _;
+
+        let mut window = Window::default();
+
+        drop(window.update(Message::TogglePopup));
+        drop(window.update(Message::TogglePopup));
+        assert_eq!(
+            window.popup, None,
+            "both toggles take the create branch: no closure has run yet"
+        );
+
+        // Both settings closures, back to back, as the next round runs them.
+        let first = window::Id::unique();
+        let second = window::Id::unique();
+        window.adopt_popup(first);
+        window.adopt_popup(second);
+
+        assert_eq!(window.popup, Some(second), "the later create wins");
+        assert_eq!(
+            window.closing_popups,
+            vec![first],
+            "the displaced popup is owed by name, not dropped on the floor"
+        );
+
+        // A menu opened in the surviving popup, and only then does upstream's
+        // parent-mismatch destroy of the displaced popup come back.
+        drop(window.update(Message::DropdownSurface(dropdown_create())));
+        assert_eq!(window.dropdowns_open, 1, "the live session's menu");
+
+        drop(window.update(Message::PopupClosed(first)));
+
+        assert!(
+            window.dropdown_open(),
+            "the displaced popup's close must not decrement a live menu"
+        );
+        assert!(window.closing_popups.is_empty(), "the debt is settled");
+    }
+
+    /// A displacement does **not** reset the menu count, unlike `TogglePopup`.
+    /// Nothing is subtracted, so a menu that dies with the displaced popup is
+    /// still counted and is paid for by its own `Done` through the
+    /// by-elimination row — exact arithmetic, no anonymous debt, and the count
+    /// never dips below the number of mapped menus.
+    #[tokio::test]
+    async fn a_displaced_popup_leaves_its_menus_counted() {
+        use cosmic::Application as _;
+
+        let mut window = Window::default();
+        let first = window::Id::unique();
+        window.popup = Some(first);
+        drop(window.update(Message::DropdownSurface(dropdown_create())));
+        assert_eq!(window.dropdowns_open, 1, "a menu is up under the first");
+
+        window.adopt_popup(window::Id::unique());
+        assert_eq!(
+            window.dropdowns_open, 1,
+            "the menu is still mapped and still owes its close"
+        );
+        assert_eq!(
+            window.stale_menu_closes, 0,
+            "nothing was subtracted, so nothing is owed anonymously"
+        );
+
+        // The menu dies with the popup it hung under; its own close pays for
+        // it, and the displaced popup's close settles the keyed debt.
+        drop(window.update(Message::PopupClosed(window::Id::unique())));
+        assert!(!window.dropdown_open(), "every menu is accounted for");
+        drop(window.update(Message::PopupClosed(first)));
+        assert!(window.closing_popups.is_empty(), "and so is the popup");
     }
 
     /// The disputed interleaving, settled against the pinned libcosmic rev and

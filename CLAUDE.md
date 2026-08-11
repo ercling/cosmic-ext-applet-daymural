@@ -536,6 +536,22 @@ Rules for touching any of this:
     mapped. Don't "simplify" the two halves into one counter. Unclaimed
     entries are never evicted either: evicting one hands its `Done` back to the
     by-elimination row, which is the un-pausing direction.
+  - A create that **displaces** an already-set `self.popup` books it the same
+    way (`Window::adopt_popup` — the create's settings closure never does a
+    bare `self.popup.replace`). `TogglePopup` decides its create branch in
+    `update()`, but the id is minted a message round later: libcosmic drains
+    *every* queued message before running the actions they produced
+    (`iced/winit/src/lib.rs`), and the create is one of those actions
+    (`surface_task` is `crate::task::message`, so it re-enters as a message
+    and only the next round's `Action::AppPopup` arm runs the closure). Two
+    panel clicks in one drain therefore both open. Upstream then destroys the
+    displaced popup for real — a create whose parent is not the topmost popup
+    takes the `parent_mismatch` path (`…/wayland/event_loop/state.rs`) and
+    destroys everything above it, `Done` included — so an unbooked id lands on
+    the by-elimination row and decrements a *newer* session's live menu count.
+    The count is deliberately **not** reset on a displacement (unlike the
+    `TogglePopup` path): nothing is subtracted, so the displaced popup's menus
+    stay counted and pair with their own closes.
 
   **Delivery genuinely is asynchronous** — measured against
   the pinned rev, a self-initiated destroy travels `update()` → `Task` → the

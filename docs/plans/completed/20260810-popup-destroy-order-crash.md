@@ -870,6 +870,46 @@ fix costs nothing and removes it.
   must un-pause tooltips while the phantom's entry stays outstanding.
   Mutation-verified: booking the popup anonymously again fails it.
 
+### Sixth review pass (2026-08-11) — the create that displaces a live popup
+
+CRITICAL, and **confirmed**: the create's settings closure did
+`window.popup.replace(new_id)` and dropped whatever it overwrote on the floor
+— unbooked, so the displaced popup's later `Done` fell through to the
+by-elimination row and could decrement a *newer* session's live menu count to
+zero with its menu mapped. That is the un-pausing direction, i.e. the crash
+class this branch exists to prevent.
+
+The reachability question ("can the create branch run with `self.popup` already
+`Some`?") is what the previous rounds left unasked. At the pinned rev it can,
+because deciding the branch and minting the id are a message round apart:
+
+| fact | file (pinned rev) |
+|---|---|
+| every queued message is drained *before* any of the resulting actions runs (`for message in messages.drain(..)` collects into `actions`; the `for action in actions` loop comes after) | `iced/winit/src/lib.rs`, `fn update` + its call sites |
+| the create is itself one of those actions — `surface_task` is `crate::task::message(..)`, an immediately-ready future, so `run_action`'s `Action::Output(message) => messages.push(message)` re-queues it | `src/surface/mod.rs`, `src/task.rs`, `iced/winit/src/lib.rs` |
+| only the next round's `AppPopup` arm runs the closure (`let settings = settings(&mut self.app);`) | `src/app/cosmic.rs` |
+| a create whose parent is not the topmost popup destroys everything above it (`parent_mismatch`) and defers itself | `…/wayland/event_loop/state.rs`, the `popup::Action::Popup` arm |
+| that destroy sends a `PopupEvent::Done` per torn-down popup | same file, the `popup::Action::Destroy` arm's `for popup in to_destroy.into_iter().rev()` loop |
+
+So two panel clicks landing in one drain (an input burst or one stalled frame —
+the same window that makes late `Done`s possible) both see `self.popup == None`,
+both take the create branch, and the second closure displaces the first popup —
+which upstream then really destroys, `Done` and all.
+
+- **Fix: `Window::adopt_popup`.** The closure never does a bare `replace`; the
+  displaced id is booked into `closing_popups`, the same keyed debt
+  `TogglePopup` uses and for the same reason (the displaced popup may never
+  have mapped, so an anonymous unit would swallow a live menu's close).
+- **`dropdowns_open` is deliberately left alone** on a displacement, unlike the
+  `TogglePopup` path. Nothing is subtracted, so a menu that dies with the
+  displaced popup is still counted and is paid for by its own `Done` through
+  the by-elimination row — exact arithmetic, no anonymous debt, and the count
+  never dips below the number of mapped menus. Resetting it to zero would be
+  the un-pausing direction.
+- Tests `a_second_toggle_in_one_drain_books_the_popup_it_displaces` (two
+  toggles, two closures, then the displaced popup's close must not touch the
+  live menu) and `a_displaced_popup_leaves_its_menus_counted`.
+
 ## Post-Completion
 
 *Items requiring manual intervention or external systems - no checkboxes,
