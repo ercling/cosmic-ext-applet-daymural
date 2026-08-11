@@ -240,7 +240,9 @@ three-flag ledger, which the review passes replaced by the single saturating
 1. **Ledger.** `Window` tracks `dropdowns_open`, a saturating count of the
    dropdown menus believed to be mapped (`dropdown_open() == (dropdowns_open >
    0)`), maintained from the surface actions the two widgets route through us
-   plus the `PopupClosed` notifications the compositor sends for every popup.
+   plus the `PopupClosed` notifications the compositor sends for every popup —
+   and, since the fourth review pass, `stale_popup_closes`, the closes an
+   *ended* popup session still owes (see "Fourth review pass").
 2. **Interlock.** A dropdown create chains a tooltip destroy **first**, ahead
    of forwarding the create — that instant is the last moment a tooltip is
    legally topmost. Unconditional: `destroy_tooltip()` is a no-op when no
@@ -317,8 +319,9 @@ child, and the runtime's own descent handles it. `TogglePopup` keeps destroying
 ### New `Window` state (`src/app.rs`)
 
 **Revised 2026-08-11 after review** — the three fields below the line were
-replaced by a single saturating count; see "Post-review revision" and "Third
-review pass". What shipped:
+replaced by a single saturating count, joined in the fourth pass by the
+popup-session debt; see "Post-review revision", "Third review pass" and
+"Fourth review pass". What shipped:
 
 ```rust
 /// How many dropdown menu popups are believed to be mapped — the whole
@@ -329,6 +332,12 @@ review pass". What shipped:
 /// `PopupClosed` for an unknown surface (decrement) and our own popup ending
 /// (reset to zero) lower it — never a `DestroyPopup` *request*.
 dropdowns_open: u32,
+/// How many `PopupClosed` events are still owed by an **ended** popup
+/// session — the popup-session generation counter, kept as a debt because
+/// `PopupClosed` carries no generation to compare. Settled before
+/// `dropdowns_open` is touched, so a `Done` delivered after a reopen and a
+/// fresh menu create cannot decrement the new session.
+stale_popup_closes: u32,
 ```
 
 Nothing tracks the tooltip: `destroy_tooltip()` is idempotent, so it is emitted
@@ -386,9 +395,10 @@ revision" and "Third review pass". Current table, with
 | `DropdownSurface` | `DestroyPopup(_)` | forward, then chain `destroy_tooltip()` — **ledger untouched** (see the second review revision) |
 | `DropdownSurface` | anything else | forward untouched |
 | `PopupClosed(id)` | `id == tooltip::window_id()` | nothing |
-| `PopupClosed(id)` | `id == self.popup` | clear `self.popup`, `dropdowns_open = 0`, `destroy_tooltip()` |
-| `PopupClosed(id)` | any other id | `dropdowns_open -= 1` (saturating), `destroy_tooltip()` |
-| `TogglePopup` | popup open | `dropdowns_open = 0`, then destroy `self.popup` |
+| `PopupClosed(id)` | `id == self.popup` | clear `self.popup`, `stale_popup_closes += dropdowns_open`, `dropdowns_open = 0`, `destroy_tooltip()` |
+| `PopupClosed(id)` | any other id, `stale_popup_closes > 0` | `stale_popup_closes -= 1` (a close owed by an ended session), `destroy_tooltip()` |
+| `PopupClosed(id)` | any other id, no debt | `dropdowns_open -= 1` (saturating), `destroy_tooltip()` |
+| `TogglePopup` | popup open | `stale_popup_closes += dropdowns_open + 1`, `dropdowns_open = 0`, then destroy `self.popup` |
 
 <details><summary>Superseded three-flag table (as implemented in Tasks 1-5)</summary>
 
@@ -768,6 +778,51 @@ real remedy is repointing the rev-pinned libcosmic dependency at a fork
 carrying the one-line `to_destroy.reverse()`, which was judged out of scope for
 a review-fix pass — see "Residual paths" above and the upstream-report item
 below.
+
+### Fourth review pass (2026-08-11) — the delivery-timing question, settled
+
+An external reviewer (codex) disputed the one thing the third pass's fix rested
+on: that a `Done` for a popup **we** destroyed cannot outlive a reopen plus a
+new menu create. The previous round had certified it with "`TogglePopup`'s
+destroy is handled locally in `state.rs` and pushes the `Done` synchronously".
+Traced end to end against the pinned rev
+(`~/.cargo/git/checkouts/libcosmic-41009aea1d72760b/8a017a1`), **that premise is
+false**, and this is the record so it is not re-litigated a fourth time:
+
+| step | file (pinned rev) |
+|---|---|
+| `update()` returns the destroy `Task`; its `Action` is queued on the runtime's event channel | `iced/winit/src/lib.rs` (`run_instance`'s `event_receiver`) |
+| `run_action` → `PlatformSpecific::send_action` → `send_wayland` | `iced/winit/src/lib.rs:2612`, `…/platform_specific/mod.rs`, `…/wayland/mod.rs:142` |
+| handed to a `calloop::channel::Sender<Action>` consumed by **a separate `std::thread`** running the sctk event loop | `…/wayland/event_loop/mod.rs:81-120` (`SctkEventLoop::new` → `std::thread::spawn`) |
+| the `Action::Destroy` arm tears the popup and its child down and calls `send_event` per popup | `…/wayland/event_loop/state.rs` (`Destroy` arm, `for popup in to_destroy.into_iter().rev()`) |
+| `send_event` pushes onto an unbounded `Control` mpsc and wakes the proxy | `…/wayland/event_loop/state.rs:2138-2146` |
+| the main thread forwards `Control::PlatformSpecific` back onto the same event channel `update()` is driven from | `iced/winit/src/lib.rs:566-569` |
+
+Four queue hops and a thread boundary. Nothing sequences those `Done`s ahead of
+messages already sitting in the event channel behind the destroy `Action`, so a
+reopen and a fresh menu create *can* be processed first — they only have to be
+queued when the closing click is handled (an input burst, or one stalled
+frame). With a bare saturating count those two stale `Done`s decrement the
+**new** session to zero with its menu mapped: tooltips un-paused beside a live
+sibling, the two-children state the whole branch forbids.
+
+- **Fix: a popup-session generation counter, kept as a debt
+  (`Window::stale_popup_closes`).** The project's other generation counters
+  (`timer_generation`, `shuffle_generation`, `accent_generation`) stamp their
+  own message and drop a stale tick; `PopupClosed` cannot — its payload is a
+  bare `window::Id` from libcosmic's `on_close_requested`, and a menu's id is
+  minted inside the widget. What *is* knowable is how many closes the ended
+  session still owes, so ending a session books one per mapped menu (plus, on
+  the `TogglePopup` path, one for our own popup, whose `Done` is still in
+  flight) and `on_popup_closed` settles the debt before it touches the live
+  count.
+- Safety direction is unchanged: paying a debt can only *withhold* a decrement,
+  so the ledger stays biased toward "open" — an unpaid debt (the upstream
+  create-drop case) pauses tooltips, it never un-pauses them.
+- Test `late_closes_from_an_ended_session_never_decrement_a_reopened_one`
+  drives exactly the disputed interleaving (menu → `TogglePopup` → reopen →
+  menu → both stale `Done`s) and asserts the live menu is still recorded.
+  Mutation-verified: disabling the debt branch fails it.
 
 ## Post-Completion
 

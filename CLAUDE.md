@@ -512,8 +512,31 @@ Rules for touching any of this:
   because it comes *late*, after `self.popup.take()`, so the "ours" row can no
   longer match it. Every child dies with our popup, so both that path and the
   "ours" row of `on_popup_closed` reset the count to zero; the
-  by-elimination row *decrements* instead, and the saturating floor is what
-  makes a late id for a popup already gone harmless.
+  by-elimination row *decrements* instead.
+- **A popup session's late closes are booked as a debt
+  (`stale_popup_closes`), and paid before the live count is touched.** This is
+  the popup-session generation counter, kept as a debt because `PopupClosed`
+  carries no generation to compare: its payload is a bare `window::Id` handed
+  to us by `on_close_requested`, and a menu's id is minted inside the widget,
+  so a stale close cannot be told from a live one by inspection — only
+  *counted*. Ending a session books one owed close per menu that was mapped,
+  plus (on the `TogglePopup` path only) one for our own popup, whose `Done` is
+  still in flight. **Delivery genuinely is asynchronous** — measured against
+  the pinned rev, a self-initiated destroy travels `update()` → `Task` → the
+  event queue → `run_action` → `PlatformSpecific::send_action` → a
+  `calloop::channel::Sender` → **a separate `std::thread`** running the sctk
+  event loop (`…/wayland/event_loop/mod.rs`, `SctkEventLoop::new` spawns it) →
+  the `Action::Destroy` arm → `send_event` → an unbounded `Control` channel →
+  back onto that same event queue. Four queue hops and a thread boundary, so a
+  reopen *and* a fresh menu create can be processed before the `Done`s land
+  (they need only be queued behind the closing click — an input burst, or one
+  stalled frame). Do **not** write "the destroy is handled locally in
+  `state.rs` and pushes its `Done` synchronously" — an earlier review round
+  certified exactly that, and it is false. Without the debt those stale closes
+  decrement the *new* session to zero with its menu mapped. Paying a debt can
+  only withhold a decrement, so the ledger keeps its "biased toward open"
+  safety: an unpaid debt (the upstream create-drop case) pauses tooltips, it
+  never un-pauses them.
 - **`dropdowns_open` is a saturating count, biased toward "open", and only a
   *close* lowers it.** A spurious non-zero only pauses tooltips; a spurious
   zero lets one arm beside a mapped menu. It is a count and not a bool because
@@ -524,7 +547,8 @@ Rules for touching any of this:
   every popup torn down is removed from `self.popups` first (both
   `…/handlers/shell/xdg_popup.rs::done` and the `Action::Destroy` arm), so one
   mapped popup yields at most one `Done`. The create increments; `PopupClosed`
-  decrements (or resets, for our own popup) and `TogglePopup` resets; a
+  decrements (unless it settles a `stale_popup_closes` debt first, or names our
+  own popup, which resets) and `TogglePopup` resets; a
   `DestroyPopup` **request deliberately does not**. Both rows publish through
   one `Message::DropdownSurface`, and a widget left with a stale `is_open`
   (grab-loss dismissal never reaches its `ButtonPressed` arm, and `iced`'s

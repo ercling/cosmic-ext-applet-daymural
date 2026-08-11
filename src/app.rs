@@ -96,7 +96,8 @@ pub struct Window {
     ///
     /// **Only three things lower it**, all of which are evidence that a menu is
     /// really gone: a `PopupClosed` for an unknown surface decrements
-    /// ([`Window::on_popup_closed`]), and our own popup ending — its
+    /// ([`Window::on_popup_closed`]) *unless it is owed to an ended session*
+    /// (see [`Window::stale_popup_closes`]), and our own popup ending — its
     /// `PopupClosed` or [`Message::TogglePopup`] — resets it to zero, since
     /// every child dies with it. A `DestroyPopup` *request* deliberately does
     /// not — the two rows share one message and a widget left with a stale
@@ -107,6 +108,44 @@ pub struct Window {
     /// no `Done`, so leaving the count alone here is exactly right; a real
     /// destroy is announced back as `PopupClosed`.
     dropdowns_open: u32,
+    /// How many `PopupClosed` events are still **owed by an ended popup
+    /// session** — the popup-session generation counter, kept as a debt
+    /// because the event carries no generation to compare.
+    ///
+    /// The other generation counters in this file (`timer_generation`,
+    /// `shuffle_generation`, `accent_generation`) can stamp their own message
+    /// and drop a tick whose stamp is stale. `PopupClosed` cannot: its payload
+    /// is a bare `window::Id` handed to us by libcosmic's `on_close_requested`,
+    /// and a dropdown menu's id is minted inside the widget, so a stale close
+    /// is indistinguishable from a live one by inspection. What *is* knowable
+    /// is how many closes the ended session still has outstanding, and that is
+    /// this count: each one is paid off before [`Window::dropdowns_open`] —
+    /// which belongs to the *current* session — is touched.
+    ///
+    /// **The delivery really is asynchronous, so this is not theoretical.**
+    /// Verified against the pinned libcosmic rev, a self-initiated destroy
+    /// travels: `update()` → `Task` → the runtime's event queue →
+    /// `run_action` → `PlatformSpecific::send_action` → a
+    /// `calloop::channel::Sender` → **a separate `std::thread`** running the
+    /// sctk event loop (`…/platform_specific/wayland/event_loop/mod.rs`,
+    /// `SctkEventLoop::new` spawns it) → the `Action::Destroy` arm in
+    /// `…/event_loop/state.rs`, which pushes a `PopupEventVariant::Done` per
+    /// torn-down popup through `send_event` → an unbounded `Control` channel →
+    /// back onto the same event queue `update()` is driven from. Four queue
+    /// hops and a thread boundary: nothing sequences those `Done`s ahead of
+    /// messages already queued behind the destroy, so a reopen plus a fresh
+    /// menu create *can* be processed first (they only need to be sitting in
+    /// the queue when the closing click is handled — an input burst, or one
+    /// stalled frame). Without this debt the stale `Done`s would decrement the
+    /// **new** session's menu count to zero with its menu mapped, un-pausing
+    /// tooltips beside a live sibling — the two-children state the whole
+    /// invariant forbids.
+    ///
+    /// Paying a debt can only *withhold* a decrement, so the ledger stays
+    /// biased toward "open" (see [`Window::dropdowns_open`]): a debt that is
+    /// never paid — the upstream create-drop case, where the `Done` we counted
+    /// on never comes — only pauses tooltips, never un-pauses them.
+    stale_popup_closes: u32,
     /// Applet settings (shuffle, retention). Defaults when the config context
     /// is unavailable.
     pub(crate) config: AppletConfig,
@@ -491,22 +530,38 @@ impl Window {
         }
         if self.popup == Some(id) {
             // Our popup takes every child with it, so the count goes to zero
-            // whatever it held.
+            // whatever it held — but each of those children still owes a
+            // `Done` (the compositor `done`s the whole grab chain), and those
+            // belong to the session that just ended, not to the next one.
             self.popup = None;
+            self.stale_popup_closes = self.stale_popup_closes.saturating_add(self.dropdowns_open);
             self.dropdowns_open = 0;
-            tracing::debug!("popup closed: our own popup (dropdowns open: 0)");
+            tracing::debug!(
+                "popup closed: our own popup (dropdowns open: 0, closes owed: {})",
+                self.stale_popup_closes
+            );
+        } else if self.stale_popup_closes > 0 {
+            // A close owed by an ended popup session — see the field doc for
+            // why it can land here long after the session was reset, and after
+            // a fresh popup and menu were opened. It says nothing about the
+            // menus of the *current* session, so pay the debt and leave the
+            // live count alone.
+            self.stale_popup_closes -= 1;
+            tracing::debug!(
+                "popup closed: owed by an ended session (dropdowns open: {}, closes owed: {})",
+                self.dropdowns_open,
+                self.stale_popup_closes
+            );
         } else {
-            // By elimination: a dropdown menu. Its window id is minted inside
-            // the widget (`window::Id::unique()` into private state) and is
-            // never visible to us at creation. A *stale* id lands here too —
-            // the `Done` for a popup `TogglePopup` already took out of
-            // `self.popup`, or one for a menu that had already closed — so
-            // this is a *decrement*, not a clear: a `Done` that arrives after
-            // a newer create still belongs to the create it pairs with, and
-            // clearing would leave the count at zero with that newer menu
-            // mapped. The saturating floor is what makes the misclassified
-            // ids harmless — an extra close can never push the ledger below
-            // "nothing open".
+            // By elimination: a dropdown menu of the current session. Its
+            // window id is minted inside the widget (`window::Id::unique()`
+            // into private state) and is never visible to us at creation, so
+            // there is nothing to match on. This is a *decrement*, not a
+            // clear: a `Done` that arrives after a newer create still belongs
+            // to the create it pairs with, and clearing would leave the count
+            // at zero with that newer menu mapped. The saturating floor keeps
+            // any remaining misclassification harmless — an extra close can
+            // never push the ledger below "nothing open".
             self.dropdowns_open = self.dropdowns_open.saturating_sub(1);
             tracing::debug!(
                 "popup closed: a dropdown menu (dropdowns open: {})",
@@ -2115,6 +2170,7 @@ impl cosmic::Application for Window {
             core,
             popup: None,
             dropdowns_open: 0,
+            stale_popup_closes: 0,
             config,
             config_context,
             catalogue,
@@ -2163,12 +2219,25 @@ impl cosmic::Application for Window {
                 if let Some(popup_id) = self.popup.take() {
                     // The runtime *does* announce this destroy back to us
                     // (`PopupEvent::Done` → [`Message::PopupClosed`], see
-                    // [`Window::on_popup_closed`]), but only asynchronously,
-                    // and by then the id no longer matches `self.popup`. So
-                    // the ledger is reset here rather than left to a row that
-                    // can no longer fire: a stale count would pause every
-                    // tooltip for the rest of the session. Zero, not a
-                    // decrement — every child dies with our popup.
+                    // [`Window::on_popup_closed`]), but only asynchronously —
+                    // across a thread and four queues — and by then the id no
+                    // longer matches `self.popup`. So the ledger is reset here
+                    // rather than left to a row that can no longer fire: a
+                    // stale count would pause every tooltip for the rest of
+                    // the session. Zero, not a decrement — every child dies
+                    // with our popup.
+                    //
+                    // Those late closes are then owed to *this* session, not
+                    // the next one: one per menu that was mapped, plus one for
+                    // our own popup (the `Action::Destroy` arm emits a `Done`
+                    // for every popup it tears down, this one included). See
+                    // [`Window::stale_popup_closes`] — without the debt they
+                    // would decrement a reopened session's count with its menu
+                    // still up.
+                    self.stale_popup_closes = self
+                        .stale_popup_closes
+                        .saturating_add(self.dropdowns_open)
+                        .saturating_add(1);
                     self.dropdowns_open = 0;
                     return cosmic::surface::surface_task(cosmic::surface::action::destroy_popup(
                         popup_id,
@@ -3892,6 +3961,10 @@ mod tests {
 
         assert_eq!(window.popup, None);
         assert!(!window.dropdown_open());
+        assert_eq!(
+            window.stale_popup_closes, 1,
+            "the menu still owes a `Done`; our popup's is this very event"
+        );
         assert_eq!(emitted(task).await, vec![Emitted::DestroyTooltip]);
     }
 
@@ -3974,7 +4047,9 @@ mod tests {
     /// The stale-id case the by-elimination rule cannot distinguish: the
     /// `Done` for a popup `TogglePopup` already took out of `self.popup`
     /// arrives later and is read as a menu. Harmless because `TogglePopup`
-    /// already reset the count and the decrement saturates at zero.
+    /// booked it as a close owed by the session it ended
+    /// ([`Window::stale_popup_closes`]), so it is paid off rather than
+    /// charged to the live count.
     #[tokio::test]
     async fn a_late_close_for_a_popup_we_already_took_is_harmless() {
         use cosmic::Application as _;
@@ -3984,12 +4059,65 @@ mod tests {
         window.popup = Some(ours);
         drop(window.update(Message::TogglePopup));
         assert_eq!(window.popup, None, "taken before the destroy is emitted");
+        assert_eq!(window.stale_popup_closes, 1, "our popup still owes its own");
 
         let task = window.update(Message::PopupClosed(ours));
 
         assert_eq!(window.popup, None);
         assert!(!window.dropdown_open());
+        assert_eq!(window.stale_popup_closes, 0, "the debt is settled");
         assert_eq!(emitted(task).await, vec![Emitted::DestroyTooltip]);
+    }
+
+    /// The disputed interleaving, settled against the pinned libcosmic rev and
+    /// pinned here so it is not re-litigated: a self-initiated destroy's
+    /// `Done`s are delivered across a thread and four queues
+    /// ([`Window::stale_popup_closes`] carries the trace), so a reopen *and* a
+    /// fresh menu create can be processed before they land. Those late closes
+    /// belong to the session that ended, and must not decrement the new one —
+    /// a zeroed count with a menu mapped un-pauses tooltips beside a live
+    /// sibling, which is exactly the two-children state the branch exists to
+    /// forbid.
+    #[tokio::test]
+    async fn late_closes_from_an_ended_session_never_decrement_a_reopened_one() {
+        use cosmic::Application as _;
+
+        let mut window = Window::default();
+        let first = window::Id::unique();
+        window.popup = Some(first);
+        drop(window.update(Message::DropdownSurface(dropdown_create())));
+        assert_eq!(
+            window.dropdowns_open, 1,
+            "a menu is up in the first session"
+        );
+
+        // Panel icon clicked: our popup and its menu are torn down, and each
+        // owes a `Done` that has not been delivered yet.
+        drop(window.update(Message::TogglePopup));
+        assert_eq!(window.stale_popup_closes, 2, "the menu's and our popup's");
+
+        // Reopened and a new menu opened, all before those `Done`s are
+        // drained. The open branch's popup id is minted inside the runtime's
+        // closure, which tests never run, so it is set here.
+        drop(window.update(Message::TogglePopup));
+        window.popup = Some(window::Id::unique());
+        drop(window.update(Message::DropdownSurface(dropdown_create())));
+        assert_eq!(window.dropdowns_open, 1, "the second session's menu");
+
+        // Now the first session's two `Done`s arrive: the menu's (an id we
+        // never saw) and our old popup's (an id `self.popup` no longer holds).
+        drop(window.update(Message::PopupClosed(window::Id::unique())));
+        drop(window.update(Message::PopupClosed(first)));
+
+        assert!(
+            window.dropdown_open(),
+            "the live menu is still mapped, so tooltips stay paused"
+        );
+        assert_eq!(window.stale_popup_closes, 0, "both debts settled");
+
+        // And the live menu's own close still lands normally.
+        drop(window.update(Message::PopupClosed(window::Id::unique())));
+        assert!(!window.dropdown_open(), "now every menu is accounted for");
     }
 
     /// With no menu mapped the tooltip is the topmost popup, so everything it
@@ -4163,7 +4291,8 @@ mod tests {
     /// Clicking the panel icon closes our popup with an explicit destroy. The
     /// runtime *does* announce that back as `PopupClosed`, but asynchronously
     /// and with an id `self.popup` no longer holds, so the ledger is cleared
-    /// on the spot — a stale count would pause every later tooltip.
+    /// on the spot — a stale count would pause every later tooltip — and the
+    /// closes still in flight are booked as owed by the ended session.
     #[tokio::test]
     async fn closing_our_own_popup_clears_the_ledger() {
         use cosmic::Application as _;
@@ -4178,6 +4307,10 @@ mod tests {
         assert!(
             !window.dropdown_open(),
             "a stale dropdown would pause tooltips for the rest of the session"
+        );
+        assert_eq!(
+            window.stale_popup_closes, 2,
+            "the menu's `Done` and our popup's are both still owed"
         );
         assert_eq!(
             emitted(task).await,
