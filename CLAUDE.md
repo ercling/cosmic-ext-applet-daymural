@@ -450,10 +450,18 @@ actionable rule — verified against the pinned rev:
   `DestroyPopup` it emits when it *closes* — we can never destroy a menu
   ourselves, so no ordering function can be written.
 
-With one child the runtime's own descent is already correct. The invariant is
-held by **one bit** on `Window` (`dropdown_open`) plus one idempotent task —
-see `Window::on_tooltip_surface`, `on_dropdown_surface`, `on_popup_closed` and
-the free `destroy_tooltip` in `app.rs`:
+With one child the runtime's own descent is already correct. **Scope, so this
+is not over-read:** the invariant governs the destroys *we* emit. It does not
+and cannot cover compositor-initiated dismissal, which is an independent
+upstream destroy-order bug that trips with a single child — see residual path
+(a) below, and read it before blaming this ledger for any `xdg_popup` error.
+On the create side upstream is partly self-healing already (a create whose
+requested parent is not the last entry of `self.popups` destroys everything
+above it, topmost-first, then retries — `state.rs`, `parent_mismatch`), so the
+ledger's real job is the destroys and the ordering, not the creates. The
+invariant is held by **one bit** on `Window` (`dropdown_open`) plus one
+idempotent task — see `Window::on_tooltip_surface`, `on_dropdown_surface`,
+`on_popup_closed` and the free `destroy_tooltip` in `app.rs`:
 
 - **`destroy_tooltip()` is idempotent** — the runtime's `Destroy` arm logs
   `"No popup to destroy"` and returns *before touching state* for an unmapped
@@ -503,25 +511,40 @@ Rules for touching any of this:
   longer match it. Both `on_popup_closed` branches (ours / by-elimination) end
   in the same clear-and-sweep, which is what makes that misclassification —
   and a stale id for any popup already gone — harmless.
-- **`dropdown_open` is one bool, biased toward `true`.** A spurious `true` only
-  pauses tooltips; a spurious `false` lets one arm beside a mapped menu. It
-  cannot count two menus, so a create and a destroy from the *two different*
-  rows landing in one pass (create first) can end with the bit clear while a
-  menu is mapped; recovery is upstream's own, since a popup create destroys
-  everything above its requested parent (`state.rs`, `parent_mismatch`).
+- **`dropdown_open` is one bool, biased toward `true`, and only a *close*
+  clears it.** A spurious `true` only pauses tooltips; a spurious `false` lets
+  one arm beside a mapped menu. The create sets it; `PopupClosed` and
+  `TogglePopup` clear it; a `DestroyPopup` **request deliberately does not**.
+  Both rows publish through one `Message::DropdownSurface`, and a widget left
+  with a stale `is_open` (grab-loss dismissal never reaches its `ButtonPressed`
+  arm, and `iced`'s `Row::update` hands the event to *every* child regardless
+  of `capture_event`) emits a destroy for an already-dead popup in the same
+  pass as the *other* row's create — clearing on the request would end that
+  pass with the bit false and a menu mapped. A stale destroy is a runtime
+  no-op, so it emits no `Done`; a real one always does. Don't "simplify" this
+  back into the destroy arm.
 - **Residual paths, not closed by this work — don't read either as a
-  regression.** (a) Compositor-initiated dismissal is out of reach:
-  `…/handlers/shell/xdg_popup.rs::done` walks only *up* the parent chain and
-  never collects children, and our popup has `grab: true` while the tooltip has
-  `grab: false` (so it is outside the grab chain). A click outside can still
-  make the compositor destroy the parent with the tooltip mapped, and
-  `PopupClosed` only reaches us afterwards — this is the **most likely** cause
-  of the reported error, not a leftover. (b) The arm→create gap: the interlock
-  fires while the tooltip's 100 ms future is still pending, so it is a no-op
-  and the future can still map the tooltip after the menu; the widget re-checks
-  `is_hovered` at resolution, so only a no-leave activation (touch/keyboard)
-  survives. If a protocol error reappears, note **which surface id** it names
-  before concluding the ledger broke.
+  regression.** (a) **Compositor-initiated dismissal is an upstream
+  destroy-order bug, and it needs no second child.**
+  `…/handlers/shell/xdg_popup.rs::done` builds `to_destroy` by walking *up*
+  from the dismissed popup (`[dismissed, parent, …]`, breaking at a
+  layer-surface/window parent — it never collects children) and then iterates
+  `.into_iter().rev()`, i.e. **ancestor first**. It is missing the
+  `to_destroy.reverse()` that `state.rs`'s `Action::Destroy` arm has between
+  its up-walk and its down-walk, and each `SctkPopup` dropped in that loop
+  destroys its `xdg_popup` (sctk's `impl Drop for PopupInner`), so the wire
+  order is inverted. A dropdown menu has `grab: true` and so does our popup, so
+  clicking outside an open menu `popup_done`s the chain and libcosmic destroys
+  `window.popup` **before** the menu — the fatal error, with one child and no
+  tooltip anywhere. Nothing on our side can prevent it: we never learn the
+  menu's id, and `PopupClosed` only reaches us afterwards. The same shape hits
+  a mapped tooltip when our popup is dismissed. (b) The arm→create gap: the
+  interlock fires while the tooltip's 100 ms future is still pending, so it is
+  a no-op and the future can still map the tooltip after the menu; the widget
+  re-checks `is_hovered` at resolution, so only a no-leave activation
+  (touch/keyboard) survives. If a protocol error reappears, note **which
+  surface id** it names before concluding the ledger broke — a crash right
+  after clicking outside an open dropdown is (a), not us.
 
 Disabled icon buttons: the theme's own disabled styling is a **no-op** for
 `Button::Icon` — `on_disabled` differs from `on` in alpha only, and the SVG

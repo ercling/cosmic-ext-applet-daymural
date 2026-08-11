@@ -161,13 +161,22 @@ Bing's UHD images are roughly **5 MB each**. Expect about:
   home is no obstacle — and hands the bytes to the unprivileged greeter over
   D-Bus. Under any other display manager (GDM, SDDM, …) the login screen keeps
   its own background and nothing the applet does can reach it.
-- **A popup dismissed by the compositor while a tooltip is visible can still
-  kill the applet** (`xdg_popup was destroyed while it was not the topmost
-  popup`; the panel then restarts it). The applet keeps at most one popup open
-  under its own popup so it never destroys them out of order itself, but this
-  path is inside libcosmic: when the compositor dismisses the popup — a click
-  outside it — the runtime tears the parent down without collecting the tooltip
-  child, and we are only told afterwards. Rare, and self-recovering.
+- **Clicking outside an open dropdown menu can still kill the applet**
+  (`xdg_popup was destroyed while it was not the topmost popup`; the panel then
+  restarts it, so nothing is lost but the open popup). The applet keeps at most
+  one popup open under its own popup and orders every destroy it emits, so it
+  never gets this wrong itself — but the dismissal path is entirely inside
+  libcosmic. When the compositor dismisses a popup chain, the runtime collects
+  the dismissed popup *and its ancestors* and then destroys them in the wrong
+  direction, ancestor first
+  (`iced/winit/src/platform_specific/wayland/handlers/shell/xdg_popup.rs`'s
+  `done`, which is missing the `to_destroy.reverse()` its sibling code path
+  in `event_loop/state.rs` has). Since a dropdown menu and the applet popup are
+  both in the same grab chain, the applet popup gets destroyed while the menu
+  is still mapped, which is the protocol violation. So it is not rare — it is
+  close to deterministic for that one interaction — and no tooltip needs to be
+  involved. Dismissing a menu by picking an entry, or by clicking the dropdown
+  button again, is unaffected. Fixing it needs a libcosmic change.
 - Market is auto-detected, resolution is fixed at UHD, and the download folder
   is fixed at `~/Pictures/BingWallpaper`.
 

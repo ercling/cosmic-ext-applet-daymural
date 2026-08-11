@@ -85,8 +85,18 @@ pub struct Window {
     /// state the invariant forbids. It is set optimistically on the create,
     /// which the runtime can still drop (it retries a deferred create five
     /// times at 30 ms and then gives up, and `get_popup` failures only log);
-    /// tooltips then stay paused until the next thing that clears the bit —
-    /// clicking the dropdown again, a `PopupClosed`, or closing the popup.
+    /// tooltips then stay paused until the next thing that clears the bit.
+    ///
+    /// **Only two things clear it**, both of which are evidence that a menu is
+    /// really gone: a `PopupClosed` ([`Window::on_popup_closed`]) and closing
+    /// our own popup ([`Message::TogglePopup`]). A `DestroyPopup` *request*
+    /// deliberately does not — the two rows share one message and a widget
+    /// left with a stale `is_open` (grab-loss dismissal never reaches its
+    /// `ButtonPressed` arm, and `Row::update` dispatches to every child
+    /// regardless of `capture_event`) emits a destroy for a popup that is
+    /// already gone, in the same pass as the *other* row's create. That
+    /// no-op destroy produces no `Done`, so leaving the bit alone here is
+    /// exactly right; a real destroy is announced back as `PopupClosed`.
     pub(crate) dropdown_open: bool,
     /// Applet settings (shuffle, retention). Defaults when the config context
     /// is unavailable.
@@ -479,10 +489,10 @@ impl Window {
         }
         self.dropdown_open = false;
         // Our popup dying does *not* take a mapped tooltip with it on the
-        // compositor path (`…/handlers/shell/xdg_popup.rs::done` walks only up
-        // the parent chain), so the orphan is cleaned up here; on the
-        // self-initiated path it is already gone and this is the documented
-        // no-op.
+        // compositor path (`…/handlers/shell/xdg_popup.rs::done` collects the
+        // dismissed popup's *ancestors* and no children), so the orphan is
+        // cleaned up here; on the self-initiated path it is already gone and
+        // this is the documented no-op.
         destroy_tooltip()
     }
 
@@ -540,8 +550,16 @@ impl Window {
                 before = destroy_tooltip();
             }
             cosmic::surface::Action::DestroyPopup(_) => {
-                tracing::debug!("dropdown destroyed");
-                self.dropdown_open = false;
+                // The bit is deliberately *not* cleared here — see the field's
+                // doc. Both rows publish through this one message, and a row
+                // whose widget kept a stale `is_open` (grab loss dismisses the
+                // menu without ever reaching its `ButtonPressed` arm) emits a
+                // destroy for an already-dead popup in the same pass as the
+                // other row's create; clearing here would leave the bit false
+                // with a menu mapped, which is the state the invariant
+                // forbids. A destroy that really tears a menu down comes back
+                // as `PopupClosed`, and that is what clears it.
+                tracing::debug!("dropdown destroy forwarded");
                 // Ordered after the menu's own destroy: only then is a tooltip
                 // topmost again. Unconditional, so it also collects a tooltip
                 // whose destroy was dropped while the menu was up.
@@ -3827,9 +3845,10 @@ mod tests {
     /// possibly-orphaned tooltip is swept.
     ///
     /// The sweep is for the compositor path — `…/handlers/shell/xdg_popup.rs`'s
-    /// `done` walks only *up* the parent chain, so a mapped tooltip is left in
-    /// the runtime's list with a dead parent. On the self-initiated path the
-    /// runtime already took it and the destroy is the documented no-op.
+    /// `done` collects the dismissed popup's *ancestors* and no children, so a
+    /// mapped tooltip is left in the runtime's list with a dead parent. On the
+    /// self-initiated path the runtime already took it and the destroy is the
+    /// documented no-op.
     #[tokio::test]
     async fn popup_closed_for_our_popup_clears_the_ledger_and_sweeps_the_tooltip() {
         use cosmic::Application as _;
@@ -4015,6 +4034,10 @@ mod tests {
     /// The menu's own destroy: forwarded first, then the tooltip sweep — only
     /// once the menu is gone is a tooltip beneath it topmost again. This is
     /// what makes dropping a tooltip destroy during the menu safe.
+    ///
+    /// The bit stays set: a destroy *request* is not evidence the menu died
+    /// (see the field doc). `PopupClosed` is what clears it, and the runtime
+    /// sends one for every popup this destroy really tears down.
     #[tokio::test]
     async fn a_dropdown_destroy_sweeps_the_tooltip_afterwards() {
         use cosmic::Application as _;
@@ -4025,11 +4048,51 @@ mod tests {
 
         let task = window.update(Message::DropdownSurface(dropdown_destroy()));
 
-        assert!(!window.dropdown_open);
+        assert!(
+            window.dropdown_open,
+            "the request is not the close; `PopupClosed` clears the bit"
+        );
         assert_eq!(
             emitted(task).await,
             vec![Emitted::DestroyOther, Emitted::DestroyTooltip],
             "the menu goes first; only then is the tooltip topmost"
+        );
+    }
+
+    /// The two-rows regression: both dropdowns publish through one
+    /// `DropdownSurface`, and `Row::update` hands the same `ButtonPressed` to
+    /// every child regardless of `capture_event`. A row whose widget kept a
+    /// stale `is_open` — grab-loss dismissal destroys the menu without ever
+    /// reaching that widget's `ButtonPressed` arm, so nothing resets it —
+    /// therefore emits a destroy for an already-dead popup in the *same* pass
+    /// as the other row's create, and tree order (interval before retention in
+    /// `view.rs`) puts the create first. Clearing the bit on the destroy would
+    /// end that pass with a menu mapped and tooltips un-paused, which is the
+    /// two-children state the invariant forbids.
+    #[tokio::test]
+    async fn a_stale_destroy_after_a_create_leaves_the_menu_recorded() {
+        use cosmic::Application as _;
+
+        let mut window = Window::default();
+        window.popup = Some(window::Id::unique());
+
+        let task = window.update(Message::DropdownSurface(dropdown_create()));
+        assert_eq!(
+            emitted(task).await,
+            vec![Emitted::DestroyTooltip, Emitted::Create]
+        );
+
+        // The other row's stale destroy, same pass. A runtime no-op ("No popup
+        // to destroy"), so it produces no `Done` and must not move the ledger.
+        let task = window.update(Message::DropdownSurface(dropdown_destroy()));
+        assert_eq!(
+            emitted(task).await,
+            vec![Emitted::DestroyOther, Emitted::DestroyTooltip]
+        );
+
+        assert!(
+            window.dropdown_open,
+            "the menu the create mapped is still up, so tooltips stay paused"
         );
     }
 
@@ -4089,6 +4152,12 @@ mod tests {
             vec![Emitted::DestroyOther, Emitted::DestroyTooltip],
             "the dropped destroy is re-emitted once it is legal"
         );
+        assert!(window.dropdown_open, "the request is not yet the close");
+
+        // The runtime announces the teardown, and only that re-opens the
+        // tooltip window.
+        let task = window.update(Message::PopupClosed(window::Id::unique()));
+        assert_eq!(emitted(task).await, vec![Emitted::DestroyTooltip]);
         assert!(!window.dropdown_open);
     }
 

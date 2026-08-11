@@ -774,7 +774,9 @@ mod tests {
     ///
     /// Driven through the ledger rather than by poking `dropdown_open`, so it
     /// asserts the wiring from the menu's own surface actions to the view, not
-    /// the field's own value.
+    /// the field's own value. Note which event re-opens the window: the
+    /// menu's `PopupClosed`, not its destroy *request* — a request can be a
+    /// stale no-op from the other row (see `app.rs`'s field doc).
     #[test]
     fn a_tooltip_is_suppressed_exactly_while_a_dropdown_is_open() {
         use cosmic::Application as _;
@@ -790,6 +792,12 @@ mod tests {
         );
 
         drop(window.update(Message::DropdownSurface(dropdown_destroy())));
+        assert!(
+            tooltip_suppressed(&window),
+            "the destroy is only a request; the menu may still be mapped"
+        );
+
+        drop(window.update(Message::PopupClosed(cosmic::iced::window::Id::unique())));
         assert!(
             !tooltip_suppressed(&window),
             "the menu is gone — hovering works again"

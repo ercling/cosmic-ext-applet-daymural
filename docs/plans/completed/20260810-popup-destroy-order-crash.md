@@ -72,27 +72,58 @@ dropdown sits above it. All tooltip call sites share one `WINDOW_ID`
 
 ### Residual paths, not closed by this plan
 
-> **Read this before interpreting the soak.** Review (2026-08-11) established
-> that the runtime *already* refuses to map two children: on any popup create
-> `state.rs` computes `parent_mismatch` from the last entry of `self.popups`
-> and, on mismatch, legally destroys every popup above the requested parent
-> (topmost-first) before retrying the create 30 ms later. So the two-children
-> state this plan targets is hard to reach from the *create* side, and the
-> failure that actually matches the reported error is a **live child at
-> parent-destroy time** — path (a) below. It is the more likely cause of the
-> eleven journal hits, not a leftover. A reappearing error is therefore not
-> evidence that the ledger broke.
+> **Read this before interpreting the soak.** Review (2026-08-11, second
+> pass) established two things that change how a reappearing error must be
+> read.
+>
+> First, the runtime *already* refuses to map two children: on any popup
+> create `state.rs` computes `parent_mismatch` from the last entry of
+> `self.popups` and, on mismatch, legally destroys every popup above the
+> requested parent (topmost-first) before retrying the create 30 ms later. So
+> the two-children state this plan targets is hard to reach from the *create*
+> side.
+>
+> Second — and this is the correction that matters — path (a) below is **not
+> tooltip-specific and needs no second child at all**. It is an upstream
+> destroy-*order* bug that fires on the ordinary "dismiss a dropdown by
+> clicking outside it" interaction (item 4 of the soak list). The soak is
+> therefore expected to still reproduce the error on that one step, and doing
+> so is **not** evidence that the ledger broke. What the ledger is answerable
+> for is the *other* steps: tooltip + menu interleavings, and any destroy this
+> applet emits itself.
 
-**(a) Compositor-initiated dismissal** is outside our reach.
+**(a) Compositor-initiated dismissal** is outside our reach, and is an
+upstream destroy-order bug.
 `iced/winit/src/platform_specific/wayland/handlers/shell/xdg_popup.rs::done`
-walks **up** the parent chain (`PopupParent::Popup`) and breaks at a
-layer-surface/window parent — it never collects children. Our applet popup has
-`grab: true`, the tooltip `grab: false` (so it is not in the grab chain), so a
-click outside can make the compositor dismiss the parent while the tooltip
-child is mapped, and `PopupClosed` only reaches us *after* the destroy.
-Maintaining the single-child invariant narrows this (the tooltip is short-lived
-and self-destroys on leave) but does not eliminate it. If the soak still shows
-protocol errors, note **which** surface id they name before concluding the fix
+builds `to_destroy` by walking **up** the parent chain (`PopupParent::Popup`),
+breaking at a layer-surface/window parent — it never collects children, so
+`to_destroy == [dismissed, parent, grandparent, …]`, deepest first. It then
+iterates `to_destroy.into_iter().rev()`, i.e. **ancestor first**, because it is
+missing the `to_destroy.reverse()` that `event_loop/state.rs`'s
+`Action::Destroy` arm performs between its up-walk and its down-walk. Each
+`SctkPopup` is dropped inside that loop and sctk's
+`impl Drop for PopupInner` (`src/shell/xdg/popup.rs`) calls
+`xdg_popup.destroy()`, so the destroy order on the wire is inverted.
+
+Consequence, with **one** child and no tooltip anywhere: a dropdown menu is
+created with `grab: true` (`src/widget/dropdown/widget.rs`) and our applet
+popup also has `grab: true` (`src/applet/mod.rs`), so both are in one grab
+chain. A click outside makes the compositor `popup_done` the chain, and either
+delivery order breaks:
+
+- `done(menu)` first → `to_destroy = [menu, our_popup]` → `.rev()` destroys
+  **our popup first**, while the menu is still mapped;
+- `done(our_popup)` first → `to_destroy = [our_popup]` (its parent is the panel
+  layer surface, so the walk breaks) → destroys it with the menu child mapped.
+
+Either way: `xdg_popup was destroyed while it was not the topmost popup`. The
+same shape hits a mapped tooltip when our popup is dismissed (the tooltip has
+`grab: false`, so it is not in the grab chain and is simply left orphaned or
+destroyed out of order). Maintaining the single-child invariant narrows the
+tooltip variant (the tooltip is short-lived and self-destroys on leave) but has
+no effect at all on the menu variant. Fixing it needs a libcosmic patch — see
+**Post-Completion**. If the soak shows protocol errors, note **which** surface
+id they name, and what the last interaction was, before concluding the fix
 failed.
 
 **(b) The arm→create gap.** The tooltip's create is produced by a 100 ms
@@ -284,7 +315,7 @@ task; see "Post-review revision". Current table:
 | `TooltipSurface` | anything, `dropdown_open` | **drop it** (no forward, no emission) |
 | `TooltipSurface` | anything, `!dropdown_open` | forward untouched |
 | `DropdownSurface` | `Popup`/`AppPopup` | `dropdown_open = true`; chain `destroy_tooltip()` **before** the forwarded create |
-| `DropdownSurface` | `DestroyPopup(_)` | `dropdown_open = false`; forward, then chain `destroy_tooltip()` |
+| `DropdownSurface` | `DestroyPopup(_)` | forward, then chain `destroy_tooltip()` — **ledger untouched** (see the second review revision) |
 | `DropdownSurface` | anything else | forward untouched |
 | `PopupClosed(id)` | `id == tooltip::window_id()` | nothing |
 | `PopupClosed(id)` | `id == self.popup` | clear `self.popup`, `dropdown_open = false`, `destroy_tooltip()` |
@@ -604,6 +635,37 @@ tooltip call site (it is the thumbnail and the four `nav_button`s); the plan
 inventory and the hardcoded plan path in `CLAUDE.md`; the `README.md` tooltip
 bullet and its "Limitations" section.
 
+### Second review pass (2026-08-11)
+
+A re-check of the revised branch produced three major findings; all three were
+confirmed against the pinned libcosmic rev and acted on.
+
+- **`DestroyPopup` no longer clears `dropdown_open`.** The two dropdown rows
+  share one `Message::DropdownSurface`, and a row whose widget kept a stale
+  `is_open` emits a destroy for an already-dead popup. That is not exotic:
+  grab-loss dismissal is consumed by the compositor, so
+  `widget/dropdown/widget.rs`'s `ButtonPressed` arm never runs and nothing
+  resets `state.is_open` — the applet only ever sees `PopupClosed`, which the
+  widget does not. The next click on the *other* row is then dispatched to
+  both widgets (`iced/widget/src/row.rs`'s `update` iterates every child
+  regardless of `capture_event`), and tree order (interval before retention)
+  publishes the create first and the stale destroy second, ending the pass with
+  the bit clear and a menu mapped — tooltips un-paused beside an open menu,
+  the exact state the invariant forbids. The fix needs no id we cannot
+  observe: a stale destroy is a runtime no-op ("No popup to destroy", before
+  any state mutation) and so emits no `Done`, while every real teardown does,
+  so `PopupClosed` alone owns the clear. The chained post-destroy
+  `destroy_tooltip()` stayed where it was. Regression test:
+  `a_stale_destroy_after_a_create_leaves_the_menu_recorded`.
+- **Residual path (a) was re-characterised** — it is an upstream *destroy
+  order* bug (missing `to_destroy.reverse()` in `xdg_popup.rs::done`) that
+  fires with a single child and no tooltip, not a tooltip-specific rarity. See
+  the rewritten "Residual paths" section above; `CLAUDE.md` and `README.md`
+  were corrected to match, and the soak instructions now say which step is
+  expected to keep failing.
+- **The upstream-report item now names that bug first**, with the one-line fix
+  and a minimal repro, instead of only the two secondary holes.
+
 ## Post-Completion
 
 *Items requiring manual intervention or external systems - no checkboxes,
@@ -622,9 +684,14 @@ informational only*
   `journalctl --user | grep -E 'CosmicBingWallpaper.*(xdg_popup|exited with code 1)'`
   — the baseline is 11 hits, the last two on 2026-08-10 at 18:13:02 and
   18:18:02.
-- If an error *does* appear, note which surface id it names before concluding
-  the fix failed: the compositor-initiated `popup_done` path (see "Residual
-  path" above) is not closed by this work.
+- If an error *does* appear, note which surface id it names **and which of the
+  steps above produced it** before concluding the fix failed. In particular,
+  "dismiss a dropdown by clicking outside it" is expected to keep failing: it
+  is residual path (a), an upstream destroy-order bug that needs neither a
+  tooltip nor a second child, so a hit there is a *confirmation* of the
+  analysis and not a regression of the ledger. A hit on any of the other
+  steps — tooltip interleavings, selecting an entry, clicking the dropdown
+  button again, closing the popup by the panel icon — is ours to explain.
 - Soak for a day of normal use and re-check; the crash was intermittent
   (roughly one per few hours of interaction), so one clean session is not proof.
 - Corroborating signals, not acceptance criteria: no duplicated/overlapping
@@ -634,15 +701,29 @@ informational only*
 
 **External system updates**:
 
-- Consider filing an upstream libcosmic issue covering both holes:
-  `Action::Destroy`
-  (`iced/winit/src/platform_specific/wayland/event_loop/state.rs:1392`)
-  collects one child per level, so a popup with two children destroys the
-  parent while a sibling is mapped; and `xdg_popup.rs::done` walks only up the
-  parent chain, so compositor dismissal has the same hole. Every applet
-  combining a wayland tooltip with a dropdown under one popup is exposed, and
-  `widget::dropdown::popup_dropdown` gives the application no way to close the
-  menu it opened.
+- File an upstream libcosmic issue. **The actionable bug — lead with this
+  one — is a missing `to_destroy.reverse()` in
+  `iced/winit/src/platform_specific/wayland/handlers/shell/xdg_popup.rs`'s
+  `PopupHandler::done`.** It walks *up* the parent chain, so `to_destroy` is
+  `[dismissed, parent, grandparent, …]` (deepest first), and then iterates
+  `.into_iter().rev()` — destroying the **ancestor first**. Dropping each
+  `SctkPopup` calls `xdg_popup.destroy()` through sctk's
+  `impl Drop for PopupInner`, so the wire order is inverted and the client
+  dies with `xdg_popup was destroyed while it was not the topmost popup`. The
+  sibling code path, `Action::Destroy` in
+  `iced/winit/src/platform_specific/wayland/event_loop/state.rs` (~l. 1414),
+  does exactly the right thing: it reverses between the up-walk and the
+  down-walk. The one-line fix is to reverse in `done` too — or simply iterate
+  `to_destroy` forward, since without a down-walk the vector is already
+  deepest-first. Minimal repro: an applet popup (`grab: true`) with a
+  `widget::dropdown::popup_dropdown` menu open (`grab: true`), then click
+  outside — no tooltip and no second child needed.
+  Secondary, worth mentioning in the same issue: `Action::Destroy`'s down-walk
+  collects one child *per level* (`.position(|p| p.data.parent…)`), so a popup
+  with two children destroys the parent while a sibling is still mapped; and
+  `popup_dropdown` gives the application no way to close the menu it opened
+  (the window id is minted inside the widget), so an application cannot even
+  order the destroys itself as a workaround.
 - Unrelated but noticed while investigating, worth reporting to Fedora:
   `/usr/share/cosmic/com.system76.CosmicTheme.Dark.Builder/v2/palette` (from
   `cosmic-config-fedora`) is malformed RON — it opens with `(` instead of the
