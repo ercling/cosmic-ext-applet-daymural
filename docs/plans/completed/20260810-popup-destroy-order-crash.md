@@ -232,6 +232,29 @@ survives, and upstream's `parent_mismatch` cleanup covers even that.
 never be destroyed by us, the fix is to guarantee a tooltip and a dropdown are
 never mapped at the same time. Four rules, backed by a small ledger:
 
+**Revised 2026-08-11 after review** — rules 1 and 4 below described the
+three-flag ledger, which the review passes replaced by the single saturating
+`dropdowns_open` count plus the idempotent `destroy_tooltip()` task (see
+"Post-review revision" and "Third review pass"). Current rules:
+
+1. **Ledger.** `Window` tracks `dropdowns_open`, a saturating count of the
+   dropdown menus believed to be mapped (`dropdown_open() == (dropdowns_open >
+   0)`), maintained from the surface actions the two widgets route through us
+   plus the `PopupClosed` notifications the compositor sends for every popup.
+2. **Interlock.** A dropdown create chains a tooltip destroy **first**, ahead
+   of forwarding the create — that instant is the last moment a tooltip is
+   legally topmost. Unconditional: `destroy_tooltip()` is a no-op when no
+   tooltip is mapped.
+3. **Suppression.** While `dropdown_open()`, the tooltip widget is built with
+   `settings: None` (upstream's `has_popup` shape), so no new tooltip can arm.
+4. **Drop, then re-emit.** *Everything* the tooltip publishes while
+   `dropdown_open()` is dropped, never deferred — a create would map a second
+   child, a destroy would target a non-topmost popup. Nothing is lost: a
+   dropdown destroy and every `PopupClosed` chain `destroy_tooltip()` once the
+   menu is gone.
+
+<details><summary>Superseded three-flag rules (as implemented in Tasks 1-5)</summary>
+
 1. **Ledger.** `Window` tracks `tooltip_open` and `dropdown_open`, maintained
    from the surface actions the two widgets route through us plus the
    `PopupClosed` notifications the compositor sends for every popup.
@@ -242,6 +265,8 @@ never mapped at the same time. Four rules, backed by a small ledger:
    `settings: None` (upstream's `has_popup` shape), so no new tooltip can arm.
 4. **Deferral.** A tooltip destroy arriving while `dropdown_open` is held back
    (it would be non-topmost) and flushed when the dropdown closes.
+
+</details>
 
 There is deliberately **no** `popup_teardown` ordering function and no
 multi-child destroy sequence: with the invariant held there is at most one
@@ -254,6 +279,22 @@ child, and the runtime's own descent handles it. `TogglePopup` keeps destroying
   dropdown destroy, which is impossible (Why it happens, fact 2). Enforcing
   "at most one child" is the only rule that is actually actionable, and it
   makes the runtime's existing single-child descent correct.
+- **Revised 2026-08-11 after review — no tooltip flag at all; tooltip destroys
+  are dropped, then re-emitted.** The two bullets below the line described the
+  three-flag ledger. What shipped: nothing tracks the tooltip, because
+  `destroy_tooltip()` is idempotent by construction — the runtime's
+  `Action::Destroy` arm logs `"No popup to destroy"` and returns *before
+  touching state* for an unmapped id — so it is emitted whenever a tooltip
+  *might* be mapped. That is also why dropping a tooltip destroy while a menu
+  is up strands nothing: the menu's own destroy and every `PopupClosed` chain
+  `destroy_tooltip()` after the menu is gone, which is the old "deferral"
+  collapsed into the destroy's idempotence. A "tooltip open" flag would have to
+  be set on the widget's `Action::Task` (arming, not creation), and five
+  tooltip widgets publishing arm/leave in *widget-tree* order rather than
+  pointer order make such a flag wrong exactly when it matters.
+
+<details><summary>Superseded tooltip-flag decisions (as implemented in Tasks 1-5)</summary>
+
 - **`tooltip_open` means "armed", not "mapped".** The observable signal is
   `Action::Task`, whose future may resolve to `Ignore` (no popup). The flag is
   therefore deliberately biased toward `true`: a false positive costs one
@@ -263,6 +304,9 @@ child, and the runtime's own descent handles it. `TogglePopup` keeps destroying
 - **Tooltip destroys are deferred, never dropped.** Dropping one on a desynced
   flag would strand a mapped tooltip forever. The only suppression is the
   dropdown-open window, and it is always flushed.
+
+</details>
+
 - **Never clone a surface action.** Handlers match by reference and move the
   action into `surface_task`; `Debug` logging by reference is safe.
 - **Not fixed here**: libcosmic's runtime sibling hole and the compositor-side
@@ -271,6 +315,26 @@ child, and the runtime's own descent handles it. `TogglePopup` keeps destroying
 ## Technical Details
 
 ### New `Window` state (`src/app.rs`)
+
+**Revised 2026-08-11 after review** — the three fields below the line were
+replaced by a single saturating count; see "Post-review revision" and "Third
+review pass". What shipped:
+
+```rust
+/// How many dropdown menu popups are believed to be mapped — the whole
+/// popup ledger, read through [`Window::dropdown_open`]. A *count*, not a
+/// bool, because a menu's window id is minted inside the widget and is never
+/// visible here, so a create and a close can only be paired by arithmetic.
+/// Saturating in both directions and biased toward "open". Only a
+/// `PopupClosed` for an unknown surface (decrement) and our own popup ending
+/// (reset to zero) lower it — never a `DestroyPopup` *request*.
+dropdowns_open: u32,
+```
+
+Nothing tracks the tooltip: `destroy_tooltip()` is idempotent, so it is emitted
+whenever a tooltip might be mapped (see the revised Key design decisions).
+
+<details><summary>Superseded three-flag state (as implemented in Tasks 1-5)</summary>
 
 ```rust
 /// Whether a tooltip popup on the shared surface (`tooltip::window_id()`)
@@ -289,6 +353,8 @@ dropdown_open: bool,
 /// dropdown closes.
 tooltip_destroy_deferred: bool,
 ```
+
+</details>
 
 ### New messages (`src/app.rs`)
 

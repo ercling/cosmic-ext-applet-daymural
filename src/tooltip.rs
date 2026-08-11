@@ -76,7 +76,7 @@ pub fn tooltip<'a>(
     parent_id: Option<window::Id>,
     suppressed: bool,
 ) -> Element<'a, Message> {
-    let window_id = window_id();
+    let window_id = *WINDOW_ID;
     let (popup_anchor, gravity) = away_from_panel(core.applet.anchor);
     let label = label.into();
 

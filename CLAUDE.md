@@ -322,7 +322,7 @@ the pinned rev before coding against remembered names.
     genuine crash between the theme write and its record — accepted, and the
     gap disarm keeping the snapshot makes even that recoverable via
     re-enable. That exposure was **observed in the wild** on 2026-08-10: the
-    out-of-order `xdg_popup` destroy (see "UI conventions → popup stack")
+    out-of-order `xdg_popup` destroy (see "UI conventions → Popup stack")
     killed the process inside that ~800 ms window, so the next start read
     builders ≠ record and hit `Disarm { keep_snapshot: true }` — the
     "accent toggle switches itself off after a restart" report. Nothing in
@@ -361,7 +361,8 @@ for the applet itself, `20260808-ux-polish-lockscreen-i18n.md` for tooltips /
 disabled styling / i18n / theme conformance, `20260808-accent-from-wallpaper.md`
 plus its `-notes.md` for the accent feature, `20260810-popup-destroy-order-crash.md`
 for the popup-stack invariant and its libcosmic source-line evidence — each in
-`docs/plans/` or, once archived, `docs/plans/completed/`). Gotchas recorded there worth knowing: the
+`docs/plans/` or, once archived, `docs/plans/completed/`). Gotchas recorded
+there worth knowing: the
 `zune-jpeg` `log`-feature workaround in `Cargo.toml`, the transitive
 `cosmic-config` pin living only in `Cargo.lock`, and the live-verified
 lock-screen propagation chain (applet → cosmic-bg config → cosmic-bg state →
@@ -418,7 +419,7 @@ surface. Two cases, same rule:
 - **Dropdowns** use `widget::dropdown::popup_dropdown(..)` with the
   `Message::DropdownSurface(cosmic::surface::Action)` forwarder (see the
   interval/retention rows in `view.rs`). There is deliberately **no** blind
-  `Message::Surface` forwarder any more — see "popup stack" below.
+  `Message::Surface` forwarder any more — see "Popup stack" below.
 - **Tooltips** go through `crate::tooltip::tooltip(..)`, never `widget::tooltip`
   (an overlay) and no longer `Core::applet_tooltip` — see `src/tooltip.rs` for
   why upstream's copy is unusable here (its surface is painted in the *same*
@@ -438,8 +439,8 @@ Everything parented to it — the tooltip and either dropdown menu — is a
 **topmost** popup of a stack; violating it is a fatal `xdg_popup was destroyed
 while it was not the topmost popup` (the 2026-08-10 crash, plan
 `docs/plans/completed/20260810-popup-destroy-order-crash.md`). Two libcosmic
-facts make the invariant the only
-actionable rule — verified against the pinned rev:
+facts make the invariant the only actionable rule — verified against the
+pinned rev:
 
 - the runtime's `Action::Destroy`
   (`iced/winit/src/platform_specific/wayland/event_loop/state.rs`) descends
@@ -477,14 +478,15 @@ idempotent task — see `Window::on_tooltip_surface`, `on_dropdown_surface`,
   tooltip is legally topmost. Unconditional, and legal either way — no tooltip
   mapped is the no-op, and a tooltip that reached the surface while a menu was
   already up was mapped *above* it, i.e. is itself topmost.
-- **Suppression** — while `Window::dropdown_open()`, `view::tooltip_suppressed` makes
-  `tooltip(..)` withhold its settings closure, so no tooltip can arm. In the
+- **Suppression** — while `Window::dropdown_open()`,
+  `view::tooltip_suppressed` makes `tooltip(..)` withhold its settings
+  closure, so no tooltip can arm. In the
   real pointer flow this is the rule that actually holds the invariant: the
   widget publishes `on_leave` on the `CursorMoved` that takes the pointer off
   the control, which necessarily precedes clicking a dropdown button.
-- **Drop, then re-emit** — while `Window::dropdown_open()`, *everything* the tooltip
-  publishes is dropped (a create would map a second child; a destroy would
-  target a non-topmost popup). Nothing is lost, because a dropdown destroy —
+- **Drop, then re-emit** — while `Window::dropdown_open()`, *everything* the
+  tooltip publishes is dropped (a create would map a second child; a destroy
+  would target a non-topmost popup). Nothing is lost, because a dropdown destroy —
   and any `PopupClosed` — chains `destroy_tooltip()` *after* the menu is gone.
   This is the old "deferral" collapsed into the destroy's idempotence; don't
   reintroduce a `tooltip_destroy_deferred` flag.

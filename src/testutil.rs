@@ -3,8 +3,11 @@
 // the real Bing), an in-memory tiny-JPEG factory, the stock-palette
 // accessors, the cosmic-config filesystem walkers (key-file lookup and
 // read-only failure injection) shared by the accent/app/config test modules,
-// and the tempdir-rooted cosmic-bg *state* builders shared by the lock-poke
-// tests in `wallpaper.rs` and `app.rs`.
+// the tempdir-rooted cosmic-bg *state* builders shared by the lock-poke
+// tests in `wallpaper.rs` and `app.rs`, the `drained_task_outputs` drain that
+// turns a `Task` returned from `update()` into the actions it would emit, and
+// the `surface` submodule (popup-ledger action builders plus the ordered
+// emission collector) shared by the `app.rs`/`view.rs` ledger tests.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;

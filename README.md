@@ -38,7 +38,8 @@ from the GNOME extension is picked up as-is — no re-downloads.
   thumbnail) names what it does on hover; unavailable buttons are visibly dimmed.
   The panel button itself stays silent, like COSMIC's own status applets.
   Hover tooltips pause while a *Shuffle every* or *Keep images* menu is open
-  (both are popups over the same surface, and only one may be open at a time).
+  (both open as popups on the applet popup, which may only have one child at a
+  time).
 - **Localized** — the UI follows your desktop language, with catalogues for the
   73 locales COSMIC itself ships (see [Translations](#translations)).
 

@@ -106,7 +106,7 @@ pub struct Window {
     /// the same pass as the *other* row's create. That no-op destroy produces
     /// no `Done`, so leaving the count alone here is exactly right; a real
     /// destroy is announced back as `PopupClosed`.
-    pub(crate) dropdowns_open: u32,
+    dropdowns_open: u32,
     /// Applet settings (shuffle, retention). Defaults when the config context
     /// is unavailable.
     pub(crate) config: AppletConfig,
@@ -449,7 +449,7 @@ pub enum Message {
 /// A destroy for the shared tooltip surface ([`crate::tooltip::window_id`]).
 ///
 /// **Idempotent by construction**, which is what lets the popup ledger get away
-/// with a single bit: the runtime's `Action::Destroy` arm logs
+/// with a single counter: the runtime's `Action::Destroy` arm logs
 /// `"No popup to destroy"` and returns *before touching any state* when the id
 /// is not mapped (`iced/winit/src/platform_specific/wayland/event_loop/state.rs`).
 /// So it can be emitted whenever a tooltip *might* be mapped, and nothing has
@@ -483,15 +483,18 @@ impl Window {
     fn on_popup_closed(&mut self, id: window::Id) -> app::Task<Message> {
         if id == tooltip::window_id() {
             // Nothing to record: the ledger tracks menus only.
-            tracing::debug!("popup closed: the tooltip");
+            tracing::debug!(
+                "popup closed: the tooltip (dropdowns open: {})",
+                self.dropdowns_open
+            );
             return Task::none();
         }
         if self.popup == Some(id) {
             // Our popup takes every child with it, so the count goes to zero
             // whatever it held.
-            tracing::debug!("popup closed: our own popup");
             self.popup = None;
             self.dropdowns_open = 0;
+            tracing::debug!("popup closed: our own popup (dropdowns open: 0)");
         } else {
             // By elimination: a dropdown menu. Its window id is minted inside
             // the widget (`window::Id::unique()` into private state) and is
@@ -504,8 +507,11 @@ impl Window {
             // mapped. The saturating floor is what makes the misclassified
             // ids harmless — an extra close can never push the ledger below
             // "nothing open".
-            tracing::debug!("popup closed: a dropdown menu");
             self.dropdowns_open = self.dropdowns_open.saturating_sub(1);
+            tracing::debug!(
+                "popup closed: a dropdown menu (dropdowns open: {})",
+                self.dropdowns_open
+            );
         }
         // Our popup dying does *not* take a mapped tooltip with it on the
         // compositor path (`…/handlers/shell/xdg_popup.rs::done` collects the
@@ -564,8 +570,8 @@ impl Window {
                 // if no tooltip is mapped it is a no-op, and if one is mapped
                 // *above* an already-open menu it is the topmost, so the
                 // destroy is legal either way.
-                tracing::debug!("dropdown opened");
                 self.dropdowns_open = self.dropdowns_open.saturating_add(1);
+                tracing::debug!("dropdown opened (dropdowns open: {})", self.dropdowns_open);
                 before = destroy_tooltip();
             }
             cosmic::surface::Action::DestroyPopup(_) => {
@@ -578,7 +584,10 @@ impl Window {
                 // that pass at zero with a menu mapped, which is the state the
                 // invariant forbids. A destroy that really tears a menu down
                 // comes back as `PopupClosed`, and that is what decrements.
-                tracing::debug!("dropdown destroy forwarded");
+                tracing::debug!(
+                    "dropdown destroy forwarded (dropdowns open: {})",
+                    self.dropdowns_open
+                );
                 // Ordered after the menu's own destroy: only then is a tooltip
                 // topmost again. Unconditional, so it also collects a tooltip
                 // whose destroy was dropped while the menu was up.
@@ -3909,7 +3918,7 @@ mod tests {
     /// inside the widget and never visible here. Grab-loss dismissal publishes
     /// no `DestroyPopup`, so this close is the only signal the ledger gets.
     #[tokio::test]
-    async fn popup_closed_for_an_unknown_surface_clears_the_dropdown() {
+    async fn popup_closed_for_an_unknown_surface_decrements_the_dropdown_count() {
         use cosmic::Application as _;
 
         let mut window = Window::default();
@@ -4090,9 +4099,9 @@ mod tests {
     /// once the menu is gone is a tooltip beneath it topmost again. This is
     /// what makes dropping a tooltip destroy during the menu safe.
     ///
-    /// The bit stays set: a destroy *request* is not evidence the menu died
-    /// (see the field doc). `PopupClosed` is what clears it, and the runtime
-    /// sends one for every popup this destroy really tears down.
+    /// The count stays put: a destroy *request* is not evidence the menu died
+    /// (see the field doc). `PopupClosed` is what decrements it, and the
+    /// runtime sends one for every popup this destroy really tears down.
     #[tokio::test]
     async fn a_dropdown_destroy_sweeps_the_tooltip_afterwards() {
         use cosmic::Application as _;
@@ -4105,7 +4114,7 @@ mod tests {
 
         assert!(
             window.dropdown_open(),
-            "the request is not the close; `PopupClosed` clears the bit"
+            "the request is not the close; only `PopupClosed` decrements the count"
         );
         assert_eq!(
             emitted(task).await,
@@ -4121,8 +4130,8 @@ mod tests {
     /// reaching that widget's `ButtonPressed` arm, so nothing resets it —
     /// therefore emits a destroy for an already-dead popup in the *same* pass
     /// as the other row's create, and tree order (interval before retention in
-    /// `view.rs`) puts the create first. Clearing the bit on the destroy would
-    /// end that pass with a menu mapped and tooltips un-paused, which is the
+    /// `view.rs`) puts the create first. Decrementing on the destroy would end
+    /// that pass with a menu mapped and tooltips un-paused, which is the
     /// two-children state the invariant forbids.
     #[tokio::test]
     async fn a_stale_destroy_after_a_create_leaves_the_menu_recorded() {
