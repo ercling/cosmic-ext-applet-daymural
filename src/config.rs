@@ -203,7 +203,13 @@ pub(crate) fn increment_refresh_request(
     state_dir: &Path,
 ) -> Result<u64, CoordinationError> {
     with_coordination_lock(state_dir, || {
-        let current = CoordinationConfig::load(config).refresh_request;
+        let mailbox = CoordinationConfig::load(config);
+        // A damaged/missing request key must not move allocation behind a
+        // still-valid completion watermark. Otherwise the new request looks
+        // already acknowledged and is silently lost.
+        let current = mailbox
+            .refresh_request
+            .max(mailbox.refresh_completion.request);
         let next = current
             .checked_add(1)
             .ok_or(CoordinationError::CounterExhausted("refresh_request"))?;
@@ -596,9 +602,30 @@ mod tests {
 
         assert!(increment_refresh_request(&ctx, state.path()).is_ok());
         let loaded = CoordinationConfig::load(&ctx);
-        assert_eq!(loaded.refresh_request, 1);
+        assert_eq!(loaded.refresh_request, 4);
         assert_eq!(loaded.apply_notice, Some(notice));
         assert_eq!(loaded.refresh_completion.request, 3);
+    }
+
+    #[test]
+    fn corrupt_request_allocates_above_valid_completion_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let ctx = test_context(&dir);
+        ctx.set(
+            "refresh_completion",
+            PeerRefreshCompletion {
+                request: 17,
+                outcome: PeerRefreshOutcome::Success,
+            },
+        )
+        .unwrap();
+        ctx.set("refresh_request", "not a counter").unwrap();
+
+        assert_eq!(increment_refresh_request(&ctx, state.path()).unwrap(), 18);
+        let mailbox = CoordinationConfig::load(&ctx);
+        assert_eq!(mailbox.refresh_request, 18);
+        assert_eq!(mailbox.refresh_completion.request, 17);
     }
 
     #[test]

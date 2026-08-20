@@ -347,6 +347,10 @@ pub struct Window {
     /// cosmic-bg state inside the blocking task.
     #[cfg(test)]
     test_snapshot_inputs: Option<TestSnapshotInputs>,
+    /// Sandboxed contexts used to exercise recovery from transient context
+    /// creation failure without consulting the test runner's real XDG dirs.
+    #[cfg(test)]
+    test_hydration_contexts: Option<(cosmic_config::Config, cosmic_config::Config)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -435,6 +439,8 @@ enum AccentJob {
 /// touching the real desktop configuration.
 #[derive(Debug, Clone)]
 pub(crate) struct LeadershipHydration {
+    config_context: Option<cosmic_config::Config>,
+    coordination_context: Option<cosmic_config::Config>,
     config: AppletConfig,
     coordination: CoordinationConfig,
     catalogue: Catalogue,
@@ -673,6 +679,12 @@ pub enum Message {
     },
     /// Cross-process coordination mailbox changed on disk.
     CoordinationUpdated(CoordinationConfig),
+    /// A leader finished reading live cosmic-bg state for a peer refresh.
+    /// `request` guards both role changes and a newer mailbox observation.
+    PeerRefreshLiveRead {
+        request: u64,
+        live: wallpaper::CurrentWallpaper,
+    },
     /// The one-shot leadership retry timer fired.
     LeadershipTick(u64),
     /// The blocking takeover snapshot finished. Both generations must still
@@ -825,6 +837,9 @@ impl Window {
         }
 
         if self.leadership.is_leader() {
+            // Consume this one-shot before spawning the blocking read; a
+            // duplicate delivery must not create concurrent hydrations.
+            self.leadership_generation = self.leadership_generation.wrapping_add(1);
             return self.start_leadership_hydration();
         }
         if !self.leadership.try_acquire() {
@@ -845,13 +860,10 @@ impl Window {
         if !self.leadership.is_leader() || self.leader_readiness != LeaderReadiness::Hydrating {
             return Task::none();
         }
-        let (Some(config_context), Some(coordination_context)) = (
-            self.config_context.clone(),
-            self.coordination_context.clone(),
-        ) else {
-            tracing::warn!("cannot hydrate takeover without both config contexts");
-            return self.schedule_leadership_retry();
-        };
+        let config_context = self.config_context.clone();
+        let coordination_context = self.coordination_context.clone();
+        #[cfg(test)]
+        let test_contexts = self.test_hydration_contexts.clone();
 
         self.leadership_hydration_generation = self.leadership_hydration_generation.wrapping_add(1);
         let generation = self.leadership_hydration_generation;
@@ -871,26 +883,63 @@ impl Window {
         let (snapshot_catalogue_path, snapshot_images_dir) =
             (catalogue_path(), wallpaper::download_dir());
         cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || LeadershipHydration {
-                config: AppletConfig::load(&config_context),
-                coordination: CoordinationConfig::load(&coordination_context),
-                catalogue: Catalogue::load_or_rebuild(
-                    &snapshot_catalogue_path,
-                    &snapshot_images_dir,
-                ),
-                live: {
-                    #[cfg(test)]
-                    if let Some(live) = test_live {
-                        live
-                    } else {
+            let result = tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                let (test_config, test_coordination) = test_contexts
+                    .map(|(config, coordination)| (Some(config), Some(coordination)))
+                    .unwrap_or((None, None));
+                let config_context = config_context
+                    .or({
+                        #[cfg(test)]
+                        {
+                            test_config
+                        }
+                        #[cfg(not(test))]
+                        {
+                            None
+                        }
+                    })
+                    .map(Ok)
+                    .unwrap_or_else(AppletConfig::context)
+                    .map_err(|error| format!("cannot open applet config: {error}"))?;
+                let coordination_context = coordination_context
+                    .or({
+                        #[cfg(test)]
+                        {
+                            test_coordination
+                        }
+                        #[cfg(not(test))]
+                        {
+                            None
+                        }
+                    })
+                    .map(Ok)
+                    .unwrap_or_else(CoordinationConfig::context)
+                    .map_err(|error| format!("cannot open coordination config: {error}"))?;
+                Ok::<_, String>(LeadershipHydration {
+                    config: AppletConfig::load(&config_context),
+                    coordination: CoordinationConfig::load(&coordination_context),
+                    config_context: Some(config_context),
+                    coordination_context: Some(coordination_context),
+                    catalogue: Catalogue::load_or_rebuild(
+                        &snapshot_catalogue_path,
+                        &snapshot_images_dir,
+                    ),
+                    live: {
+                        #[cfg(test)]
+                        if let Some(live) = test_live {
+                            live
+                        } else {
+                            wallpaper::current_wallpaper()
+                        }
+                        #[cfg(not(test))]
                         wallpaper::current_wallpaper()
-                    }
-                    #[cfg(not(test))]
-                    wallpaper::current_wallpaper()
-                },
+                    },
+                })
             })
             .await
-            .map_err(|error| format!("leadership hydration task failed: {error}"));
+            .map_err(|error| format!("leadership hydration task failed: {error}"))
+            .and_then(|result| result);
             Message::LeadershipHydrated {
                 generation,
                 state_generation,
@@ -925,6 +974,12 @@ impl Window {
             return self.start_leadership_hydration();
         }
 
+        if let Some(context) = hydration.config_context {
+            self.config_context = Some(context);
+        }
+        if let Some(context) = hydration.coordination_context {
+            self.coordination_context = Some(context);
+        }
         self.config = hydration.config;
         self.coordination = hydration.coordination;
         self.catalogue = hydration.catalogue;
@@ -1341,10 +1396,11 @@ impl Window {
         Task::batch(tasks)
     }
 
-    /// Write-on-change: adopt `config` and persist it if it differs from the
-    /// current settings. Used by the shuffle/retention controls.
+    /// Persist only fields this transition actually changed. In particular,
+    /// never serialize the full in-memory entry: a follower may have written
+    /// an unrelated key after our last watcher snapshot.
     fn set_config(&mut self, config: AppletConfig) {
-        use cosmic_config::CosmicConfigEntry as _;
+        use cosmic_config::ConfigSet as _;
 
         if !self.is_active_leader() {
             tracing::debug!("dropping full applet-config persist from a non-leader");
@@ -1353,12 +1409,28 @@ impl Window {
         if self.config == config {
             return;
         }
-        self.config = config;
-        if let Some(context) = &self.config_context
-            && let Err(error) = self.config.write_entry(context)
-        {
-            tracing::warn!("failed to persist applet config change: {error}");
+        let previous = std::mem::replace(&mut self.config, config.clone());
+        let Some(context) = &self.config_context else {
+            return;
+        };
+        macro_rules! persist_changed {
+            ($field:ident) => {
+                if previous.$field != config.$field
+                    && let Err(error) = context.set(stringify!($field), &config.$field)
+                {
+                    tracing::warn!(
+                        "failed to persist applet config key {}: {error}",
+                        stringify!($field)
+                    );
+                }
+            };
         }
+        persist_changed!(shuffle_enabled);
+        persist_changed!(shuffle_interval_secs);
+        persist_changed!(retention_days);
+        persist_changed!(accent_enabled);
+        persist_changed!(accent_snapshot);
+        persist_changed!(accent_last_written);
     }
 
     /// Persist one ordinary setting without serializing the leader-owned
@@ -1366,6 +1438,7 @@ impl Window {
     /// write lands; a memory-only fixture retains the applet's established
     /// in-memory settings behavior.
     fn set_non_leader_setting(&mut self, setting: FollowerSetting) -> app::Task<Message> {
+        let active_leader = self.is_active_leader();
         let slot = setting.slot();
         let Some(context) = self.config_context.clone() else {
             if !matches!(setting, FollowerSetting::AccentEnabled(true)) {
@@ -1377,6 +1450,14 @@ impl Window {
             }
             return Task::none();
         };
+
+        // Leaders update their controls/timers immediately, retaining the
+        // established memory-on-write-failure behavior. Followers wait for a
+        // successful persist so their UI never claims a request the leader
+        // cannot observe.
+        if active_leader {
+            setting.adopt(&mut self.config);
+        }
 
         self.follower_setting_generations[slot] =
             self.follower_setting_generations[slot].wrapping_add(1);
@@ -1416,11 +1497,14 @@ impl Window {
         result: Result<(), String>,
     ) -> app::Task<Message> {
         self.follower_setting_inflight = false;
-        if self.leadership.is_leader() {
-            self.follower_setting_queue.clear();
-            return Task::none();
-        }
-        if generation == self.follower_setting_generations[setting.slot()] {
+        if self.is_active_leader() {
+            if let Err(error) = result {
+                tracing::warn!(
+                    "failed to persist applet setting {}: {error}",
+                    setting.key()
+                );
+            }
+        } else if generation == self.follower_setting_generations[setting.slot()] {
             match result {
                 Ok(()) => setting.adopt(&mut self.config),
                 Err(error) => tracing::warn!(
@@ -1894,7 +1978,43 @@ impl Window {
     /// Attach every currently outstanding mailbox request to the one fetch
     /// in flight, or start that fetch when idle.
     fn consume_peer_refresh_request(&mut self) -> app::Task<Message> {
-        self.consume_peer_refresh_request_over(wallpaper::current_wallpaper())
+        if !self.is_active_leader()
+            || self.coordination.refresh_request <= self.coordination.refresh_completion.request
+        {
+            return Task::none();
+        }
+        let request = self.coordination.refresh_request;
+        #[cfg(test)]
+        let test_live = self
+            .test_snapshot_inputs
+            .as_ref()
+            .map(|inputs| inputs.live.clone());
+        cosmic::task::future(async move {
+            let live = tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                if let Some(live) = test_live {
+                    return live;
+                }
+                wallpaper::current_wallpaper()
+            })
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!("peer refresh live-state task failed: {error}");
+                wallpaper::CurrentWallpaper::Unknown
+            });
+            Message::PeerRefreshLiveRead { request, live }
+        })
+    }
+
+    fn finish_peer_refresh_live_read(
+        &mut self,
+        request: u64,
+        live: wallpaper::CurrentWallpaper,
+    ) -> app::Task<Message> {
+        if !self.is_active_leader() || request != self.coordination.refresh_request {
+            return Task::none();
+        }
+        self.consume_peer_refresh_request_over(live)
     }
 
     /// [`Window::consume_peer_refresh_request`] with injected live wallpaper
@@ -3383,6 +3503,8 @@ impl cosmic::Application for Window {
             poke_config: wallpaper::poke_state_handle(),
             #[cfg(test)]
             test_snapshot_inputs: None,
+            #[cfg(test)]
+            test_hydration_contexts: None,
         };
         let startup = window.arm_initial_duties(live);
         (window, startup)
@@ -3499,6 +3621,9 @@ impl cosmic::Application for Window {
                     return Task::batch([refresh, apply]);
                 }
                 return self.settle_peer_refresh(completion);
+            }
+            Message::PeerRefreshLiveRead { request, live } => {
+                return self.finish_peer_refresh_live_read(request, live);
             }
             Message::LeadershipTick(generation) => return self.on_leadership_tick(generation),
             Message::LeadershipHydrated {
@@ -3626,41 +3751,39 @@ impl cosmic::Application for Window {
                 return Task::batch([accent, shuffle]);
             }
             Message::SetShuffleEnabled(enabled) => {
-                if !self.is_active_leader() {
-                    return self.set_non_leader_setting(FollowerSetting::ShuffleEnabled(enabled));
-                }
-                let mut config = self.config.clone();
-                config.shuffle_enabled = enabled;
-                self.set_config(config);
+                let active_leader = self.is_active_leader();
+                let persist = self.set_non_leader_setting(FollowerSetting::ShuffleEnabled(enabled));
                 // Enabling starts a fresh full-interval countdown.
-                return self.sync_shuffle(true);
+                return if active_leader {
+                    Task::batch([persist, self.sync_shuffle(true)])
+                } else {
+                    persist
+                };
             }
             Message::SetShuffleInterval(index) => {
+                let active_leader = self.is_active_leader();
                 let interval = view::shuffle_interval_secs(index);
-                if !self.is_active_leader() {
-                    return self.set_non_leader_setting(FollowerSetting::ShuffleInterval(interval));
-                }
-                let mut config = self.config.clone();
-                config.shuffle_interval_secs = interval;
-                self.set_config(config);
+                let persist =
+                    self.set_non_leader_setting(FollowerSetting::ShuffleInterval(interval));
                 // Picking an interval restarts the countdown at that length.
-                return self.sync_shuffle(true);
+                return if active_leader {
+                    Task::batch([persist, self.sync_shuffle(true)])
+                } else {
+                    persist
+                };
             }
             Message::SetRetention(index) => {
+                let active_leader = self.is_active_leader();
                 let new_days = view::retention_days(index);
-                if !self.is_active_leader() {
-                    return self.set_non_leader_setting(FollowerSetting::Retention(new_days));
-                }
                 let reduced = schedule::retention_reduced(self.config.retention_days, new_days);
-                let mut config = self.config.clone();
-                config.retention_days = new_days;
-                self.set_config(config);
-                if reduced {
+                let persist = self.set_non_leader_setting(FollowerSetting::Retention(new_days));
+                if active_leader && reduced {
                     // Reduced retention prunes immediately (the routine
                     // post-fetch prune would otherwise leave over-limit
                     // files around for up to a day).
-                    return self.prune_immediately();
+                    return Task::batch([persist, self.prune_immediately()]);
                 }
+                return persist;
             }
             Message::SetAccentEnabled(enabled) => return self.set_accent_enabled(enabled),
             Message::AccentComputed { source, hue } => {
@@ -3886,6 +4009,8 @@ mod tests {
         live: wallpaper::CurrentWallpaper,
     ) -> LeadershipHydration {
         LeadershipHydration {
+            config_context: None,
+            coordination_context: None,
             config,
             coordination,
             catalogue: Catalogue::default(),
@@ -3979,6 +4104,67 @@ mod tests {
         assert_eq!(window.current, Some(live_path));
         assert_eq!(window.cold_start, ColdStart::Done);
         assert_eq!(window.timer_generation, 1);
+    }
+
+    #[tokio::test]
+    async fn takeover_reopens_missing_contexts_and_recovers_on_retry() {
+        use cosmic::Application as _;
+        use cosmic_config::CosmicConfigEntry as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (config_context, coordination_context) =
+            takeover_contexts(&dir.path().join("recovered-config"));
+        let disk_config = AppletConfig {
+            retention_days: 30,
+            ..Default::default()
+        };
+        disk_config.write_entry(&config_context).unwrap();
+        let disk_coordination = CoordinationConfig {
+            refresh_request: 6,
+            refresh_completion: PeerRefreshCompletion {
+                request: 6,
+                outcome: PeerRefreshOutcome::Success,
+            },
+            ..Default::default()
+        };
+        disk_coordination
+            .write_entry(&coordination_context)
+            .unwrap();
+        let images_dir = dir.path().join("images");
+        std::fs::create_dir_all(&images_dir).unwrap();
+        let catalogue_path = dir.path().join("catalogue.json");
+
+        let mut window = Window {
+            leadership: Leadership::forced(true),
+            leader_readiness: LeaderReadiness::Hydrating,
+            config_context: None,
+            coordination_context: None,
+            test_hydration_contexts: Some((config_context, coordination_context)),
+            test_snapshot_inputs: Some(TestSnapshotInputs {
+                catalogue_path,
+                images_dir,
+                live: wallpaper::CurrentWallpaper::NoFile,
+            }),
+            ..Window::default()
+        };
+
+        let retry = window.finish_leadership_hydration(
+            0,
+            0,
+            Err("transient context creation failure".into()),
+        );
+        assert_eq!(retry.units(), 1);
+        assert!(!window.is_active_leader());
+        let hydration_task = window.update(Message::LeadershipTick(1));
+        let mut messages = app_messages(hydration_task).await;
+        assert_eq!(messages.len(), 1);
+        let duties = window.update(messages.pop().unwrap());
+        assert!(window.is_active_leader());
+        assert!(window.config_context.is_some());
+        assert!(window.coordination_context.is_some());
+        assert_eq!(window.config.retention_days, 30);
+        assert_eq!(window.coordination.refresh_request, 6);
+        assert!(duties.units() >= 2, "recovered leader arms its duties");
     }
 
     #[test]
@@ -5979,6 +6165,62 @@ mod tests {
         assert_eq!(window.peer_refresh_request, Some(5));
     }
 
+    #[tokio::test]
+    async fn coordination_update_reads_live_wallpaper_off_update_and_guards_completion() {
+        use cosmic::Application as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = Window {
+            test_snapshot_inputs: Some(TestSnapshotInputs {
+                catalogue_path: dir.path().join("catalogue.json"),
+                images_dir: dir.path().join("images"),
+                live: wallpaper::CurrentWallpaper::NoFile,
+            }),
+            ..Window::default()
+        };
+        let read = window.update(Message::CoordinationUpdated(CoordinationConfig {
+            refresh_request: 3,
+            ..Default::default()
+        }));
+        assert_eq!(read.units(), 1);
+        assert!(
+            !window.refresh_pending,
+            "update only schedules the live read"
+        );
+
+        let mut messages = app_messages(read).await;
+        let refresh = window.update(messages.pop().unwrap());
+        assert!(window.refresh_pending);
+        assert_eq!(window.peer_refresh_request, Some(3));
+        assert_eq!(refresh.units(), 1);
+
+        let mut stale = Window {
+            test_snapshot_inputs: window.test_snapshot_inputs.clone(),
+            ..Window::default()
+        };
+        stale.coordination.refresh_request = 4;
+        assert_eq!(
+            stale
+                .update(Message::PeerRefreshLiveRead {
+                    request: 3,
+                    live: wallpaper::CurrentWallpaper::NoFile,
+                })
+                .units(),
+            0
+        );
+        assert!(!stale.refresh_pending);
+        stale.leadership = Leadership::forced(false);
+        assert_eq!(
+            stale
+                .update(Message::PeerRefreshLiveRead {
+                    request: 4,
+                    live: wallpaper::CurrentWallpaper::NoFile,
+                })
+                .units(),
+            0
+        );
+    }
+
     #[test]
     fn late_coordination_snapshots_never_regress_or_repeat_leader_work() {
         use cosmic::Application as _;
@@ -7245,6 +7487,43 @@ mod tests {
         assert_eq!(window.config, changed);
     }
 
+    #[tokio::test]
+    async fn leader_and_follower_setting_writes_do_not_clobber_other_keys() {
+        use cosmic::Application as _;
+        use cosmic_config::CosmicConfigEntry as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let context = cosmic_config::Config::with_custom_path(
+            APP_ID,
+            AppletConfig::VERSION,
+            dir.path().to_path_buf(),
+        )
+        .unwrap();
+        AppletConfig::default().write_entry(&context).unwrap();
+        let mut leader = Window {
+            config_context: Some(context.clone()),
+            ..Window::default()
+        };
+        let mut follower = Window {
+            leadership: Leadership::forced(false),
+            config_context: Some(context.clone()),
+            ..Window::default()
+        };
+
+        // Both processes begin from the same stale full snapshot, then write
+        // unrelated controls in the adversarial follower-before-leader order.
+        let follower_write = follower.update(Message::SetRetention(2));
+        let leader_write = leader.update(Message::SetShuffleEnabled(true));
+        let mut follower_messages = app_messages(follower_write).await;
+        drop(follower.update(follower_messages.pop().unwrap()));
+        let mut leader_messages = app_messages(leader_write).await;
+        drop(leader.update(leader_messages.pop().unwrap()));
+
+        let disk = AppletConfig::load(&context);
+        assert_eq!(disk.retention_days, 30);
+        assert!(disk.shuffle_enabled);
+    }
+
     // -----------------------------------------------------------------
     // Accent-from-wallpaper wiring. The theme configs are TempDir-rooted
     // (`accent::ThemeHandles::sandboxed`) and the applet config context is
@@ -8356,6 +8635,13 @@ mod tests {
             dark: Some([40, 50, 60]),
         };
         window.config.accent_snapshot = Some(user);
+        use cosmic_config::ConfigSet as _;
+        window
+            .config_context
+            .as_ref()
+            .unwrap()
+            .set("accent_snapshot", Some(user))
+            .unwrap();
         let source = PathBuf::from("/imgs/20260808-Foo_ROW1_UHD.jpg");
         window.current = Some(source.clone());
 
