@@ -50,6 +50,14 @@ the pinned rev before coding against remembered names.
 - `src/localize.rs` — Fluent i18n: `rust-embed`ded `i18n/<locale>/cosmic_bing_wallpaper.ftl`,
   the `LANGUAGE_LOADER` `LazyLock`, the crate's own `fl!` macro, `localize()`,
   and the locale guard tests. See "i18n" below.
+- `src/leader.rs` — cross-process single-owner election for COSMIC's one-applet-
+  per-output process model. `Leadership` holds an advisory
+  `state_dir()/leader.lock`; the winner owns shared background work, a loser
+  retains its file handle and retries every ~60 s, and process exit releases
+  the lock. Lock/open errors warn and fail open so a lone instance remains
+  useful. `with_coordination_lock` holds the shorter-lived
+  `state_dir()/coordination.lock` around blocking mailbox read-modify-write
+  operations; neither lock belongs on the UI thread.
 - `src/app.rs` — the `cosmic::Application` impl (`Window`): message loop, popup
   open/close, startup restore (catalogue + config, no network), the refresh
   pipeline split in two: `run_refresh`/`fetch_and_download` (async, off the UI
@@ -85,6 +93,23 @@ the pinned rev before coding against remembered names.
   `on_tooltip_surface` / `on_dropdown_surface` and the free `destroy_tooltip`
   task — which holds the at-most-one-child invariant on `window.popup`. See
   "UI conventions → Popup stack".
+  It additionally owns the leadership lifecycle. `is_active_leader()` means
+  both lock owner and fully hydrated; every automatic/destructive entry point
+  (refresh and shuffle timers, download/thumbnail/prune work, automatic apply,
+  lock-screen poke, accent compute/write, and full-entry config persistence) is
+  gated on it. A follower's manual refresh is a coordination-mailbox request,
+  coalesced into the leader's current or next fetch and settled by a covering
+  completion counter. A follower may apply navigation choices directly, then
+  posts an apply notice; the leader verifies cosmic-bg's live wallpaper before
+  updating `current`, spending `ColdStart`, and recomputing the accent.
+  Followers persist ordinary settings and the accent-enabled flag one key at a
+  time, so they cannot rewrite leader-owned accent records from stale memory.
+  On lock takeover, the winner remains inert while a blocking task reloads the
+  complete applet config, coordination entry, and live wallpaper; watcher
+  events invalidate that snapshot. Follower popup opens and peer-refresh
+  settlement similarly reload catalogue/live state asynchronously and adopt
+  it only through generation and role guards. The logind subscription remains
+  alive in every process, but only the active leader acts on its messages.
 - `src/view.rs` — popup UI (thumbnail, title/copyright, About link, prev/next/
   newest/refresh controls, shuffle + accent + retention rows, status footer —
   the accent toggler also renders in the empty-catalogue branch, so a modified
@@ -137,7 +162,13 @@ the pinned rev before coding against remembered names.
   the accent feature's `accent_enabled` / `accent_snapshot` /
   `accent_last_written` — colour types imported from `accent.rs`) via
   cosmic-config under app ID `io.github.ercling.CosmicBingWallpaper`, version 1,
-  write-on-change setters, watch subscription for external edits.
+  write-on-change setters, watch subscription for external edits. The separate
+  `CoordinationConfig` entry uses the same app ID/version but disjoint raw keys:
+  monotonically increasing `refresh_request`, covering `refresh_completion`
+  (request plus success/network/disk outcome), and optional `apply_notice`
+  (generation plus evidence path). Its helpers serialize counter allocation
+  under `coordination.lock` and write only the changed key; a full
+  `AppletConfig` write therefore cannot clobber the mailbox.
 - `src/wallpaper.rs` — cosmic-bg config writer: `updated_entry` mutates only
   `source`, `apply` writes the `all` entry *before* flipping `same-on-all`,
   `current_wallpaper`/`is_ours`/`should_auto_apply` back the don't-clobber rule,
@@ -242,13 +273,18 @@ the pinned rev before coding against remembered names.
     (`accent_recompute_queued`), (b) no `ConfigUpdated` flip is routed, and
     (c) toggles are recorded (`accent_flip_requested`, rendered by the
     toggler via `accent_toggler_state`, pinned to disk raw).
-    `ConfigUpdated` **never adopts the three accent fields from a watcher
-    payload, in-flight or not**: payloads are read at event time and can be
-    delivered late, so even after the guard drops an echo can carry
+    For an active leader, `ConfigUpdated` **never adopts the three accent
+    fields from a watcher payload, in-flight or not**: payloads are read at
+    event time and can be delivered late, so even after the guard drops an echo can carry
     mid-flight state (adopting its `last_written: None` disarms spuriously
-    on the next recompute — the oscillation class); in-memory accent state
-    is authoritative (single-instance assumption), and a not-in-flight
+    on the next recompute — the oscillation class); the active leader's
+    in-memory accent state is authoritative, and a not-in-flight
     payload flip is only routed after a **fresh disk read** confirms it.
+    A follower is the explicit exception: it never owns the accent lifecycle,
+    adopts only a freshly confirmed `accent_enabled` value for display, and
+    preserves its in-memory snapshot/last-written fields until a takeover
+    hydration replaces the complete trio from disk. Its popup toggle persists
+    only the raw enabled key and runs no snapshot, restore, compute, or write.
     The completion reconciles once: a recorded user toggle wins (a
     concurrent `set_config` full-entry write can rewrite the pinned disk
     flag from stale memory), else a genuine external flip — evidenced by
@@ -360,7 +396,9 @@ implementation notes live in `docs/plans/` (`20260807-cosmic-bing-wallpaper-appl
 for the applet itself, `20260808-ux-polish-lockscreen-i18n.md` for tooltips /
 disabled styling / i18n / theme conformance, `20260808-accent-from-wallpaper.md`
 plus its `-notes.md` for the accent feature, `20260810-popup-destroy-order-crash.md`
-for the popup-stack invariant and its libcosmic source-line evidence — each in
+for the popup-stack invariant and its libcosmic source-line evidence, and
+`20260817-single-instance-leader.md` for multi-output ownership and peer
+coordination — each in
 `docs/plans/` or, once archived, `docs/plans/completed/`). Gotchas recorded
 there worth knowing: the
 `zune-jpeg` `log`-feature workaround in `Cargo.toml`, the transitive

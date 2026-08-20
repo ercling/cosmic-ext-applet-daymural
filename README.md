@@ -20,6 +20,11 @@ from the GNOME extension is picked up as-is — no re-downloads.
   browsing applies the wallpaper immediately.
 - **Refresh now** — manual fetch button; errors surface in the popup footer
   ("Bing unreachable — retrying in 1 h") and retry automatically.
+- **Multi-monitor safe** — COSMIC may start one copy of the applet for each
+  panel output, but they coordinate so only one performs downloads, scheduled
+  work, cleanup, and accent updates. Every popup remains usable: a manual
+  refresh from another output is transparently routed through the active copy,
+  and browsing still applies the selected wallpaper immediately.
 - **Shuffle** — rotate among downloaded images every 30 min / 1 h / 6 h / daily.
 - **Retention** — keep 3 / 8 / 30 days of images, or forever.
 - **Match accent to wallpaper** — opt-in (off by default): derives the COSMIC
@@ -122,6 +127,11 @@ Bing's UHD images are roughly **5 MB each**. Expect about:
   is off at refresh time catches up at next login (same trade-off as the GNOME
   extension). Timers also don't advance during suspend, so a refresh that came
   due while the machine slept fires late after resume rather than immediately.
+- **Multi-monitor ownership transfer is not instantaneous.** If the output
+  hosting the active applet disappears and COSMIC stops that applet process, a
+  surviving copy takes over shared work after its next leadership check,
+  normally within about 60 seconds. If COSMIC keeps the old process alive, it
+  remains the active owner.
 - **The lock screen may show its own default for a few seconds before the
   wallpaper appears — an upstream cosmic-greeter bug the applet works around.**
   The applet writes nothing lock-screen-specific: it writes cosmic-bg's config,

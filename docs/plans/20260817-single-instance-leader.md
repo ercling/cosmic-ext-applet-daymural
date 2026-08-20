@@ -481,15 +481,27 @@ reload helper. Leaders keep their in-memory-authoritative catalogue.
 - Move: `docs/plans/20260817-single-instance-leader.md` to
   `docs/plans/completed/`
 
-- [ ] document multi-output single-owner behavior and transparent peer refresh
+- [x] document multi-output single-owner behavior and transparent peer refresh
       routing in `README.md`
-- [ ] update `CLAUDE.md` with `src/leader.rs`, the coordination config keys,
+- [x] update `CLAUDE.md` with `src/leader.rs`, the coordination config keys,
       active-leader gates, per-key non-leader persists, async takeover/reload,
       and the explicit non-leader exception to in-memory accent authority
-- [ ] record any implementation deviation in this plan before marking tasks
+- [x] record any implementation deviation in this plan before marking tasks
       complete
-- [ ] move the synchronized plan to `docs/plans/completed/`
-- [ ] run `just check` after documentation changes
+- [x] move the synchronized plan to `docs/plans/completed/` *(deferred to
+      planning-exec final archive so review phases retain the stable path)*
+- [x] run `just check` after documentation changes
+
+### Implementation deviations
+
+- ⚠️ When an initial leader sees an outstanding peer-refresh request, that
+  refresh replaces rather than accompanies the startup thumbnail pass. Its
+  refresh backfill is the sole thumbnail producer, preserving the stronger
+  no-concurrent-producer/sweep invariant.
+- ⚠️ The completed plan remains at this path through planning-exec's review
+  phases and is physically archived by finalization; Task 10 records that
+  required archive as complete without moving the executor's source of truth
+  early.
 
 ## Post-Completion
 
