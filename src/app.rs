@@ -23,7 +23,8 @@ use cosmic::{
 };
 
 use crate::catalogue::{self, Catalogue, ImageEntry};
-use crate::config::AppletConfig;
+use crate::config::{AppletConfig, CoordinationConfig};
+use crate::leader::Leadership;
 // No `fl!` here: every user-visible string this applet renders lives in the
 // popup (`view.rs`). The panel contributes an icon and nothing else.
 use crate::{accent, bing, lockwatch, schedule, thumbs, tooltip, view, wallpaper};
@@ -33,6 +34,9 @@ pub const APP_ID: &str = "io.github.ercling.CosmicBingWallpaper";
 
 /// Symbolic icon shown in the panel.
 const PANEL_ICON: &str = "preferences-desktop-wallpaper-symbolic";
+
+/// How often a surviving panel instance checks whether the leader exited.
+const LEADERSHIP_RETRY_DELAY: Duration = Duration::from_secs(60);
 
 pub fn run() -> cosmic::iced::Result {
     cosmic::applet::run::<Window>(())
@@ -194,6 +198,20 @@ pub struct Window {
     /// while evicting one would hand its `Done` back to the by-elimination row
     /// — the un-pausing direction this whole ledger refuses to take.
     closing_popups: Vec<ClosingPopup>,
+    /// Process-wide ownership of shared applet work. The descriptor held by
+    /// this value is also what keeps the advisory lock alive.
+    leadership: Leadership,
+    /// A takeover owns the lock before its blocking state hydration finishes.
+    /// Existing unit fixtures remain active leaders because this wrapper's
+    /// default is deliberately ready.
+    leader_readiness: LeaderReadiness,
+    /// Generation of the one-shot retry timer used by non-leaders.
+    leadership_generation: u64,
+    /// Generation of the blocking takeover hydration snapshot.
+    #[allow(dead_code, reason = "used by the takeover task in plan Task 7")]
+    leadership_hydration_generation: u64,
+    /// Config/mailbox watcher epoch used to invalidate a hydration snapshot.
+    leadership_state_generation: u64,
     /// Applet settings (shuffle, retention). Defaults when the config context
     /// is unavailable.
     pub(crate) config: AppletConfig,
@@ -201,6 +219,13 @@ pub struct Window {
     /// the config directory could not be created — the applet still runs with
     /// defaults, changes just don't persist.
     config_context: Option<cosmic_config::Config>,
+    /// Independent watched entry for cross-process requests and notices.
+    coordination: CoordinationConfig,
+    /// Context used for raw, single-key coordination writes.
+    #[allow(dead_code, reason = "used by peer mailbox writers in later plan tasks")]
+    coordination_context: Option<cosmic_config::Config>,
+    /// Newest peer refresh request attached to the current fetch.
+    peer_refresh_request: Option<u64>,
     /// All downloaded images (restored from disk at startup — no network).
     pub(crate) catalogue: Catalogue,
     /// Our idea of the currently applied wallpaper file. Refreshed from
@@ -284,6 +309,17 @@ pub struct Window {
     /// no-op. Tests inject a tempdir-rooted `Config::with_custom_path`
     /// handle (mirroring `config_context`).
     poke_config: Option<cosmic_config::Config>,
+}
+
+#[allow(
+    dead_code,
+    reason = "Hydrating is entered by the takeover task in plan Task 7"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum LeaderReadiness {
+    #[default]
+    Ready,
+    Hydrating,
 }
 
 /// One entry of [`Window::closing_popups`]: a popup of ours whose destroy has
@@ -486,6 +522,10 @@ pub enum Message {
     PopupClosed(window::Id),
     /// Settings changed on disk (external edit or our own write echoed back).
     ConfigUpdated(AppletConfig),
+    /// Cross-process coordination mailbox changed on disk.
+    CoordinationUpdated(CoordinationConfig),
+    /// The one-shot leadership retry timer fired.
+    LeadershipTick(u64),
     /// The refresh timer fired (payload: the generation it was armed with).
     RefreshDue(u64),
     /// The fetch pipeline finished (payload: the freshly fetched entries,
@@ -576,6 +616,57 @@ fn destroy_tooltip() -> app::Task<Message> {
 }
 
 impl Window {
+    fn is_active_leader(&self) -> bool {
+        self.leadership.is_leader() && self.leader_readiness == LeaderReadiness::Ready
+    }
+
+    fn schedule_leadership_retry(&mut self) -> app::Task<Message> {
+        self.leadership_generation += 1;
+        let generation = self.leadership_generation;
+        cosmic::task::future(async move {
+            tokio::time::sleep(LEADERSHIP_RETRY_DELAY).await;
+            Message::LeadershipTick(generation)
+        })
+    }
+
+    /// Arm ordinary leader startup work. An outstanding peer refresh starts
+    /// immediately and replaces the startup thumbnail producer for this
+    /// cycle: the refresh backfill fills the same cache, and running both
+    /// would violate the one-producer/sweep invariant.
+    fn arm_leader_duties(&mut self, live: wallpaper::CurrentWallpaper) -> app::Task<Message> {
+        if !self.is_active_leader() {
+            return Task::none();
+        }
+
+        let delay = schedule::next_refresh(
+            self.catalogue
+                .newest()
+                .map(|entry| entry.fullstartdate.as_str()),
+            Utc::now(),
+        );
+        let timer = self.schedule_refresh(delay);
+        let shuffle = self.sync_shuffle(false);
+        let outstanding = (self.coordination.refresh_request
+            > self.coordination.refresh_completion.request)
+            .then_some(self.coordination.refresh_request);
+        let producer = if let Some(request) = outstanding {
+            self.peer_refresh_request = Some(request);
+            self.start_refresh_over(live)
+        } else {
+            self.start_thumbnail_pass_over(live)
+        };
+        let accent = self.accent_compute_for_current();
+        Task::batch([timer, shuffle, producer, accent])
+    }
+
+    fn arm_initial_duties(&mut self, live: wallpaper::CurrentWallpaper) -> app::Task<Message> {
+        if self.is_active_leader() {
+            self.arm_leader_duties(live)
+        } else {
+            self.schedule_leadership_retry()
+        }
+    }
+
     /// Whether a dropdown menu is believed to be mapped — the ledger's one
     /// question ([`Window::dropdowns_open`], whose doc carries the rules).
     pub(crate) fn dropdown_open(&self) -> bool {
@@ -1975,6 +2066,22 @@ fn restore_catalogue(path: &Path, images_dir: &Path, state_dir: &Path) -> Catalo
     catalogue
 }
 
+/// Restore startup state according to process ownership. A follower may scan
+/// the image folder to rebuild its in-memory view, but it must not persist,
+/// prune, or reconcile shared files.
+fn restore_catalogue_for_role(
+    path: &Path,
+    images_dir: &Path,
+    state_dir: &Path,
+    active_leader: bool,
+) -> Catalogue {
+    if active_leader {
+        restore_catalogue(path, images_dir, state_dir)
+    } else {
+        Catalogue::load_or_rebuild(path, images_dir)
+    }
+}
+
 /// `link` if it is an ordinary web URL, otherwise `None`.
 ///
 /// The "About this image" link comes from Bing's JSON and survives in the
@@ -2311,6 +2418,11 @@ impl cosmic::Application for Window {
     }
 
     fn init(core: cosmic::app::Core, _flags: ()) -> (Self, app::Task<Self::Message>) {
+        // Election precedes catalogue restoration: a loser must never run the
+        // destructive startup prune/cache sweep before it knows its role.
+        let leadership = Leadership::acquire(state_dir());
+        let active_leader = leadership.is_leader();
+
         // Missing/invalid config must never crash the applet: a failed context
         // or unreadable keys both degrade to defaults.
         let config_context = match AppletConfig::context() {
@@ -2323,6 +2435,17 @@ impl cosmic::Application for Window {
         let config = config_context
             .as_ref()
             .map(AppletConfig::load)
+            .unwrap_or_default();
+        let coordination_context = match CoordinationConfig::context() {
+            Ok(context) => Some(context),
+            Err(error) => {
+                tracing::warn!("cannot open coordination config (using defaults): {error}");
+                None
+            }
+        };
+        let coordination = coordination_context
+            .as_ref()
+            .map(CoordinationConfig::load)
             .unwrap_or_default();
 
         // Same degradation for the theme configs: without them the accent
@@ -2339,8 +2462,12 @@ impl cosmic::Application for Window {
         // missing catalogue rebuilds from the download folder scan; entries
         // whose file vanished while we weren't running are dropped so a
         // hollow catalogue still counts as a cold start.
-        let catalogue =
-            restore_catalogue(&catalogue_path(), &wallpaper::download_dir(), state_dir());
+        let catalogue = restore_catalogue_for_role(
+            &catalogue_path(),
+            &wallpaper::download_dir(),
+            state_dir(),
+            active_leader,
+        );
         // Read once and handed to the thumbnail pass below: it must protect
         // the applied file's preview exactly as the prune protects its file.
         let live = wallpaper::current_wallpaper();
@@ -2351,21 +2478,22 @@ impl cosmic::Application for Window {
             ColdStart::Done
         };
 
-        // Empty catalogue (cold start) → fetch fires ~5 s after startup;
-        // otherwise the next refresh derives from the newest fullstartdate.
-        let delay = schedule::next_refresh(
-            catalogue.newest().map(|e| e.fullstartdate.as_str()),
-            Utc::now(),
-        );
-
         let mut window = Self {
             core,
             popup: None,
             dropdowns_open: 0,
             stale_menu_closes: 0,
             closing_popups: Vec::new(),
+            leadership,
+            leader_readiness: LeaderReadiness::Ready,
+            leadership_generation: 0,
+            leadership_hydration_generation: 0,
+            leadership_state_generation: 0,
             config,
             config_context,
+            coordination,
+            coordination_context,
+            peer_refresh_request: None,
             catalogue,
             current,
             refresh_pending: false,
@@ -2385,21 +2513,8 @@ impl cosmic::Application for Window {
             lock_poke_generation: 0,
             poke_config: wallpaper::poke_state_handle(),
         };
-        let timer = window.schedule_refresh(delay);
-        // Shuffle restored as enabled starts a fresh full-interval cycle.
-        let shuffle = window.sync_shuffle(false);
-        // Previews come from the cache, so the cache is filled *now*, from
-        // the files already on disk — not by a refresh that may be ~24 h out
-        // (or never, offline).
-        let thumbnails = window.start_thumbnail_pass_over(live);
-        // Startup reconciliation: startup does *not* pass through
-        // `on_apply_success` (`current` was restored above), and the next
-        // apply can be ~24 h out — or never, offline — while the wallpaper or
-        // the accent may have changed when the applet was down. The same
-        // extraction task catches both: an external accent change disarms,
-        // anything else re-applies. Gated inside on `accent_enabled`.
-        let accent = window.accent_compute_for_current();
-        (window, Task::batch([timer, shuffle, thumbnails, accent]))
+        let startup = window.arm_initial_duties(live);
+        (window, startup)
     }
 
     fn on_close_requested(&self, id: window::Id) -> Option<Message> {
@@ -2467,6 +2582,7 @@ impl cosmic::Application for Window {
             }
             Message::PopupClosed(id) => return self.on_popup_closed(id),
             Message::ConfigUpdated(config) => {
+                self.leadership_state_generation = self.leadership_state_generation.wrapping_add(1);
                 // Our own setter writes echo back here unchanged (no-op);
                 // an *external* edit of the shuffle settings restarts the
                 // countdown against the new values, and an externally
@@ -2533,6 +2649,15 @@ impl cosmic::Application for Window {
                 if !tasks.is_empty() {
                     return Task::batch(tasks);
                 }
+            }
+            Message::CoordinationUpdated(coordination) => {
+                self.coordination = coordination;
+                self.leadership_state_generation = self.leadership_state_generation.wrapping_add(1);
+            }
+            // Task 7 completes acquisition and hydration. Keeping the message
+            // explicit now makes the startup retry an isolated one-shot.
+            Message::LeadershipTick(generation) => {
+                let _ = generation;
             }
             Message::RefreshDue(generation) => {
                 // Stale timers (replaced by a newer reschedule) are ignored.
@@ -2697,6 +2822,9 @@ impl cosmic::Application for Window {
             self.core
                 .watch_config::<AppletConfig>(APP_ID)
                 .map(|update| Message::ConfigUpdated(update.config)),
+            self.core
+                .watch_config::<CoordinationConfig>(APP_ID)
+                .map(|update| Message::CoordinationUpdated(update.config)),
             // logind lock/resume events → the poke ladder (the
             // cosmic-greeter#511 workaround; rationale in `lockwatch.rs`).
             lockwatch::subscription().map(Message::LockEvent),
@@ -2737,6 +2865,97 @@ impl cosmic::Application for Window {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
+    fn file_snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn walk(root: &Path, path: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            let Ok(entries) = std::fs::read_dir(path) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(root, &path, files);
+                } else {
+                    files.insert(
+                        path.strip_prefix(root).unwrap().to_owned(),
+                        std::fs::read(path).unwrap(),
+                    );
+                }
+            }
+        }
+
+        let mut files = BTreeMap::new();
+        walk(root, root, &mut files);
+        files
+    }
+
+    #[test]
+    fn default_window_is_a_ready_leader() {
+        let mut window = Window::default();
+        assert!(window.leadership.is_leader());
+        assert_eq!(window.leader_readiness, LeaderReadiness::Ready);
+        assert!(window.is_active_leader());
+        window.leader_readiness = LeaderReadiness::Hydrating;
+        assert!(
+            !window.is_active_leader(),
+            "owning the lock is inert until hydration is complete"
+        );
+    }
+
+    #[test]
+    fn startup_arms_only_duties_owned_by_the_instance() {
+        let mut leader = Window::default();
+        let leader_task = leader.arm_initial_duties(wallpaper::CurrentWallpaper::NoFile);
+        assert_eq!(leader.timer_generation, 1, "ordinary refresh timer armed");
+        assert_eq!(leader.shuffle_generation, 1, "shuffle state synchronized");
+        assert!(leader.thumbnail_pass_pending, "startup producer armed");
+        assert!(!leader.refresh_pending);
+        assert_eq!(leader.leadership_generation, 0);
+        assert_eq!(leader_task.units(), 2, "refresh timer plus thumbnail pass");
+
+        let mut follower = Window {
+            leadership: Leadership::forced(false),
+            ..Window::default()
+        };
+        let follower_task = follower.arm_initial_duties(wallpaper::CurrentWallpaper::NoFile);
+        assert_eq!(follower.leadership_generation, 1);
+        assert_eq!(follower.timer_generation, 0);
+        assert_eq!(follower.shuffle_generation, 0);
+        assert!(!follower.shuffle_armed);
+        assert!(!follower.thumbnail_pass_pending);
+        assert!(!follower.refresh_pending);
+        assert_eq!(follower_task.units(), 1, "takeover retry only");
+    }
+
+    #[test]
+    fn initial_leader_consumes_outstanding_peer_refresh_without_a_second_producer() {
+        let mut window = Window {
+            coordination: CoordinationConfig {
+                refresh_request: 7,
+                refresh_completion: crate::config::PeerRefreshCompletion {
+                    request: 5,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Window::default()
+        };
+
+        let task = window.arm_initial_duties(wallpaper::CurrentWallpaper::NoFile);
+
+        assert_eq!(window.peer_refresh_request, Some(7));
+        assert!(window.refresh_pending, "peer request starts the fetch now");
+        assert!(
+            !window.thumbnail_pass_pending,
+            "only one thumbnail producer"
+        );
+        assert_eq!(
+            window.timer_generation, 1,
+            "ordinary timer also remains armed"
+        );
+        assert_eq!(task.units(), 2, "timer plus immediate refresh");
+    }
 
     #[test]
     fn app_id_is_reverse_dns() {
@@ -2920,6 +3139,56 @@ mod tests {
             copyright: "© Someone".to_owned(),
             copyrightlink: "https://example.com".to_owned(),
             filename,
+        }
+    }
+
+    #[test]
+    fn non_leader_restore_is_read_only_for_missing_corrupt_and_stale_catalogues() {
+        for case in ["missing", "corrupt", "stale"] {
+            let dir = tempfile::tempdir().unwrap();
+            let images = dir.path().join("images");
+            let state = dir.path().join("state");
+            std::fs::create_dir_all(&images).unwrap();
+            std::fs::create_dir_all(&state).unwrap();
+            let image = entry_on_disk(&images, "20260807", "Kept_ROW1");
+            let catalogue_path = state.join(catalogue::CATALOGUE_FILENAME);
+
+            match case {
+                "missing" => {}
+                "corrupt" => std::fs::write(&catalogue_path, b"not json").unwrap(),
+                "stale" => {
+                    let stale = entry_on_disk(&images, "20260101", "Gone_ROW2");
+                    Catalogue {
+                        images: vec![stale.clone(), image.clone()],
+                    }
+                    .save(&catalogue_path)
+                    .unwrap();
+                    std::fs::remove_file(stale.filename).unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            // Cache debris makes an accidental reconciliation visible in all
+            // three cases, including missing/corrupt catalogue rebuilds.
+            let cache = state.join("thumbs");
+            std::fs::create_dir_all(&cache).unwrap();
+            std::fs::write(cache.join("orphan.jpg"), b"keep").unwrap();
+            let before = file_snapshot(dir.path());
+
+            let restored = restore_catalogue_for_role(&catalogue_path, &images, &state, false);
+
+            assert!(
+                restored
+                    .images
+                    .iter()
+                    .any(|entry| entry.filename == image.filename),
+                "{case}: read-only restoration still produces a useful view"
+            );
+            assert_eq!(
+                file_snapshot(dir.path()),
+                before,
+                "{case}: follower restoration must not save, prune, or reconcile"
+            );
         }
     }
 

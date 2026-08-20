@@ -303,24 +303,24 @@ reload helper. Leaders keep their in-memory-authoritative catalogue.
 - Modify: `src/app.rs`
 - Test: `src/app.rs`
 
-- [ ] add `Leadership`, ready/hydration state, coordination state, and the new
+- [x] add `Leadership`, ready/hydration state, coordination state, and the new
       timer/generation fields to `Window`; keep existing fixtures leader-ready
       through a readiness wrapper whose `Default` is ready, while production
       initializes every field explicitly
-- [ ] acquire the lock before catalogue restore; leader restore keeps today's
+- [x] acquire the lock before catalogue restore; leader restore keeps today's
       prune/save/reconcile behavior, non-leader restore is read-only
-- [ ] extract `arm_leader_duties(CurrentWallpaper)` and call it only for the
+- [x] extract `arm_leader_duties(CurrentWallpaper)` and call it only for the
       initial active leader; a non-leader arms only takeover retry
-- [ ] add the second `CoordinationConfig` subscription without changing the
+- [x] add the second `CoordinationConfig` subscription without changing the
       lockwatch subscription or popup surface routing
-- [ ] **success tests:** the leader init-shaped helper arms exactly today's
+- [x] **success tests:** the leader init-shaped helper arms exactly today's
       duties and consumes an outstanding peer refresh; the non-leader arms only
       takeover retry
-- [ ] **failure/edge tests:** non-leader restoration with missing, corrupt, or
+- [x] **failure/edge tests:** non-leader restoration with missing, corrupt, or
       stale catalogue data performs no catalogue save, prune, or cache mutation
-- [ ] confirm the existing `Window::default()` suite retains leader behavior
+- [x] confirm the existing `Window::default()` suite retains leader behavior
       without fixture churn
-- [ ] run focused startup/restore tests and `just check`; both must pass before
+- [x] run focused startup/restore tests and `just check`; both must pass before
       Task 4
 
 ### Task 4: Gate runtime automatic, destructive, and persistence paths
