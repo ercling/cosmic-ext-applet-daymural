@@ -426,6 +426,25 @@ pub(crate) struct LeadershipHydration {
     live: wallpaper::CurrentWallpaper,
 }
 
+/// Read-only catalogue and live-wallpaper snapshot used to refresh a
+/// follower's popup without letting it mutate shared state.
+#[derive(Debug, Clone)]
+pub(crate) struct NonLeaderReload {
+    catalogue: Catalogue,
+    live: wallpaper::CurrentWallpaper,
+}
+
+fn read_non_leader_reload(
+    catalogue_path: &Path,
+    images_dir: &Path,
+    live: wallpaper::CurrentWallpaper,
+) -> NonLeaderReload {
+    NonLeaderReload {
+        catalogue: Catalogue::load_or_rebuild(catalogue_path, images_dir),
+        live,
+    }
+}
+
 fn accent_job(inflight: &AccentInflight) -> AccentJob {
     match inflight {
         AccentInflight::Write { builders, pair, .. } => AccentJob::Write {
@@ -562,6 +581,11 @@ pub enum Message {
         generation: u64,
         state_generation: u64,
         result: Result<LeadershipHydration, String>,
+    },
+    /// A follower's read-only catalogue/live-state snapshot finished.
+    NonLeaderReloaded {
+        generation: u64,
+        result: Result<NonLeaderReload, String>,
     },
     /// The refresh timer fired (payload: the generation it was armed with).
     RefreshDue(u64),
@@ -1410,12 +1434,45 @@ impl Window {
         })
     }
 
-    /// Mark the point where Task 8 performs a read-only catalogue/live-state
-    /// reload. Keeping the generation here makes completion and timeout
-    /// settlement observable and already safe against later applies/reloads.
+    /// Reload a follower's catalogue and live wallpaper off the UI thread.
+    /// The generation is invalidated by every newer reload, successful local
+    /// apply, and takeover, so an old disk snapshot cannot move navigation
+    /// state backwards.
     fn request_non_leader_reload(&mut self) -> app::Task<Message> {
+        if self.leadership.is_leader() {
+            return Task::none();
+        }
         self.non_leader_reload_generation = self.non_leader_reload_generation.wrapping_add(1);
-        Task::none()
+        let generation = self.non_leader_reload_generation;
+        let catalogue_path = catalogue_path();
+        let images_dir = wallpaper::download_dir();
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                read_non_leader_reload(&catalogue_path, &images_dir, wallpaper::current_wallpaper())
+            })
+            .await
+            .map_err(|error| format!("non-leader reload task failed: {error}"));
+            Message::NonLeaderReloaded { generation, result }
+        })
+    }
+
+    /// Adopt an injected follower snapshot only while it is still current.
+    /// This completion performs no filesystem or cosmic-config reads.
+    fn finish_non_leader_reload(
+        &mut self,
+        generation: u64,
+        result: Result<NonLeaderReload, String>,
+    ) {
+        if self.leadership.is_leader() || generation != self.non_leader_reload_generation {
+            return;
+        }
+        match result {
+            Ok(reload) => {
+                self.catalogue = reload.catalogue;
+                self.current = wallpaper::synced_current(&reload.live, self.current.take());
+            }
+            Err(error) => tracing::warn!("failed to reload non-leader state: {error}"),
+        }
     }
 
     fn settle_peer_refresh(&mut self, completion: PeerRefreshCompletion) -> app::Task<Message> {
@@ -3086,7 +3143,7 @@ impl cosmic::Application for Window {
                         popup_id,
                     ));
                 }
-                return cosmic::surface::surface_task(cosmic::surface::action::app_popup(
+                let popup = cosmic::surface::surface_task(cosmic::surface::action::app_popup(
                     |_: &Window| Default::default(),
                     |window: &mut Window| {
                         let new_id = window::Id::unique();
@@ -3107,6 +3164,18 @@ impl cosmic::Application for Window {
                     },
                     None,
                 ));
+                // The popup action is emitted immediately. A follower also
+                // refreshes its read-only view in parallel unless a peer
+                // refresh is already settling; that path reloads once its
+                // completion or timeout arrives instead.
+                if !self.leadership.is_leader()
+                    && !self.peer_refresh_write_pending
+                    && self.requested_peer_refresh.is_none()
+                    && !self.refresh_pending
+                {
+                    return Task::batch([popup, self.request_non_leader_reload()]);
+                }
+                return popup;
             }
             Message::PopupClosed(id) => return self.on_popup_closed(id),
             Message::ConfigUpdated(config) => {
@@ -3226,6 +3295,9 @@ impl cosmic::Application for Window {
                 result,
             } => {
                 return self.finish_leadership_hydration(generation, state_generation, result);
+            }
+            Message::NonLeaderReloaded { generation, result } => {
+                self.finish_non_leader_reload(generation, result);
             }
             Message::RefreshDue(generation) => {
                 // Stale timers (replaced by a newer reschedule) are ignored.
@@ -5294,6 +5366,211 @@ mod tests {
             refresh_pending: true,
             peer_refresh_timeout_generation: request,
             ..Window::default()
+        }
+    }
+
+    fn follower_reload(catalogue: Catalogue, live: wallpaper::CurrentWallpaper) -> NonLeaderReload {
+        NonLeaderReload { catalogue, live }
+    }
+
+    #[test]
+    fn non_leader_popup_batches_reload_without_changing_popup_ledger() {
+        use cosmic::Application as _;
+
+        let mut follower = Window {
+            leadership: Leadership::forced(false),
+            dropdowns_open: 2,
+            ..Window::default()
+        };
+        let task = follower.update(Message::TogglePopup);
+        assert_eq!(
+            task.units(),
+            2,
+            "popup action and blocking reload are batched"
+        );
+        assert_eq!(follower.non_leader_reload_generation, 1);
+        assert_eq!(
+            follower.dropdowns_open, 2,
+            "opening does not edit the ledger"
+        );
+        assert_eq!(
+            follower.popup, None,
+            "the runtime still owns popup creation"
+        );
+
+        let mut leader = Window::default();
+        let task = leader.update(Message::TogglePopup);
+        assert_eq!(task.units(), 1, "a leader trusts its in-memory catalogue");
+        assert_eq!(leader.non_leader_reload_generation, 0);
+    }
+
+    #[test]
+    fn pending_peer_refresh_suppresses_popup_reload() {
+        use cosmic::Application as _;
+
+        for mut follower in [
+            Window {
+                leadership: Leadership::forced(false),
+                peer_refresh_write_pending: true,
+                ..Window::default()
+            },
+            Window {
+                leadership: Leadership::forced(false),
+                requested_peer_refresh: Some(4),
+                refresh_pending: true,
+                ..Window::default()
+            },
+        ] {
+            let task = follower.update(Message::TogglePopup);
+            assert_eq!(task.units(), 1, "popup creation is never delayed");
+            assert_eq!(follower.non_leader_reload_generation, 0);
+        }
+    }
+
+    #[test]
+    fn non_leader_reload_adopts_added_and_dropped_entries_and_live_current() {
+        let dropped = entry_in_memory("20260806", "Dropped_ROW1");
+        let added = entry_in_memory("20260808", "Added_ROW2");
+        let live = PathBuf::from("/images/live.jpg");
+        let mut follower = Window {
+            leadership: Leadership::forced(false),
+            catalogue: Catalogue {
+                images: vec![dropped],
+            },
+            current: Some(PathBuf::from("/images/stale.jpg")),
+            non_leader_reload_generation: 3,
+            ..Window::default()
+        };
+
+        follower.finish_non_leader_reload(
+            3,
+            Ok(follower_reload(
+                Catalogue {
+                    images: vec![added.clone()],
+                },
+                wallpaper::CurrentWallpaper::File(live.clone()),
+            )),
+        );
+
+        assert_eq!(follower.catalogue.images, vec![added]);
+        assert_eq!(follower.current, Some(live));
+    }
+
+    #[test]
+    fn peer_refresh_settlement_reuses_the_guarded_reload() {
+        let added = entry_in_memory("20260808", "Peer_ROW2");
+        let live = PathBuf::from("/images/peer-live.jpg");
+        let mut follower = peer_follower(5);
+
+        let reload_task = follower.settle_peer_refresh(PeerRefreshCompletion {
+            request: 5,
+            outcome: PeerRefreshOutcome::Success,
+        });
+        assert_eq!(reload_task.units(), 1);
+        assert_eq!(follower.non_leader_reload_generation, 1);
+        follower.finish_non_leader_reload(
+            1,
+            Ok(follower_reload(
+                Catalogue {
+                    images: vec![added.clone()],
+                },
+                wallpaper::CurrentWallpaper::File(live.clone()),
+            )),
+        );
+
+        assert_eq!(follower.catalogue.images, vec![added]);
+        assert_eq!(follower.current, Some(live));
+    }
+
+    #[test]
+    fn stale_non_leader_reload_cannot_overwrite_apply_or_takeover_state() {
+        let stale_entry = entry_in_memory("20260801", "Stale_ROW1");
+        let authoritative = entry_in_memory("20260809", "Authoritative_ROW2");
+
+        let mut after_apply = Window {
+            leadership: Leadership::forced(false),
+            non_leader_reload_generation: 1,
+            catalogue: Catalogue {
+                images: vec![authoritative.clone()],
+            },
+            ..Window::default()
+        };
+        let applied = PathBuf::from("/images/applied.jpg");
+        drop(after_apply.finish_manual_apply(applied.clone()));
+        after_apply.finish_non_leader_reload(
+            1,
+            Ok(follower_reload(
+                Catalogue {
+                    images: vec![stale_entry.clone()],
+                },
+                wallpaper::CurrentWallpaper::NoFile,
+            )),
+        );
+        assert_eq!(after_apply.catalogue.images, vec![authoritative.clone()]);
+        assert_eq!(after_apply.current, Some(applied));
+
+        let mut after_takeover = Window {
+            leadership: Leadership::forced(true),
+            leader_readiness: LeaderReadiness::Ready,
+            non_leader_reload_generation: 2,
+            catalogue: Catalogue {
+                images: vec![authoritative.clone()],
+            },
+            current: Some(PathBuf::from("/images/leader.jpg")),
+            ..Window::default()
+        };
+        after_takeover.finish_non_leader_reload(
+            2,
+            Ok(follower_reload(
+                Catalogue {
+                    images: vec![stale_entry],
+                },
+                wallpaper::CurrentWallpaper::NoFile,
+            )),
+        );
+        assert_eq!(after_takeover.catalogue.images, vec![authoritative]);
+        assert_eq!(
+            after_takeover.current,
+            Some(PathBuf::from("/images/leader.jpg"))
+        );
+    }
+
+    #[test]
+    fn non_leader_reload_failure_and_catalogue_fallback_are_safe_and_read_only() {
+        let mut follower = Window {
+            leadership: Leadership::forced(false),
+            non_leader_reload_generation: 1,
+            catalogue: Catalogue {
+                images: vec![entry_in_memory("20260807", "Kept_ROW1")],
+            },
+            current: Some(PathBuf::from("/images/kept.jpg")),
+            ..Window::default()
+        };
+        let before = follower.catalogue.clone();
+        follower.finish_non_leader_reload(1, Err("join failed".to_owned()));
+        assert_eq!(follower.catalogue, before);
+        assert_eq!(follower.current, Some(PathBuf::from("/images/kept.jpg")));
+
+        for corrupt in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let images = dir.path().join("images");
+            let catalogue_path = dir.path().join("catalogue.json");
+            std::fs::create_dir_all(&images).unwrap();
+            let rebuilt = entry_on_disk(&images, "20260808", "Rebuilt_ROW2");
+            if corrupt {
+                std::fs::write(&catalogue_path, b"not json").unwrap();
+            }
+            let before = file_snapshot(dir.path());
+
+            let reload = read_non_leader_reload(
+                &catalogue_path,
+                &images,
+                wallpaper::CurrentWallpaper::Unknown,
+            );
+
+            assert_eq!(reload.catalogue.images.len(), 1);
+            assert_eq!(reload.catalogue.images[0].filename, rebuilt.filename);
+            assert_eq!(file_snapshot(dir.path()), before, "reload writes nothing");
         }
     }
 

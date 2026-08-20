@@ -437,18 +437,18 @@ reload helper. Leaders keep their in-memory-authoritative catalogue.
 - Modify: `src/app.rs`
 - Test: `src/app.rs`
 
-- [ ] add the generation-guarded read-only reload helper and completion
+- [x] add the generation-guarded read-only reload helper and completion
       message for catalogue plus live wallpaper
-- [ ] batch reload with popup creation for a non-leader when no peer refresh is
+- [x] batch reload with popup creation for a non-leader when no peer refresh is
       pending; never delay or bypass the popup ledger action
-- [ ] reuse the helper after peer refresh completion/timeout and invalidate it
+- [x] reuse the helper after peer refresh completion/timeout and invalidate it
       after a successful local apply or takeover
-- [ ] **success tests:** reload adopts added/dropped entries and applies
+- [x] **success tests:** reload adopts added/dropped entries and applies
       `synced_current` after popup open and peer refresh settlement
-- [ ] **failure/edge tests:** stale completion after apply/takeover,
+- [x] **failure/edge tests:** stale completion after apply/takeover,
       pending-refresh suppression, corrupt/missing catalogue fallback, and a
       leader popup cannot overwrite authoritative in-memory state
-- [ ] run focused popup/reload tests and `just check`; both must pass before
+- [x] run focused popup/reload tests and `just check`; both must pass before
       Task 9
 
 ### Task 9: Verify acceptance criteria
