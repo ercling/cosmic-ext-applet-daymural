@@ -114,10 +114,6 @@ impl AppletConfig {
 /// field names are deliberately disjoint from [`AppletConfig`]. Each helper
 /// below writes exactly one key, so a process never persists a stale snapshot
 /// of the rest of the mailbox.
-#[allow(
-    dead_code,
-    reason = "wired into the app by later implementation-plan tasks"
-)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, CosmicConfigEntry, Default)]
 #[version = 1]
 pub struct CoordinationConfig {
@@ -126,20 +122,12 @@ pub struct CoordinationConfig {
     pub apply_notice: Option<PeerApplyNotice>,
 }
 
-#[allow(
-    dead_code,
-    reason = "wired into the app by later implementation-plan tasks"
-)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerApplyNotice {
     pub generation: u64,
     pub path: PathBuf,
 }
 
-#[allow(
-    dead_code,
-    reason = "wired into the app by later implementation-plan tasks"
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum PeerRefreshOutcome {
     #[default]
@@ -148,10 +136,6 @@ pub enum PeerRefreshOutcome {
     Disk,
 }
 
-#[allow(
-    dead_code,
-    reason = "wired into the app by later implementation-plan tasks"
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PeerRefreshCompletion {
     pub request: u64,
@@ -162,10 +146,6 @@ impl CoordinationConfig {
     /// Use the same app ID/version directory as [`AppletConfig`]. The two
     /// entries remain independent because cosmic-config persists each field
     /// under its field name.
-    #[allow(
-        dead_code,
-        reason = "wired into startup by the next implementation-plan task"
-    )]
     pub fn context() -> Result<Config, cosmic_config::Error> {
         Config::new(APP_ID, Self::VERSION)
     }
@@ -185,10 +165,6 @@ impl CoordinationConfig {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "wired into the app by later implementation-plan tasks"
-)]
 #[derive(Debug)]
 pub(crate) enum CoordinationError {
     Config(cosmic_config::Error),
@@ -222,10 +198,6 @@ impl From<io::Error> for CoordinationError {
 
 /// Allocate and persist the next peer refresh request while excluding other
 /// mailbox writers. Intended for blocking-worker use only.
-#[allow(
-    dead_code,
-    reason = "wired into the app by later implementation-plan tasks"
-)]
 pub(crate) fn increment_refresh_request(
     config: &Config,
     state_dir: &Path,
@@ -242,10 +214,6 @@ pub(crate) fn increment_refresh_request(
 
 /// Allocate and persist an apply notice generation. Intended for
 /// blocking-worker use only.
-#[allow(
-    dead_code,
-    reason = "wired into the app by later implementation-plan tasks"
-)]
 pub(crate) fn write_apply_notice(
     config: &Config,
     state_dir: &Path,
@@ -269,10 +237,6 @@ pub(crate) fn write_apply_notice(
 /// Persist a refresh acknowledgement if it is newer than the one already on
 /// disk. Returns whether the key changed. Intended for blocking-worker use
 /// only.
-#[allow(
-    dead_code,
-    reason = "wired into the app by later implementation-plan tasks"
-)]
 pub(crate) fn record_refresh_completion(
     config: &Config,
     state_dir: &Path,

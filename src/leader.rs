@@ -6,11 +6,6 @@
 //! operations.  Both locks are advisory and are released when their open file
 //! is dropped, including during unwinding or process exit.
 
-#![allow(
-    dead_code,
-    reason = "the staged implementation plan wires these primitives into the app in later tasks"
-)]
-
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::path::Path;

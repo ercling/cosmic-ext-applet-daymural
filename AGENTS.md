@@ -228,11 +228,12 @@ inline UI strings.
 - Update the user-facing README when behavior, settings, installation, or
   limitations change. Update the relevant plan when implementation diverges
   from recorded design.
-- The current planned feature is
-  `docs/plans/20260817-single-instance-leader.md`. It restores the single-owner
-  premise on multi-output panels. When implementing it, follow its task order,
-  tests, leader/non-leader side-effect gates, per-key non-leader persistence,
-  and progress tracking; do not treat the plan's unchecked boxes as completed.
+- Multi-output panels run one applet process per output, but exactly one active
+  leader owns shared background, destructive, lock-screen, and accent work.
+  Followers proxy refresh/apply coordination, persist ordinary settings one
+  key at a time, and hydrate fresh state before takeover. Preserve the gates
+  and mailbox rules recorded in
+  `docs/plans/completed/20260817-single-instance-leader.md`.
 
 ## Code Review Rules
 

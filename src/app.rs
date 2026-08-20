@@ -9,7 +9,7 @@
 // pending timer. The pipeline itself runs as one async task and reports
 // back via `RefreshFinished`.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -229,8 +229,17 @@ pub struct Window {
     /// Independent watched entry for cross-process requests and notices.
     coordination: CoordinationConfig,
     /// Context used for raw, single-key coordination writes.
-    #[allow(dead_code, reason = "used by peer mailbox writers in later plan tasks")]
     coordination_context: Option<cosmic_config::Config>,
+    /// Per-key generations for follower setting writes. A completion may
+    /// update the popup only when no newer write to that same key exists.
+    follower_setting_generations: [u64; 4],
+    /// One serialized queue prevents an older blocking write from landing
+    /// after a newer click and regressing the on-disk key.
+    follower_setting_queue: VecDeque<(u64, FollowerSetting)>,
+    follower_setting_inflight: bool,
+    /// Generation guarding blocking fresh-config confirmations triggered by
+    /// watcher payloads.
+    config_confirmation_generation: u64,
     /// Injectable directory containing the short-lived coordination lock.
     /// Production uses [`state_dir`]; tests always provide a tempdir.
     coordination_state_dir: PathBuf,
@@ -333,6 +342,11 @@ pub struct Window {
     /// no-op. Tests inject a tempdir-rooted `Config::with_custom_path`
     /// handle (mirroring `config_context`).
     poke_config: Option<cosmic_config::Config>,
+    /// Hermetic inputs used by tests that drain the real hydration/reload
+    /// tasks. Production always resolves the ordinary applet paths and live
+    /// cosmic-bg state inside the blocking task.
+    #[cfg(test)]
+    test_snapshot_inputs: Option<TestSnapshotInputs>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -423,6 +437,15 @@ enum AccentJob {
 pub(crate) struct LeadershipHydration {
     config: AppletConfig,
     coordination: CoordinationConfig,
+    catalogue: Catalogue,
+    live: wallpaper::CurrentWallpaper,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct TestSnapshotInputs {
+    catalogue_path: PathBuf,
+    images_dir: PathBuf,
     live: wallpaper::CurrentWallpaper,
 }
 
@@ -434,6 +457,55 @@ pub(crate) struct NonLeaderReload {
     live: wallpaper::CurrentWallpaper,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FollowerSetting {
+    ShuffleEnabled(bool),
+    ShuffleInterval(u32),
+    Retention(u16),
+    AccentEnabled(bool),
+}
+
+impl FollowerSetting {
+    fn slot(self) -> usize {
+        match self {
+            Self::ShuffleEnabled(_) => 0,
+            Self::ShuffleInterval(_) => 1,
+            Self::Retention(_) => 2,
+            Self::AccentEnabled(_) => 3,
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::ShuffleEnabled(_) => "shuffle_enabled",
+            Self::ShuffleInterval(_) => "shuffle_interval_secs",
+            Self::Retention(_) => "retention_days",
+            Self::AccentEnabled(_) => "accent_enabled",
+        }
+    }
+
+    fn adopt(self, config: &mut AppletConfig) {
+        match self {
+            Self::ShuffleEnabled(value) => config.shuffle_enabled = value,
+            Self::ShuffleInterval(value) => config.shuffle_interval_secs = value,
+            Self::Retention(value) => config.retention_days = value,
+            Self::AccentEnabled(value) => config.accent_enabled = value,
+        }
+    }
+
+    fn persist(self, context: &cosmic_config::Config) -> Result<(), cosmic_config::Error> {
+        use cosmic_config::ConfigSet as _;
+
+        match self {
+            Self::ShuffleEnabled(value) => context.set(self.key(), value),
+            Self::ShuffleInterval(value) => context.set(self.key(), value),
+            Self::Retention(value) => context.set(self.key(), value),
+            Self::AccentEnabled(value) => context.set(self.key(), value),
+        }
+        .map(|_| ())
+    }
+}
+
 fn read_non_leader_reload(
     catalogue_path: &Path,
     images_dir: &Path,
@@ -442,6 +514,27 @@ fn read_non_leader_reload(
     NonLeaderReload {
         catalogue: Catalogue::load_or_rebuild(catalogue_path, images_dir),
         live,
+    }
+}
+
+/// Watchers may deliver snapshots out of order. Mailbox counters are
+/// append-only evidence, so merge every field monotonically instead of
+/// replacing a newer in-memory snapshot with a late payload.
+fn merge_coordination(current: &mut CoordinationConfig, incoming: CoordinationConfig) {
+    current.refresh_request = current.refresh_request.max(incoming.refresh_request);
+    if incoming.refresh_completion.request > current.refresh_completion.request {
+        current.refresh_completion = incoming.refresh_completion;
+    }
+    let current_notice = current
+        .apply_notice
+        .as_ref()
+        .map_or(0, |notice| notice.generation);
+    if incoming
+        .apply_notice
+        .as_ref()
+        .is_some_and(|notice| notice.generation > current_notice)
+    {
+        current.apply_notice = incoming.apply_notice;
     }
 }
 
@@ -571,6 +664,13 @@ pub enum Message {
     PopupClosed(window::Id),
     /// Settings changed on disk (external edit or our own write echoed back).
     ConfigUpdated(AppletConfig),
+    /// Fresh disk confirmation for a config watcher payload. The read runs on
+    /// the blocking pool; the generation and role prevent late adoption.
+    ConfigConfirmed {
+        generation: u64,
+        was_active_leader: bool,
+        config: AppletConfig,
+    },
     /// Cross-process coordination mailbox changed on disk.
     CoordinationUpdated(CoordinationConfig),
     /// The one-shot leadership retry timer fired.
@@ -586,6 +686,12 @@ pub enum Message {
     NonLeaderReloaded {
         generation: u64,
         result: Result<NonLeaderReload, String>,
+    },
+    /// A follower's raw single-key setting persist completed.
+    FollowerSettingWritten {
+        generation: u64,
+        setting: FollowerSetting,
+        result: Result<(), String>,
     },
     /// The refresh timer fired (payload: the generation it was armed with).
     RefreshDue(u64),
@@ -750,11 +856,38 @@ impl Window {
         self.leadership_hydration_generation = self.leadership_hydration_generation.wrapping_add(1);
         let generation = self.leadership_hydration_generation;
         let state_generation = self.leadership_state_generation;
+        #[cfg(test)]
+        let (snapshot_catalogue_path, snapshot_images_dir, test_live) =
+            if let Some(inputs) = &self.test_snapshot_inputs {
+                (
+                    inputs.catalogue_path.clone(),
+                    inputs.images_dir.clone(),
+                    Some(inputs.live.clone()),
+                )
+            } else {
+                (catalogue_path(), wallpaper::download_dir(), None)
+            };
+        #[cfg(not(test))]
+        let (snapshot_catalogue_path, snapshot_images_dir) =
+            (catalogue_path(), wallpaper::download_dir());
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || LeadershipHydration {
                 config: AppletConfig::load(&config_context),
                 coordination: CoordinationConfig::load(&coordination_context),
-                live: wallpaper::current_wallpaper(),
+                catalogue: Catalogue::load_or_rebuild(
+                    &snapshot_catalogue_path,
+                    &snapshot_images_dir,
+                ),
+                live: {
+                    #[cfg(test)]
+                    if let Some(live) = test_live {
+                        live
+                    } else {
+                        wallpaper::current_wallpaper()
+                    }
+                    #[cfg(not(test))]
+                    wallpaper::current_wallpaper()
+                },
             })
             .await
             .map_err(|error| format!("leadership hydration task failed: {error}"));
@@ -794,13 +927,32 @@ impl Window {
 
         self.config = hydration.config;
         self.coordination = hydration.coordination;
+        self.catalogue = hydration.catalogue;
         self.peer_apply_notice_generation = self
             .coordination
             .apply_notice
             .as_ref()
             .map_or(0, |notice| notice.generation);
         self.current = wallpaper::synced_current(&hydration.live, self.current.take());
+        // A takeover must not inherit follower request state. In particular,
+        // stale `refresh_pending` would reject every leader timer forever.
+        self.peer_refresh_request = None;
+        self.requested_peer_refresh = None;
+        self.peer_refresh_write_pending = false;
+        self.refresh_pending = false;
+        self.follower_setting_queue.clear();
+        self.peer_refresh_timeout_generation = self.peer_refresh_timeout_generation.wrapping_add(1);
         self.non_leader_reload_generation = self.non_leader_reload_generation.wrapping_add(1);
+        // Only an explicitly empty live wallpaper is safe for a takeover to
+        // retain first-run auto-apply semantics. Any displayed/unknown state
+        // conservatively spends the bypass so an external choice is safe.
+        self.cold_start = if self.catalogue.images.is_empty()
+            && matches!(&hydration.live, wallpaper::CurrentWallpaper::NoFile)
+        {
+            ColdStart::Pending
+        } else {
+            ColdStart::Done
+        };
         self.leader_readiness = LeaderReadiness::Ready;
         self.arm_leader_duties(hydration.live)
     }
@@ -1114,6 +1266,81 @@ impl Window {
             .chain(after)
     }
 
+    /// Treat a watcher payload as evidence and confirm the complete current
+    /// entry from disk away from the UI thread. With no context there can be
+    /// no self-write echo, so the payload itself remains usable.
+    fn confirm_config_update(&mut self, payload: AppletConfig) -> app::Task<Message> {
+        self.config_confirmation_generation = self.config_confirmation_generation.wrapping_add(1);
+        let generation = self.config_confirmation_generation;
+        let was_active_leader = self.is_active_leader();
+        let Some(context) = self.config_context.clone() else {
+            return self.finish_config_confirmation(
+                generation,
+                was_active_leader,
+                payload.normalize(),
+            );
+        };
+        cosmic::task::future(async move {
+            let config = tokio::task::spawn_blocking(move || AppletConfig::load(&context))
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!("config confirmation task failed: {error}");
+                    payload.normalize()
+                });
+            Message::ConfigConfirmed {
+                generation,
+                was_active_leader,
+                config,
+            }
+        })
+    }
+
+    fn finish_config_confirmation(
+        &mut self,
+        generation: u64,
+        was_active_leader: bool,
+        mut config: AppletConfig,
+    ) -> app::Task<Message> {
+        if generation != self.config_confirmation_generation
+            || was_active_leader != self.is_active_leader()
+        {
+            return Task::none();
+        }
+
+        config = config.normalize();
+        let shuffle_changed = config.shuffle_enabled != self.config.shuffle_enabled
+            || config.shuffle_interval_secs != self.config.shuffle_interval_secs;
+        let retention_reduced =
+            schedule::retention_reduced(self.config.retention_days, config.retention_days);
+        if !self.is_active_leader() {
+            config.accent_snapshot = self.config.accent_snapshot;
+            config.accent_last_written = self.config.accent_last_written;
+            self.config = config;
+            return Task::none();
+        }
+
+        let accent_flip = if self.accent_inflight.is_some() {
+            None
+        } else {
+            (config.accent_enabled != self.config.accent_enabled).then_some(config.accent_enabled)
+        };
+        config.accent_enabled = self.config.accent_enabled;
+        config.accent_snapshot = self.config.accent_snapshot;
+        config.accent_last_written = self.config.accent_last_written;
+        self.config = config;
+        let mut tasks = Vec::new();
+        if retention_reduced {
+            tasks.push(self.prune_immediately());
+        }
+        if shuffle_changed {
+            tasks.push(self.sync_shuffle(true));
+        }
+        if let Some(enabled) = accent_flip {
+            tasks.push(self.set_accent_enabled(enabled));
+        }
+        Task::batch(tasks)
+    }
+
     /// Write-on-change: adopt `config` and persist it if it differs from the
     /// current settings. Used by the shuffle/retention controls.
     fn set_config(&mut self, config: AppletConfig) {
@@ -1138,29 +1365,75 @@ impl Window {
     /// accent snapshot fields. A follower adopts the value only after the
     /// write lands; a memory-only fixture retains the applet's established
     /// in-memory settings behavior.
-    fn set_non_leader_setting<T>(
-        &mut self,
-        key: &'static str,
-        value: T,
-        adopt: impl FnOnce(&mut AppletConfig, T),
-    ) where
-        T: serde::Serialize + Clone,
-    {
-        use cosmic_config::ConfigSet as _;
-
-        let persisted = match &self.config_context {
-            Some(context) => match context.set(key, value.clone()) {
-                Ok(_) => true,
-                Err(error) => {
-                    tracing::warn!("failed to persist applet setting {key}: {error}");
-                    false
-                }
-            },
-            None => true,
+    fn set_non_leader_setting(&mut self, setting: FollowerSetting) -> app::Task<Message> {
+        let slot = setting.slot();
+        let Some(context) = self.config_context.clone() else {
+            if !matches!(setting, FollowerSetting::AccentEnabled(true)) {
+                setting.adopt(&mut self.config);
+            } else {
+                tracing::warn!(
+                    "cannot enable accent-from-wallpaper from a non-leader: applet config is not persistable"
+                );
+            }
+            return Task::none();
         };
-        if persisted {
-            adopt(&mut self.config, value);
+
+        self.follower_setting_generations[slot] =
+            self.follower_setting_generations[slot].wrapping_add(1);
+        let generation = self.follower_setting_generations[slot];
+        self.follower_setting_queue.push_back((generation, setting));
+        self.start_next_follower_setting_write(context)
+    }
+
+    fn start_next_follower_setting_write(
+        &mut self,
+        context: cosmic_config::Config,
+    ) -> app::Task<Message> {
+        if self.follower_setting_inflight {
+            return Task::none();
         }
+        let Some((generation, setting)) = self.follower_setting_queue.pop_front() else {
+            return Task::none();
+        };
+        self.follower_setting_inflight = true;
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || setting.persist(&context))
+                .await
+                .map_err(|error| format!("follower setting task failed: {error}"))
+                .and_then(|result| result.map_err(|error| error.to_string()));
+            Message::FollowerSettingWritten {
+                generation,
+                setting,
+                result,
+            }
+        })
+    }
+
+    fn finish_non_leader_setting(
+        &mut self,
+        generation: u64,
+        setting: FollowerSetting,
+        result: Result<(), String>,
+    ) -> app::Task<Message> {
+        self.follower_setting_inflight = false;
+        if self.leadership.is_leader() {
+            self.follower_setting_queue.clear();
+            return Task::none();
+        }
+        if generation == self.follower_setting_generations[setting.slot()] {
+            match result {
+                Ok(()) => setting.adopt(&mut self.config),
+                Err(error) => tracing::warn!(
+                    "failed to persist applet setting {}: {error}",
+                    setting.key()
+                ),
+            }
+        }
+        self.config_context
+            .clone()
+            .map_or_else(Task::none, |context| {
+                self.start_next_follower_setting_write(context)
+            })
     }
 
     /// Arm the one-shot refresh timer for `delay` from now, invalidating any
@@ -1444,11 +1717,32 @@ impl Window {
         }
         self.non_leader_reload_generation = self.non_leader_reload_generation.wrapping_add(1);
         let generation = self.non_leader_reload_generation;
-        let catalogue_path = catalogue_path();
-        let images_dir = wallpaper::download_dir();
+        #[cfg(test)]
+        let (catalogue_path, images_dir, test_live) =
+            if let Some(inputs) = &self.test_snapshot_inputs {
+                (
+                    inputs.catalogue_path.clone(),
+                    inputs.images_dir.clone(),
+                    Some(inputs.live.clone()),
+                )
+            } else {
+                (catalogue_path(), wallpaper::download_dir(), None)
+            };
+        #[cfg(not(test))]
+        let (catalogue_path, images_dir) = (catalogue_path(), wallpaper::download_dir());
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                read_non_leader_reload(&catalogue_path, &images_dir, wallpaper::current_wallpaper())
+                let live = {
+                    #[cfg(test)]
+                    if let Some(live) = test_live {
+                        live
+                    } else {
+                        wallpaper::current_wallpaper()
+                    }
+                    #[cfg(not(test))]
+                    wallpaper::current_wallpaper()
+                };
+                read_non_leader_reload(&catalogue_path, &images_dir, live)
             })
             .await
             .map_err(|error| format!("non-leader reload task failed: {error}"));
@@ -2300,8 +2594,7 @@ impl Window {
     /// this same dispatcher by the completion's fresh-disk-read reconcile.
     fn set_accent_enabled(&mut self, enabled: bool) -> app::Task<Message> {
         if !self.is_active_leader() {
-            self.set_non_leader_accent_enabled(enabled);
-            return Task::none();
+            return self.set_non_leader_accent_enabled(enabled);
         }
         if self.accent_inflight.is_some() {
             if enabled == self.accent_toggler_state() {
@@ -2354,24 +2647,11 @@ impl Window {
     /// is permitted here. Unlike ordinary follower settings, a missing
     /// config context is not allowed to create a memory-only enabled state:
     /// no leader could observe or safely own that lifecycle.
-    fn set_non_leader_accent_enabled(&mut self, enabled: bool) {
-        use cosmic_config::ConfigSet as _;
-
+    fn set_non_leader_accent_enabled(&mut self, enabled: bool) -> app::Task<Message> {
         if enabled == self.config.accent_enabled {
-            return;
+            return Task::none();
         }
-        let Some(context) = &self.config_context else {
-            tracing::warn!(
-                "cannot change accent-from-wallpaper from a non-leader: applet config is not persistable"
-            );
-            return;
-        };
-        match context.set("accent_enabled", enabled) {
-            Ok(_) => self.config.accent_enabled = enabled,
-            Err(error) => {
-                tracing::warn!("failed to persist the requested non-leader accent toggle: {error}")
-            }
-        }
+        self.set_non_leader_setting(FollowerSetting::AccentEnabled(enabled))
     }
 
     /// What the popup's accent toggler renders: the *requested* state while
@@ -3072,6 +3352,10 @@ impl cosmic::Application for Window {
             config_context,
             coordination,
             coordination_context,
+            follower_setting_generations: [0; 4],
+            follower_setting_queue: VecDeque::new(),
+            follower_setting_inflight: false,
+            config_confirmation_generation: 0,
             coordination_state_dir: state_dir().to_path_buf(),
             peer_refresh_request: None,
             requested_peer_refresh: None,
@@ -3097,6 +3381,8 @@ impl cosmic::Application for Window {
             accent_disk_enabled_at_spawn: None,
             lock_poke_generation: 0,
             poke_config: wallpaper::poke_state_handle(),
+            #[cfg(test)]
+            test_snapshot_inputs: None,
         };
         let startup = window.arm_initial_duties(live);
         (window, startup)
@@ -3188,88 +3474,14 @@ impl cosmic::Application for Window {
                     // (or synchronously confirm it from disk) in between.
                     return Task::none();
                 }
-                // Our own setter writes echo back here unchanged (no-op);
-                // an *external* edit of the shuffle settings restarts the
-                // countdown against the new values, and an externally
-                // reduced retention prunes immediately. Watched configs
-                // arrive raw — normalize like `AppletConfig::load` does,
-                // so a hand-edited retention outside the dropdown's
-                // choices never drives prune/fetch.
-                let mut config = config.normalize();
-                let shuffle_changed = config.shuffle_enabled != self.config.shuffle_enabled
-                    || config.shuffle_interval_secs != self.config.shuffle_interval_secs;
-                let retention_reduced =
-                    schedule::retention_reduced(self.config.retention_days, config.retention_days);
-                if !self.is_active_leader() {
-                    // Watcher payloads can be stale. Followers own only the
-                    // displayed flag, and confirm it from disk just like the
-                    // leader confirms evidence of an external flip. The
-                    // leader-owned snapshot and last-written record remain
-                    // authoritative until takeover hydration.
-                    config.accent_enabled = self
-                        .config_context
-                        .as_ref()
-                        .map(|context| AppletConfig::load(context).accent_enabled)
-                        .unwrap_or(config.accent_enabled);
-                    config.accent_snapshot = self.config.accent_snapshot;
-                    config.accent_last_written = self.config.accent_last_written;
-                    self.config = config;
-                    return Task::none();
-                }
-                // An external flip of `accent_enabled` must run the same
-                // lifecycle as the popup toggler — snapshot + compute on
-                // enable, restore + clear on disable — not silently adopt
-                // the flag (which would orphan the snapshot on disable and
-                // never snapshot on enable). The three accent fields
-                // themselves NEVER adopt from a watcher payload: payloads
-                // are read at event time and can be delivered late, so even
-                // with no task in flight a payload can carry stale
-                // mid-flight state (a `last_written: None` adopted after
-                // the write completed makes the next recompute disarm
-                // spuriously — the incident's oscillation class). Under the
-                // single-instance assumption the in-memory accent fields
-                // are authoritative; a routed flip persists the resulting
-                // accent state itself.
-                //
-                // A payload flip is only *evidence* of an external edit —
-                // verified against a fresh disk read before routing (a
-                // stale echo's flag disagrees with memory but the disk
-                // agrees; a genuine external flip lives on the disk). While
-                // an accent theme task is in flight no flip is routed at
-                // all — the completion reconciles against the disk itself.
-                let accent_flip = if self.accent_inflight.is_some() {
-                    None
-                } else if config.accent_enabled != self.config.accent_enabled {
-                    match &self.config_context {
-                        Some(context) => {
-                            let disk = AppletConfig::load(context).accent_enabled;
-                            (disk != self.config.accent_enabled).then_some(disk)
-                        }
-                        // No disk to verify against — but a memory-only
-                        // config has no persists of ours to echo either, so
-                        // the payload is taken at face value.
-                        None => Some(config.accent_enabled),
-                    }
-                } else {
-                    None
-                };
-                config.accent_enabled = self.config.accent_enabled;
-                config.accent_snapshot = self.config.accent_snapshot;
-                config.accent_last_written = self.config.accent_last_written;
-                self.config = config;
-                let mut tasks = Vec::new();
-                if retention_reduced {
-                    tasks.push(self.prune_immediately());
-                }
-                if shuffle_changed {
-                    tasks.push(self.sync_shuffle(true));
-                }
-                if let Some(enabled) = accent_flip {
-                    tasks.push(self.set_accent_enabled(enabled));
-                }
-                if !tasks.is_empty() {
-                    return Task::batch(tasks);
-                }
+                return self.confirm_config_update(config);
+            }
+            Message::ConfigConfirmed {
+                generation,
+                was_active_leader,
+                config,
+            } => {
+                return self.finish_config_confirmation(generation, was_active_leader, config);
             }
             Message::CoordinationUpdated(coordination) => {
                 self.leadership_state_generation = self.leadership_state_generation.wrapping_add(1);
@@ -3278,9 +3490,9 @@ impl cosmic::Application for Window {
                 {
                     return Task::none();
                 }
-                let completion = coordination.refresh_completion;
-                let apply_notice = coordination.apply_notice.clone();
-                self.coordination = coordination;
+                merge_coordination(&mut self.coordination, coordination);
+                let completion = self.coordination.refresh_completion;
+                let apply_notice = self.coordination.apply_notice.clone();
                 if self.is_active_leader() {
                     let refresh = self.consume_peer_refresh_request();
                     let apply = self.consume_peer_apply_notice(apply_notice);
@@ -3299,6 +3511,11 @@ impl cosmic::Application for Window {
             Message::NonLeaderReloaded { generation, result } => {
                 self.finish_non_leader_reload(generation, result);
             }
+            Message::FollowerSettingWritten {
+                generation,
+                setting,
+                result,
+            } => return self.finish_non_leader_setting(generation, setting, result),
             Message::RefreshDue(generation) => {
                 // Stale timers (replaced by a newer reschedule) are ignored.
                 if self.is_active_leader() && generation == self.timer_generation {
@@ -3410,10 +3627,7 @@ impl cosmic::Application for Window {
             }
             Message::SetShuffleEnabled(enabled) => {
                 if !self.is_active_leader() {
-                    self.set_non_leader_setting("shuffle_enabled", enabled, |config, value| {
-                        config.shuffle_enabled = value;
-                    });
-                    return Task::none();
+                    return self.set_non_leader_setting(FollowerSetting::ShuffleEnabled(enabled));
                 }
                 let mut config = self.config.clone();
                 config.shuffle_enabled = enabled;
@@ -3424,12 +3638,7 @@ impl cosmic::Application for Window {
             Message::SetShuffleInterval(index) => {
                 let interval = view::shuffle_interval_secs(index);
                 if !self.is_active_leader() {
-                    self.set_non_leader_setting(
-                        "shuffle_interval_secs",
-                        interval,
-                        |config, value| config.shuffle_interval_secs = value,
-                    );
-                    return Task::none();
+                    return self.set_non_leader_setting(FollowerSetting::ShuffleInterval(interval));
                 }
                 let mut config = self.config.clone();
                 config.shuffle_interval_secs = interval;
@@ -3440,10 +3649,7 @@ impl cosmic::Application for Window {
             Message::SetRetention(index) => {
                 let new_days = view::retention_days(index);
                 if !self.is_active_leader() {
-                    self.set_non_leader_setting("retention_days", new_days, |config, value| {
-                        config.retention_days = value;
-                    });
-                    return Task::none();
+                    return self.set_non_leader_setting(FollowerSetting::Retention(new_days));
                 }
                 let reduced = schedule::retention_reduced(self.config.retention_days, new_days);
                 let mut config = self.config.clone();
@@ -3682,13 +3888,15 @@ mod tests {
         LeadershipHydration {
             config,
             coordination,
+            catalogue: Catalogue::default(),
             live,
         }
     }
 
-    #[test]
-    fn real_lock_loser_takes_over_once_and_stays_inert_until_hydrated() {
+    #[tokio::test]
+    async fn real_lock_loser_takes_over_once_and_stays_inert_until_hydrated() {
         use cosmic::Application as _;
+        use cosmic_config::CosmicConfigEntry as _;
 
         let dir = tempfile::tempdir().unwrap();
         let winner = Leadership::acquire(dir.path());
@@ -3696,11 +3904,42 @@ mod tests {
         assert!(winner.is_leader());
         assert!(!loser.is_leader());
         let (config_context, coordination_context) = takeover_contexts(&dir.path().join("config"));
+        let disk_config = AppletConfig {
+            retention_days: 30,
+            ..Default::default()
+        };
+        disk_config.write_entry(&config_context).unwrap();
+        let disk_coordination = CoordinationConfig {
+            refresh_request: 4,
+            refresh_completion: PeerRefreshCompletion {
+                request: 4,
+                outcome: PeerRefreshOutcome::Success,
+            },
+            ..Default::default()
+        };
+        disk_coordination
+            .write_entry(&coordination_context)
+            .unwrap();
+        let images_dir = dir.path().join("images");
+        std::fs::create_dir_all(&images_dir).unwrap();
+        let entry = entry_on_disk(&images_dir, "20260820", "Takeover_ROW1");
+        let catalogue_path = dir.path().join("state/catalogue.json");
+        std::fs::create_dir_all(catalogue_path.parent().unwrap()).unwrap();
+        let mut disk_catalogue = Catalogue::default();
+        disk_catalogue.images.push(entry.clone());
+        disk_catalogue.save(&catalogue_path).unwrap();
+        let live_path = entry.filename.clone();
         let mut window = Window {
             leadership: loser,
             leadership_generation: 1,
             config_context: Some(config_context),
             coordination_context: Some(coordination_context),
+            cold_start: ColdStart::Pending,
+            test_snapshot_inputs: Some(TestSnapshotInputs {
+                catalogue_path,
+                images_dir,
+                live: wallpaper::CurrentWallpaper::File(live_path.clone()),
+            }),
             ..Window::default()
         };
 
@@ -3729,6 +3968,17 @@ mod tests {
             0,
             "the consumed takeover tick cannot arm another snapshot"
         );
+
+        let mut outputs = app_messages(hydration_task).await;
+        assert_eq!(outputs.len(), 1);
+        drop(window.update(outputs.pop().unwrap()));
+        assert!(window.is_active_leader());
+        assert_eq!(window.config, disk_config);
+        assert_eq!(window.coordination, disk_coordination);
+        assert_eq!(window.catalogue, disk_catalogue);
+        assert_eq!(window.current, Some(live_path));
+        assert_eq!(window.cold_start, ColdStart::Done);
+        assert_eq!(window.timer_generation, 1);
     }
 
     #[test]
@@ -3771,23 +4021,35 @@ mod tests {
             config: AppletConfig::default(),
             coordination: CoordinationConfig::default(),
             current: Some(PathBuf::from("/stale.jpg")),
+            requested_peer_refresh: Some(4),
+            peer_refresh_write_pending: true,
+            refresh_pending: true,
+            peer_refresh_timeout_generation: 6,
+            cold_start: ColdStart::Pending,
             ..Window::default()
         };
 
-        let duties = window.finish_leadership_hydration(
-            3,
-            5,
-            Ok(hydration(
-                config.clone(),
-                coordination.clone(),
-                wallpaper::CurrentWallpaper::File(live_path.clone()),
-            )),
+        let mut hydrated = hydration(
+            config.clone(),
+            coordination.clone(),
+            wallpaper::CurrentWallpaper::File(live_path.clone()),
         );
+        hydrated
+            .catalogue
+            .images
+            .push(entry_in_memory("20260820", "Hydrated_ROW1"));
+
+        let duties = window.finish_leadership_hydration(3, 5, Ok(hydrated));
 
         assert!(window.is_active_leader());
         assert_eq!(window.config, config, "the complete accent trio is adopted");
         assert_eq!(window.coordination, coordination);
         assert_eq!(window.current, Some(live_path));
+        assert_eq!(window.catalogue.images.len(), 1);
+        assert_eq!(window.requested_peer_refresh, None);
+        assert!(!window.peer_refresh_write_pending);
+        assert_eq!(window.cold_start, ColdStart::Done);
+        assert!(window.peer_refresh_timeout_generation > 6);
         assert_eq!(window.peer_apply_notice_generation, 11);
         assert_eq!(window.peer_refresh_request, Some(9));
         assert!(
@@ -5404,6 +5666,67 @@ mod tests {
         assert_eq!(leader.non_leader_reload_generation, 0);
     }
 
+    #[tokio::test]
+    async fn popup_and_peer_settlement_drain_the_real_injected_reload_task() {
+        use cosmic::Application as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let images_dir = dir.path().join("images");
+        let catalogue_path = dir.path().join("state/catalogue.json");
+        std::fs::create_dir_all(&images_dir).unwrap();
+        std::fs::create_dir_all(catalogue_path.parent().unwrap()).unwrap();
+        let first = entry_on_disk(&images_dir, "20260819", "Popup_ROW1");
+        Catalogue {
+            images: vec![first.clone()],
+        }
+        .save(&catalogue_path)
+        .unwrap();
+        let first_live = first.filename.clone();
+        let mut follower = Window {
+            leadership: Leadership::forced(false),
+            test_snapshot_inputs: Some(TestSnapshotInputs {
+                catalogue_path: catalogue_path.clone(),
+                images_dir: images_dir.clone(),
+                live: wallpaper::CurrentWallpaper::File(first_live.clone()),
+            }),
+            ..Window::default()
+        };
+
+        let task = follower.update(Message::TogglePopup);
+        let mut outputs = app_messages(task).await;
+        assert_eq!(
+            outputs.len(),
+            1,
+            "surface action is ignored, reload completes"
+        );
+        drop(follower.update(outputs.pop().unwrap()));
+        assert_eq!(follower.non_leader_reload_generation, 1);
+        assert_eq!(follower.catalogue.images, vec![first]);
+        assert_eq!(follower.current, Some(first_live));
+
+        let second = entry_on_disk(&images_dir, "20260820", "Peer_ROW2");
+        Catalogue {
+            images: vec![second.clone()],
+        }
+        .save(&catalogue_path)
+        .unwrap();
+        let second_live = second.filename.clone();
+        follower.test_snapshot_inputs.as_mut().unwrap().live =
+            wallpaper::CurrentWallpaper::File(second_live.clone());
+        follower.requested_peer_refresh = Some(7);
+        follower.refresh_pending = true;
+        let reload = follower.settle_peer_refresh(PeerRefreshCompletion {
+            request: 7,
+            outcome: PeerRefreshOutcome::Success,
+        });
+        let mut outputs = app_messages(reload).await;
+        assert_eq!(outputs.len(), 1);
+        drop(follower.update(outputs.pop().unwrap()));
+        assert_eq!(follower.non_leader_reload_generation, 2);
+        assert_eq!(follower.catalogue.images, vec![second]);
+        assert_eq!(follower.current, Some(second_live));
+    }
+
     #[test]
     fn pending_peer_refresh_suppresses_popup_reload() {
         use cosmic::Application as _;
@@ -5657,6 +5980,83 @@ mod tests {
     }
 
     #[test]
+    fn late_coordination_snapshots_never_regress_or_repeat_leader_work() {
+        use cosmic::Application as _;
+
+        let mut window = Window::default();
+        let newer = CoordinationConfig {
+            refresh_request: 10,
+            refresh_completion: PeerRefreshCompletion {
+                request: 10,
+                outcome: PeerRefreshOutcome::Success,
+            },
+            apply_notice: Some(PeerApplyNotice {
+                generation: 5,
+                path: PathBuf::from("/new.jpg"),
+            }),
+        };
+        let first = window.update(Message::CoordinationUpdated(newer.clone()));
+        assert_eq!(first.units(), 1, "only apply validation is armed");
+        assert!(!window.refresh_pending);
+
+        let stale = CoordinationConfig {
+            refresh_request: 9,
+            refresh_completion: PeerRefreshCompletion {
+                request: 9,
+                outcome: PeerRefreshOutcome::Network,
+            },
+            apply_notice: Some(PeerApplyNotice {
+                generation: 4,
+                path: PathBuf::from("/old.jpg"),
+            }),
+        };
+        let duplicate = window.update(Message::CoordinationUpdated(stale));
+        assert_eq!(duplicate.units(), 0, "late evidence arms no duplicate work");
+        assert_eq!(window.coordination, newer);
+        assert_eq!(window.peer_apply_notice_generation, 5);
+        assert!(!window.refresh_pending);
+    }
+
+    #[test]
+    fn follower_config_confirmation_is_generation_guarded_and_not_inline() {
+        use cosmic::Application as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (context, _) = takeover_contexts(&dir.path().join("config"));
+        let mut window = Window {
+            leadership: Leadership::forced(false),
+            config_context: Some(context),
+            ..Window::default()
+        };
+        let mut first = window.config.clone();
+        first.retention_days = 30;
+        let task = window.update(Message::ConfigUpdated(first.clone()));
+        assert_eq!(task.units(), 1);
+        assert_eq!(
+            window.config.retention_days, 8,
+            "payload is not read inline"
+        );
+        let first_generation = window.config_confirmation_generation;
+
+        let mut second = first.clone();
+        second.retention_days = 3;
+        drop(window.update(Message::ConfigUpdated(second.clone())));
+        let second_generation = window.config_confirmation_generation;
+        drop(window.update(Message::ConfigConfirmed {
+            generation: first_generation,
+            was_active_leader: false,
+            config: first,
+        }));
+        assert_eq!(window.config.retention_days, 8, "stale completion dropped");
+        drop(window.update(Message::ConfigConfirmed {
+            generation: second_generation,
+            was_active_leader: false,
+            config: second,
+        }));
+        assert_eq!(window.config.retention_days, 3);
+    }
+
+    #[test]
     fn stale_completion_and_timeout_cannot_clear_a_newer_request() {
         use cosmic::Application as _;
 
@@ -5726,6 +6126,14 @@ mod tests {
             _ => None,
         })
         .await
+    }
+
+    async fn deliver_app_task(window: &mut Window, task: app::Task<Message>) {
+        use cosmic::Application as _;
+
+        for message in app_messages(task).await {
+            drop(window.update(message));
+        }
     }
 
     #[tokio::test]
@@ -5904,8 +6312,8 @@ mod tests {
         assert!(!window.thumbnail_pass_pending);
     }
 
-    #[test]
-    fn non_leader_settings_persist_only_their_own_keys() {
+    #[tokio::test]
+    async fn non_leader_settings_persist_only_their_own_keys() {
         use cosmic::Application as _;
         use cosmic_config::CosmicConfigEntry as _;
 
@@ -5948,9 +6356,15 @@ mod tests {
         let timer_generation = window.timer_generation;
         let shuffle_generation = window.shuffle_generation;
 
-        drop(window.update(Message::SetShuffleEnabled(true)));
-        drop(window.update(Message::SetShuffleInterval(0)));
-        drop(window.update(Message::SetRetention(0)));
+        for message in [
+            Message::SetShuffleEnabled(true),
+            Message::SetShuffleInterval(0),
+            Message::SetRetention(0),
+        ] {
+            let mut outputs = app_messages(window.update(message)).await;
+            assert_eq!(outputs.len(), 1);
+            drop(window.update(outputs.pop().unwrap()));
+        }
 
         assert!(window.config.shuffle_enabled);
         assert_eq!(window.config.shuffle_interval_secs, 1_800);
@@ -5963,8 +6377,8 @@ mod tests {
         assert_eq!(persisted.accent_last_written, Some(last_written));
     }
 
-    #[test]
-    fn non_leader_settings_handle_missing_and_failing_config_contexts() {
+    #[tokio::test]
+    async fn non_leader_settings_handle_missing_and_failing_config_contexts() {
         use cosmic::Application as _;
         use cosmic_config::CosmicConfigEntry as _;
 
@@ -5995,12 +6409,49 @@ mod tests {
         };
         let before = failing.config.clone();
 
-        drop(failing.update(Message::SetShuffleEnabled(true)));
-        drop(failing.update(Message::SetShuffleInterval(0)));
-        drop(failing.update(Message::SetRetention(0)));
+        for message in [
+            Message::SetShuffleEnabled(true),
+            Message::SetShuffleInterval(0),
+            Message::SetRetention(0),
+        ] {
+            let mut outputs = app_messages(failing.update(message)).await;
+            assert_eq!(outputs.len(), 1);
+            drop(failing.update(outputs.pop().unwrap()));
+        }
 
         assert_eq!(failing.config, before, "failed persists are not adopted");
         assert!(!failing.shuffle_armed);
+    }
+
+    #[tokio::test]
+    async fn follower_setting_writes_are_serialized_and_latest_value_wins() {
+        use cosmic::Application as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (context, _) = takeover_contexts(&dir.path().join("config"));
+        let mut window = Window {
+            leadership: Leadership::forced(false),
+            config_context: Some(context),
+            ..Window::default()
+        };
+
+        let first = window.update(Message::SetShuffleEnabled(true));
+        let second = window.update(Message::SetShuffleEnabled(false));
+        assert_eq!(first.units(), 1);
+        assert_eq!(second.units(), 0, "newer write waits behind the first");
+        let mut outputs = app_messages(first).await;
+        let next = window.update(outputs.pop().unwrap());
+        assert!(
+            !window.config.shuffle_enabled,
+            "stale completion is not adopted"
+        );
+        let mut outputs = app_messages(next).await;
+        drop(window.update(outputs.pop().unwrap()));
+
+        assert!(!window.config.shuffle_enabled);
+        assert!(!AppletConfig::load(window.config_context.as_ref().unwrap()).shuffle_enabled);
+        assert!(!window.follower_setting_inflight);
+        assert!(window.follower_setting_queue.is_empty());
     }
 
     #[test]
@@ -6851,8 +7302,8 @@ mod tests {
         AppletConfig::load(window.config_context.as_ref().unwrap())
     }
 
-    #[test]
-    fn non_leader_accent_toggle_persists_only_the_raw_flag() {
+    #[tokio::test]
+    async fn non_leader_accent_toggle_persists_only_the_raw_flag() {
         use cosmic::Application as _;
         use cosmic_config::CosmicConfigEntry as _;
 
@@ -6875,7 +7326,9 @@ mod tests {
         let last_written = window.config.accent_last_written;
         let write_generation = window.accent_write_generation;
 
-        drop(window.update(Message::SetAccentEnabled(false)));
+        let mut outputs = app_messages(window.update(Message::SetAccentEnabled(false))).await;
+        assert_eq!(outputs.len(), 1);
+        drop(window.update(outputs.pop().unwrap()));
 
         assert!(!window.config.accent_enabled);
         let disk = persisted_config(&window);
@@ -6886,8 +7339,8 @@ mod tests {
         assert_eq!(window.accent_write_generation, write_generation);
     }
 
-    #[test]
-    fn non_leader_accent_toggle_requires_a_successful_persist() {
+    #[tokio::test]
+    async fn non_leader_accent_toggle_requires_a_successful_persist() {
         use cosmic::Application as _;
         use cosmic_config::CosmicConfigEntry as _;
 
@@ -6913,13 +7366,15 @@ mod tests {
             config_context: Some(context),
             ..Window::default()
         };
-        drop(failing.update(Message::SetAccentEnabled(true)));
+        let mut outputs = app_messages(failing.update(Message::SetAccentEnabled(true))).await;
+        assert_eq!(outputs.len(), 1);
+        drop(failing.update(outputs.pop().unwrap()));
         assert!(!failing.config.accent_enabled);
         assert!(failing.accent_inflight.is_none());
     }
 
-    #[test]
-    fn non_leader_config_echo_uses_fresh_flag_and_keeps_accent_records() {
+    #[tokio::test]
+    async fn non_leader_config_echo_uses_fresh_flag_and_keeps_accent_records() {
         use cosmic::Application as _;
         use cosmic_config::ConfigSet as _;
 
@@ -6947,7 +7402,9 @@ mod tests {
         stale.accent_enabled = true;
         stale.accent_snapshot = None;
         stale.accent_last_written = None;
-        drop(window.update(Message::ConfigUpdated(stale)));
+        let mut outputs = app_messages(window.update(Message::ConfigUpdated(stale))).await;
+        assert_eq!(outputs.len(), 1);
+        drop(window.update(outputs.pop().unwrap()));
 
         assert!(!window.config.accent_enabled, "fresh disk flag wins");
         assert_eq!(window.config.accent_snapshot, snapshot);
@@ -7618,8 +8075,8 @@ mod tests {
         assert_eq!(current_accents(&window), (user.light, user.dark));
     }
 
-    #[test]
-    fn a_refused_external_enable_is_persisted_back_off() {
+    #[tokio::test]
+    async fn a_refused_external_enable_is_persisted_back_off() {
         use cosmic::Application as _;
         use cosmic_config::CosmicConfigEntry as _;
 
@@ -7653,7 +8110,8 @@ mod tests {
         assert!(persisted_config(&window).accent_enabled);
 
         let locked = read_only_theme_dirs(&dir);
-        drop(window.update(Message::ConfigUpdated(external)));
+        let task = window.update(Message::ConfigUpdated(external));
+        deliver_app_task(&mut window, task).await;
         settle_accent_tasks(&mut window);
         restore_dir_permissions(&locked);
 
@@ -8046,8 +8504,8 @@ mod tests {
         assert_eq!(window.config.accent_last_written, None);
     }
 
-    #[test]
-    fn config_updated_accent_flips_run_the_toggle_lifecycle() {
+    #[tokio::test]
+    async fn config_updated_accent_flips_run_the_toggle_lifecycle() {
         use cosmic::Application as _;
         use cosmic_config::CosmicConfigEntry as _;
 
@@ -8073,7 +8531,8 @@ mod tests {
         external
             .write_entry(window.config_context.as_ref().unwrap())
             .unwrap();
-        drop(window.update(Message::ConfigUpdated(external)));
+        let task = window.update(Message::ConfigUpdated(external));
+        deliver_app_task(&mut window, task).await;
         assert!(window.config.accent_enabled);
         assert_eq!(window.config.accent_snapshot, Some(user));
         assert_eq!(window.config.accent_last_written, None);
@@ -8095,7 +8554,8 @@ mod tests {
         external
             .write_entry(window.config_context.as_ref().unwrap())
             .unwrap();
-        drop(window.update(Message::ConfigUpdated(external)));
+        let task = window.update(Message::ConfigUpdated(external));
+        deliver_app_task(&mut window, task).await;
         settle_accent_tasks(&mut window);
         assert!(!window.config.accent_enabled);
         assert_eq!(window.config.accent_snapshot, None);
@@ -8187,9 +8647,10 @@ mod tests {
         (window, source)
     }
 
-    #[test]
-    fn a_config_echo_during_an_inflight_write_is_not_routed_through_the_lifecycle() {
+    #[tokio::test]
+    async fn a_config_echo_during_an_inflight_write_is_not_routed_through_the_lifecycle() {
         use cosmic::Application as _;
+        use cosmic_config::ConfigSet as _;
 
         // The incident's oscillation: our own multi-key persists echoed back
         // stale/torn while the minute-long theme write flew, the apparent
@@ -8206,7 +8667,14 @@ mod tests {
         echo.accent_snapshot = None;
         echo.accent_last_written = None;
         echo.retention_days = 30;
-        drop(window.update(Message::ConfigUpdated(echo)));
+        window
+            .config_context
+            .as_ref()
+            .unwrap()
+            .set("retention_days", 30_u16)
+            .unwrap();
+        let task = window.update(Message::ConfigUpdated(echo));
+        deliver_app_task(&mut window, task).await;
 
         assert!(window.config.accent_enabled, "no disable routed");
         assert_eq!(window.config.accent_snapshot, snapshot, "snapshot kept");
@@ -8421,8 +8889,8 @@ mod tests {
         assert_eq!(persisted_config(&window), window.config);
     }
 
-    #[test]
-    fn an_external_disable_landing_during_an_enable_restore_is_routed_not_stomped() {
+    #[tokio::test]
+    async fn an_external_disable_landing_during_an_enable_restore_is_routed_not_stomped() {
         use cosmic::Application as _;
         use cosmic_config::CosmicConfigEntry as _;
 
@@ -8463,7 +8931,8 @@ mod tests {
         external
             .write_entry(window.config_context.as_ref().unwrap())
             .unwrap();
-        drop(window.update(Message::ConfigUpdated(external)));
+        let task = window.update(Message::ConfigUpdated(external));
+        deliver_app_task(&mut window, task).await;
         assert!(matches!(
             window.accent_inflight,
             Some(AccentInflight::EnableRestore { .. })
@@ -8476,7 +8945,8 @@ mod tests {
         flipped
             .write_entry(window.config_context.as_ref().unwrap())
             .unwrap();
-        drop(window.update(Message::ConfigUpdated(flipped)));
+        let task = window.update(Message::ConfigUpdated(flipped));
+        deliver_app_task(&mut window, task).await;
         assert!(
             window.accent_inflight.is_some(),
             "echo suppressed, the restore still flying"
