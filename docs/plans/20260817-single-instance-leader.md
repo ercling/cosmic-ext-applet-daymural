@@ -453,24 +453,24 @@ reload helper. Leaders keep their in-memory-authoritative catalogue.
 
 ### Task 9: Verify acceptance criteria
 
-- [ ] audit every caller of `schedule_refresh`, `sync_shuffle`,
+- [x] audit every caller of `schedule_refresh`, `sync_shuffle`,
       `start_thumbnail_pass_over`, `start_accent_compute`,
       `accent_compute_for_current`, `on_apply_success`, `prune_immediately`,
       `finish_refresh`, poke arming, and full-entry `set_config`
-- [ ] verify exactly one active instance owns automatic work and every
+- [x] verify exactly one active instance owns automatic work and every
       thumbnail producer/sweep; non-leader refresh is a leader request, not a
       local pipeline
-- [ ] verify settings and accent toggles work from either popup without stale
+- [x] verify settings and accent toggles work from either popup without stale
       full-entry writes, and a non-leader apply promptly updates leader
       current/ColdStart/accent state
-- [ ] verify startup races yield one lock winner; leader death during accent or
+- [x] verify startup races yield one lock winner; leader death during accent or
       refresh work is reconciled by fresh takeover state without adopting stale
       async completions
-- [ ] verify all tests use injected paths and no test/diagnostic can contact
+- [x] verify all tests use injected paths and no test/diagnostic can contact
       Bing or real COSMIC config/theme/state
-- [ ] verify no popup ledger, dependency, or Fluent catalogue changes leaked
+- [x] verify no popup ledger, dependency, or Fluent catalogue changes leaked
       into the implementation
-- [ ] run `just check`
+- [x] run `just check`
 
 ### Task 10: [Final] Update documentation
 
