@@ -254,21 +254,21 @@ reload helper. Leaders keep their in-memory-authoritative catalogue.
 - Modify: `src/main.rs`
 - Test: `src/leader.rs`
 
-- [ ] implement the leader-lock API and fail-open logging described above;
+- [x] implement the leader-lock API and fail-open logging described above;
       retain the
       opened file on both lock-winner and `WouldBlock` paths so the loser can
       retry the same handle
-- [ ] implement the blocking-pool-only coordination critical-section helper;
+- [x] implement the blocking-pool-only coordination critical-section helper;
       it must release on success, closure error, and unwind/process exit
-- [ ] declare `mod leader;`
-- [ ] **success tests:** two opens in one tempdir produce one leader; dropping the winner
+- [x] declare `mod leader;`
+- [x] **success tests:** two opens in one tempdir produce one leader; dropping the winner
       lets the loser acquire exactly once; still-blocked/already-leader retries
       return false; concurrent coordination critical sections serialize;
       `forced(true)`, `forced(false)`, and defaults report the intended role
-- [ ] **failure/edge tests:** a closure error releases `coordination.lock`; the
+- [x] **failure/edge tests:** a closure error releases `coordination.lock`; the
       deterministic file-as-directory leader-lock error resolves to leader and
       logs without using real user paths
-- [ ] run `PKG_CONFIG_PATH=/usr/lib64/pkgconfig:/usr/share/pkgconfig cargo test leader`
+- [x] run `PKG_CONFIG_PATH=/usr/lib64/pkgconfig:/usr/share/pkgconfig cargo test leader`
       and `just check`; both must pass before Task 2
 
 ### Task 2: Add the coordination config protocol

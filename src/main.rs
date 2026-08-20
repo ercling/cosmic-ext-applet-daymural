@@ -4,6 +4,7 @@ mod bing;
 mod catalogue;
 mod config;
 mod fsutil;
+mod leader;
 mod localize;
 mod lockwatch;
 mod schedule;
