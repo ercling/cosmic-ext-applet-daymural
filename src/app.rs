@@ -243,8 +243,17 @@ pub struct Window {
     /// Injectable directory containing the short-lived coordination lock.
     /// Production uses [`state_dir`]; tests always provide a tempdir.
     coordination_state_dir: PathBuf,
-    /// Newest peer refresh request attached to the current fetch.
+    /// Newest peer refresh request reserved for the current or next fetch.
     peer_refresh_request: Option<u64>,
+    /// Highest peer request covered by a fetch that finished in this
+    /// process. This advances before the asynchronous acknowledgement write,
+    /// so a late watcher/read completion cannot refetch the same request when
+    /// that write is delayed or fails.
+    peer_refresh_covered: u64,
+    /// The one live-wallpaper read currently being used to start a peer
+    /// refresh. While it is present, newer requests join the same reserved
+    /// next fetch instead of spawning parallel reads.
+    peer_refresh_live_read: Option<u64>,
     /// Request this non-leader popup is waiting for the leader to cover.
     requested_peer_refresh: Option<u64>,
     /// A blocking request-counter persist is in flight. Kept separate from
@@ -992,6 +1001,8 @@ impl Window {
         // A takeover must not inherit follower request state. In particular,
         // stale `refresh_pending` would reject every leader timer forever.
         self.peer_refresh_request = None;
+        self.peer_refresh_covered = self.coordination.refresh_completion.request;
+        self.peer_refresh_live_read = None;
         self.requested_peer_refresh = None;
         self.peer_refresh_write_pending = false;
         self.refresh_pending = false;
@@ -1975,15 +1986,32 @@ impl Window {
         }
     }
 
-    /// Attach every currently outstanding mailbox request to the one fetch
-    /// in flight, or start that fetch when idle.
+    /// Reserve every currently outstanding mailbox request for the one fetch
+    /// in flight, or asynchronously obtain the live state needed to start it.
     fn consume_peer_refresh_request(&mut self) -> app::Task<Message> {
-        if !self.is_active_leader()
-            || self.coordination.refresh_request <= self.coordination.refresh_completion.request
-        {
+        if !self.is_active_leader() {
             return Task::none();
         }
         let request = self.coordination.refresh_request;
+        if request
+            <= self
+                .coordination
+                .refresh_completion
+                .request
+                .max(self.peer_refresh_covered)
+        {
+            return Task::none();
+        }
+
+        // Reserve synchronously. Any refresh already in flight—or started by
+        // another message before the live read returns—will now acknowledge
+        // this request when it finishes.
+        self.peer_refresh_request =
+            Some(self.peer_refresh_request.unwrap_or_default().max(request));
+        if self.refresh_pending || self.peer_refresh_live_read.is_some() {
+            return Task::none();
+        }
+        self.peer_refresh_live_read = Some(request);
         #[cfg(test)]
         let test_live = self
             .test_snapshot_inputs
@@ -2011,20 +2039,43 @@ impl Window {
         request: u64,
         live: wallpaper::CurrentWallpaper,
     ) -> app::Task<Message> {
-        if !self.is_active_leader() || request != self.coordination.refresh_request {
+        if self.peer_refresh_live_read != Some(request) {
             return Task::none();
         }
-        self.consume_peer_refresh_request_over(live)
+        self.peer_refresh_live_read = None;
+        if !self.is_active_leader() || self.refresh_pending {
+            return Task::none();
+        }
+        let Some(reserved) = self.peer_refresh_request else {
+            return Task::none();
+        };
+        if reserved
+            <= self
+                .coordination
+                .refresh_completion
+                .request
+                .max(self.peer_refresh_covered)
+        {
+            self.peer_refresh_request = None;
+            return Task::none();
+        }
+        self.start_refresh_over(live)
     }
 
     /// [`Window::consume_peer_refresh_request`] with injected live wallpaper
     /// state for hermetic decision tests.
+    #[cfg(test)]
     fn consume_peer_refresh_request_over(
         &mut self,
         live: wallpaper::CurrentWallpaper,
     ) -> app::Task<Message> {
         if !self.is_active_leader()
-            || self.coordination.refresh_request <= self.coordination.refresh_completion.request
+            || self.coordination.refresh_request
+                <= self
+                    .coordination
+                    .refresh_completion
+                    .request
+                    .max(self.peer_refresh_covered)
         {
             return Task::none();
         }
@@ -2159,6 +2210,9 @@ impl Window {
             return Task::none();
         }
         let peer_request = self.peer_refresh_request.take();
+        if let Some(request) = peer_request {
+            self.peer_refresh_covered = self.peer_refresh_covered.max(request);
+        }
         let peer_outcome = match &result {
             Ok(_) => PeerRefreshOutcome::Success,
             Err(RefreshError::Network(_)) => PeerRefreshOutcome::Network,
@@ -3426,6 +3480,7 @@ impl cosmic::Application for Window {
             .apply_notice
             .as_ref()
             .map_or(0, |notice| notice.generation);
+        let peer_refresh_covered = coordination.refresh_completion.request;
 
         // Same degradation for the theme configs: without them the accent
         // feature is inert, everything else keeps working.
@@ -3478,6 +3533,8 @@ impl cosmic::Application for Window {
             config_confirmation_generation: 0,
             coordination_state_dir: state_dir().to_path_buf(),
             peer_refresh_request: None,
+            peer_refresh_covered,
+            peer_refresh_live_read: None,
             requested_peer_refresh: None,
             peer_refresh_write_pending: false,
             peer_refresh_timeout_generation: 0,
@@ -6183,6 +6240,8 @@ mod tests {
             ..Default::default()
         }));
         assert_eq!(read.units(), 1);
+        assert_eq!(window.peer_refresh_request, Some(3));
+        assert_eq!(window.peer_refresh_live_read, Some(3));
         assert!(
             !window.refresh_pending,
             "update only schedules the live read"
@@ -6193,6 +6252,7 @@ mod tests {
         assert!(window.refresh_pending);
         assert_eq!(window.peer_refresh_request, Some(3));
         assert_eq!(refresh.units(), 1);
+        assert_eq!(window.peer_refresh_live_read, None);
 
         let mut stale = Window {
             test_snapshot_inputs: window.test_snapshot_inputs.clone(),
@@ -6219,6 +6279,114 @@ mod tests {
                 .units(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn duplicate_live_reads_and_failed_ack_never_refetch_a_covered_request() {
+        use cosmic::Application as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = Window::default();
+        window.coordination.refresh_request = 7;
+        assert_eq!(window.consume_peer_refresh_request().units(), 1);
+        assert_eq!(
+            window.consume_peer_refresh_request().units(),
+            0,
+            "one live read per outstanding request"
+        );
+
+        let first = window.update(Message::PeerRefreshLiveRead {
+            request: 7,
+            live: wallpaper::CurrentWallpaper::NoFile,
+        });
+        assert_eq!(first.units(), 1);
+        assert!(window.refresh_pending);
+        let completion_tasks = window.finish_refresh(Err(RefreshError::Network("offline".into())));
+        assert_eq!(
+            completion_tasks.units(),
+            1,
+            "contextless fixture only rearms"
+        );
+        assert_eq!(window.peer_refresh_covered, 7);
+        assert!(!window.refresh_pending);
+
+        let context = cosmic_config::Config::with_custom_path(
+            APP_ID,
+            AppletConfig::VERSION,
+            dir.path().join("config"),
+        )
+        .unwrap();
+        let invalid_state = dir.path().join("not-a-directory");
+        std::fs::write(&invalid_state, b"file").unwrap();
+        window.coordination_context = Some(context);
+        window.coordination_state_dir = invalid_state;
+        let mut messages =
+            app_messages(window.record_peer_refresh_completion(7, PeerRefreshOutcome::Network))
+                .await;
+        let Message::PeerRefreshCompletionWritten { result, .. } = messages.pop().unwrap() else {
+            panic!("expected completion write result");
+        };
+        assert!(result.is_err(), "the acknowledgement persist really failed");
+        drop(window.update(Message::PeerRefreshCompletionWritten {
+            completion: PeerRefreshCompletion {
+                request: 7,
+                outcome: PeerRefreshOutcome::Network,
+            },
+            result,
+        }));
+        assert_eq!(
+            window
+                .update(Message::PeerRefreshLiveRead {
+                    request: 7,
+                    live: wallpaper::CurrentWallpaper::NoFile,
+                })
+                .units(),
+            0,
+            "delayed duplicate completion is stale"
+        );
+        assert_eq!(window.consume_peer_refresh_request().units(), 0);
+        assert!(!window.refresh_pending);
+    }
+
+    #[test]
+    fn request_reserved_during_live_read_is_acknowledged_by_intervening_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = cosmic_config::Config::with_custom_path(
+            APP_ID,
+            AppletConfig::VERSION,
+            dir.path().join("config"),
+        )
+        .unwrap();
+        let mut window = Window {
+            coordination_context: Some(context),
+            coordination_state_dir: dir.path().join("state"),
+            ..Window::default()
+        };
+        window.coordination.refresh_request = 11;
+        let delayed_read = window.consume_peer_refresh_request();
+        assert_eq!(delayed_read.units(), 1);
+        assert_eq!(window.peer_refresh_request, Some(11));
+
+        let intervening = window.start_refresh_over(wallpaper::CurrentWallpaper::NoFile);
+        assert_eq!(intervening.units(), 1);
+        assert!(window.refresh_pending);
+        let completion_tasks = window.finish_refresh(Err(RefreshError::Network("offline".into())));
+        assert_eq!(
+            completion_tasks.units(),
+            2,
+            "retry timer plus acknowledgement write"
+        );
+        assert_eq!(window.peer_refresh_request, None);
+        assert_eq!(window.peer_refresh_covered, 11);
+
+        assert_eq!(
+            window
+                .finish_peer_refresh_live_read(11, wallpaper::CurrentWallpaper::NoFile)
+                .units(),
+            0,
+            "late live read cannot start a duplicate fetch"
+        );
+        assert!(!window.refresh_pending);
     }
 
     #[test]
