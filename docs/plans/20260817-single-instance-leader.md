@@ -18,8 +18,10 @@ Restore the applet's single-owner premise with an advisory file-lock leader:
   wallpapers locally, proxy manual refresh requests to the leader, and notify
   the leader after a successful local apply so it updates `current`, spends
   `ColdStart`, and recomputes the accent;
-- non-leader settings use raw per-key persists, so stale in-memory accent
-  snapshot fields can never be written over the leader's authoritative state;
+- ordinary settings from either role use raw per-key persists, so stale
+  in-memory fields can never overwrite unrelated leader-authoritative accent
+  state; leaders adopt before enqueueing, while non-leaders adopt only after
+  a successful persist;
 - a surviving non-leader retries the lock periodically and, after the old
   leader process exits, hydrates fresh disk/live state before arming the same
   duties as an initial leader.
@@ -196,15 +198,18 @@ Gate every automatic or destructive entry point on `is_active_leader()`:
 - startup/finish thumbnail reconciliation and `ThumbnailsReady` accent retry;
 - `start_accent_compute`, plus defensive drops for `AccentComputed` and
   `AccentWriteFinished`;
-- all full-entry `set_config` call sites reachable from settings controls.
+- all leader-owned changed-field `set_config` transitions and asynchronous
+  raw per-key setting writes reachable from settings controls.
 
 `RefreshNow` is local only for the active leader; a non-leader sends the peer
 request. A non-leader failed `ApplyImage` skips `prune_immediately` because its
 catalogue may be stale. It refreshes read-only state on the next popup reload.
 
-Non-leader shuffle/interval/retention changes update memory only after their
-raw per-key persist succeeds (or preserve the established memory-only behavior
-for ordinary settings when no context exists), and never arm or prune locally.
+Shuffle/interval/retention controls from either role use one serialized
+asynchronous raw per-key queue. Leaders adopt before enqueueing so timer/prune
+behavior stays immediate; non-leaders update memory only after the persist
+succeeds (or preserve the established memory-only behavior when no context
+exists), and never arm or prune locally.
 The non-leader accent toggle is stricter: without a persistable config it warns
 and remains unchanged, because displaying an enabled state that no leader can
 consume would be false. With a context, it persists the raw flag and updates
@@ -333,9 +338,10 @@ reload helper. Leaders keep their in-memory-authoritative catalogue.
 - [x] add every runtime gate listed in Technical Details, including
       `finish_refresh`'s early error-retry branch and non-leader apply-failure
       pruning
-- [x] route non-leader shuffle/interval/retention persists through raw per-key
-      writes; skip local timer changes and pruning
-- [x] keep leader control behavior byte-for-byte unchanged
+- [x] route shuffle/interval/retention persists from both roles through raw
+      per-key writes; non-leaders skip local timer changes and pruning
+- [x] keep leader control adoption and timer/prune behavior unchanged while
+      moving its ordinary config writes onto the shared asynchronous queue
 - [x] **success tests:** current-generation automatic messages still act for a
       ready leader, and leader settings retain existing timer/prune behavior
 - [x] **failure/edge tests:** those same current-generation messages are
@@ -456,12 +462,13 @@ reload helper. Leaders keep their in-memory-authoritative catalogue.
 - [x] audit every caller of `schedule_refresh`, `sync_shuffle`,
       `start_thumbnail_pass_over`, `start_accent_compute`,
       `accent_compute_for_current`, `on_apply_success`, `prune_immediately`,
-      `finish_refresh`, poke arming, and full-entry `set_config`
+      `finish_refresh`, poke arming, changed-field `set_config`, and the raw
+      per-key setting-write queue
 - [x] verify exactly one active instance owns automatic work and every
       thumbnail producer/sweep; non-leader refresh is a leader request, not a
       local pipeline
 - [x] verify settings and accent toggles work from either popup without stale
-      full-entry writes, and a non-leader apply promptly updates leader
+      stale cross-key writes, and a non-leader apply promptly updates leader
       current/ColdStart/accent state
 - [x] verify startup races yield one lock winner; leader death during accent or
       refresh work is reconciled by fresh takeover state without adopting stale

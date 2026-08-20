@@ -230,13 +230,14 @@ pub struct Window {
     coordination: CoordinationConfig,
     /// Context used for raw, single-key coordination writes.
     coordination_context: Option<cosmic_config::Config>,
-    /// Per-key generations for follower setting writes. A completion may
-    /// update the popup only when no newer write to that same key exists.
-    follower_setting_generations: [u64; 4],
+    /// Per-key generations for asynchronous setting writes. A follower
+    /// completion may update the popup only when no newer write to that same
+    /// key exists; leaders adopt before enqueueing.
+    setting_write_generations: [u64; 4],
     /// One serialized queue prevents an older blocking write from landing
     /// after a newer click and regressing the on-disk key.
-    follower_setting_queue: VecDeque<(u64, FollowerSetting)>,
-    follower_setting_inflight: bool,
+    setting_write_queue: VecDeque<(u64, AppletSetting)>,
+    setting_write_inflight: bool,
     /// Generation guarding blocking fresh-config confirmations triggered by
     /// watcher payloads.
     config_confirmation_generation: u64,
@@ -473,14 +474,14 @@ pub(crate) struct NonLeaderReload {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FollowerSetting {
+pub(crate) enum AppletSetting {
     ShuffleEnabled(bool),
     ShuffleInterval(u32),
     Retention(u16),
     AccentEnabled(bool),
 }
 
-impl FollowerSetting {
+impl AppletSetting {
     fn slot(self) -> usize {
         match self {
             Self::ShuffleEnabled(_) => 0,
@@ -708,10 +709,10 @@ pub enum Message {
         generation: u64,
         result: Result<NonLeaderReload, String>,
     },
-    /// A follower's raw single-key setting persist completed.
-    FollowerSettingWritten {
+    /// An applet raw single-key setting persist completed.
+    AppletSettingWritten {
         generation: u64,
-        setting: FollowerSetting,
+        setting: AppletSetting,
         result: Result<(), String>,
     },
     /// The refresh timer fired (payload: the generation it was armed with).
@@ -1006,7 +1007,7 @@ impl Window {
         self.requested_peer_refresh = None;
         self.peer_refresh_write_pending = false;
         self.refresh_pending = false;
-        self.follower_setting_queue.clear();
+        self.setting_write_queue.clear();
         self.peer_refresh_timeout_generation = self.peer_refresh_timeout_generation.wrapping_add(1);
         self.non_leader_reload_generation = self.non_leader_reload_generation.wrapping_add(1);
         // Only an explicitly empty live wallpaper is safe for a takeover to
@@ -1414,7 +1415,7 @@ impl Window {
         use cosmic_config::ConfigSet as _;
 
         if !self.is_active_leader() {
-            tracing::debug!("dropping full applet-config persist from a non-leader");
+            tracing::debug!("dropping leader-owned applet-config transition from a non-leader");
             return;
         }
         if self.config == config {
@@ -1444,15 +1445,16 @@ impl Window {
         persist_changed!(accent_last_written);
     }
 
-    /// Persist one ordinary setting without serializing the leader-owned
-    /// accent snapshot fields. A follower adopts the value only after the
-    /// write lands; a memory-only fixture retains the applet's established
-    /// in-memory settings behavior.
-    fn set_non_leader_setting(&mut self, setting: FollowerSetting) -> app::Task<Message> {
+    /// Persist one user setting as a raw key without serializing unrelated
+    /// fields. Leaders adopt immediately so their duties follow the control;
+    /// followers adopt only after the write lands so their UI reflects a
+    /// request the leader can observe. A memory-only fixture retains the
+    /// established in-memory behavior, except follower accent enablement.
+    fn set_applet_setting(&mut self, setting: AppletSetting) -> app::Task<Message> {
         let active_leader = self.is_active_leader();
         let slot = setting.slot();
         let Some(context) = self.config_context.clone() else {
-            if !matches!(setting, FollowerSetting::AccentEnabled(true)) {
+            if !matches!(setting, AppletSetting::AccentEnabled(true)) {
                 setting.adopt(&mut self.config);
             } else {
                 tracing::warn!(
@@ -1470,30 +1472,26 @@ impl Window {
             setting.adopt(&mut self.config);
         }
 
-        self.follower_setting_generations[slot] =
-            self.follower_setting_generations[slot].wrapping_add(1);
-        let generation = self.follower_setting_generations[slot];
-        self.follower_setting_queue.push_back((generation, setting));
-        self.start_next_follower_setting_write(context)
+        self.setting_write_generations[slot] = self.setting_write_generations[slot].wrapping_add(1);
+        let generation = self.setting_write_generations[slot];
+        self.setting_write_queue.push_back((generation, setting));
+        self.start_next_setting_write(context)
     }
 
-    fn start_next_follower_setting_write(
-        &mut self,
-        context: cosmic_config::Config,
-    ) -> app::Task<Message> {
-        if self.follower_setting_inflight {
+    fn start_next_setting_write(&mut self, context: cosmic_config::Config) -> app::Task<Message> {
+        if self.setting_write_inflight {
             return Task::none();
         }
-        let Some((generation, setting)) = self.follower_setting_queue.pop_front() else {
+        let Some((generation, setting)) = self.setting_write_queue.pop_front() else {
             return Task::none();
         };
-        self.follower_setting_inflight = true;
+        self.setting_write_inflight = true;
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || setting.persist(&context))
                 .await
-                .map_err(|error| format!("follower setting task failed: {error}"))
+                .map_err(|error| format!("applet setting task failed: {error}"))
                 .and_then(|result| result.map_err(|error| error.to_string()));
-            Message::FollowerSettingWritten {
+            Message::AppletSettingWritten {
                 generation,
                 setting,
                 result,
@@ -1501,13 +1499,13 @@ impl Window {
         })
     }
 
-    fn finish_non_leader_setting(
+    fn finish_applet_setting_write(
         &mut self,
         generation: u64,
-        setting: FollowerSetting,
+        setting: AppletSetting,
         result: Result<(), String>,
     ) -> app::Task<Message> {
-        self.follower_setting_inflight = false;
+        self.setting_write_inflight = false;
         if self.is_active_leader() {
             if let Err(error) = result {
                 tracing::warn!(
@@ -1515,7 +1513,7 @@ impl Window {
                     setting.key()
                 );
             }
-        } else if generation == self.follower_setting_generations[setting.slot()] {
+        } else if generation == self.setting_write_generations[setting.slot()] {
             match result {
                 Ok(()) => setting.adopt(&mut self.config),
                 Err(error) => tracing::warn!(
@@ -1526,9 +1524,7 @@ impl Window {
         }
         self.config_context
             .clone()
-            .map_or_else(Task::none, |context| {
-                self.start_next_follower_setting_write(context)
-            })
+            .map_or_else(Task::none, |context| self.start_next_setting_write(context))
     }
 
     /// Arm the one-shot refresh timer for `delay` from now, invalidating any
@@ -2549,8 +2545,8 @@ impl Window {
         // The fresh disk read happens *before* the completion handlers run:
         // their own persists write the very key an external flip landed on
         // mid-flight (`arm_accent_enable` pins the flag `true`,
-        // `finish_disable_restore`'s full `set_config` rewrites it `false`
-        // from memory) — reading after them would read our own write back
+        // `finish_disable_restore`'s changed-field `set_config` rewrites it
+        // `false` from memory) — reading after them would read our own write back
         // and silently clobber a genuine external flip instead of routing
         // it.
         let disk_enabled_now = self
@@ -2720,10 +2716,8 @@ impl Window {
     ///
     /// 1. A toggle the *user* requested mid-flight
     ///    (`accent_flip_requested`) — the newest action whose ordering is
-    ///    known. It was pinned onto the disk too, but a concurrent
-    ///    `set_config` full-entry write (retention/shuffle changed while the
-    ///    task flew) rewrites the flag from stale memory, so the in-memory
-    ///    record, not the disk, carries the user's intent.
+    ///    known. It was pinned onto disk too; the in-memory record remains
+    ///    authoritative because watcher delivery can still be late or torn.
     /// 2. Otherwise a genuine external flip, evidenced by the on-disk flag
     ///    having *changed* during the flight: `at_completion` (read before
     ///    the completion handlers' own persists — see
@@ -2825,7 +2819,7 @@ impl Window {
         if enabled == self.config.accent_enabled {
             return Task::none();
         }
-        self.set_non_leader_setting(FollowerSetting::AccentEnabled(enabled))
+        self.set_applet_setting(AppletSetting::AccentEnabled(enabled))
     }
 
     /// What the popup's accent toggler renders: the *requested* state while
@@ -3527,9 +3521,9 @@ impl cosmic::Application for Window {
             config_context,
             coordination,
             coordination_context,
-            follower_setting_generations: [0; 4],
-            follower_setting_queue: VecDeque::new(),
-            follower_setting_inflight: false,
+            setting_write_generations: [0; 4],
+            setting_write_queue: VecDeque::new(),
+            setting_write_inflight: false,
             config_confirmation_generation: 0,
             coordination_state_dir: state_dir().to_path_buf(),
             peer_refresh_request: None,
@@ -3693,11 +3687,11 @@ impl cosmic::Application for Window {
             Message::NonLeaderReloaded { generation, result } => {
                 self.finish_non_leader_reload(generation, result);
             }
-            Message::FollowerSettingWritten {
+            Message::AppletSettingWritten {
                 generation,
                 setting,
                 result,
-            } => return self.finish_non_leader_setting(generation, setting, result),
+            } => return self.finish_applet_setting_write(generation, setting, result),
             Message::RefreshDue(generation) => {
                 // Stale timers (replaced by a newer reschedule) are ignored.
                 if self.is_active_leader() && generation == self.timer_generation {
@@ -3809,7 +3803,7 @@ impl cosmic::Application for Window {
             }
             Message::SetShuffleEnabled(enabled) => {
                 let active_leader = self.is_active_leader();
-                let persist = self.set_non_leader_setting(FollowerSetting::ShuffleEnabled(enabled));
+                let persist = self.set_applet_setting(AppletSetting::ShuffleEnabled(enabled));
                 // Enabling starts a fresh full-interval countdown.
                 return if active_leader {
                     Task::batch([persist, self.sync_shuffle(true)])
@@ -3820,8 +3814,7 @@ impl cosmic::Application for Window {
             Message::SetShuffleInterval(index) => {
                 let active_leader = self.is_active_leader();
                 let interval = view::shuffle_interval_secs(index);
-                let persist =
-                    self.set_non_leader_setting(FollowerSetting::ShuffleInterval(interval));
+                let persist = self.set_applet_setting(AppletSetting::ShuffleInterval(interval));
                 // Picking an interval restarts the countdown at that length.
                 return if active_leader {
                     Task::batch([persist, self.sync_shuffle(true)])
@@ -3833,7 +3826,7 @@ impl cosmic::Application for Window {
                 let active_leader = self.is_active_leader();
                 let new_days = view::retention_days(index);
                 let reduced = schedule::retention_reduced(self.config.retention_days, new_days);
-                let persist = self.set_non_leader_setting(FollowerSetting::Retention(new_days));
+                let persist = self.set_applet_setting(AppletSetting::Retention(new_days));
                 if active_leader && reduced {
                     // Reduced retention prunes immediately (the routine
                     // post-fetch prune would otherwise leave over-limit
@@ -6860,8 +6853,8 @@ mod tests {
 
         assert!(!window.config.shuffle_enabled);
         assert!(!AppletConfig::load(window.config_context.as_ref().unwrap()).shuffle_enabled);
-        assert!(!window.follower_setting_inflight);
-        assert!(window.follower_setting_queue.is_empty());
+        assert!(!window.setting_write_inflight);
+        assert!(window.setting_write_queue.is_empty());
     }
 
     #[test]
@@ -9467,7 +9460,7 @@ mod tests {
         settle_accent_tasks(&mut window);
 
         // The enable won: on in memory *and* on disk — the completion's
-        // full-entry persist did not bury it — and the enable lifecycle
+        // changed-field persists did not bury it — and the enable lifecycle
         // ran: a fresh snapshot of the just-restored user accents.
         assert!(window.config.accent_enabled);
         assert!(persisted_config(&window).accent_enabled);

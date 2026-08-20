@@ -96,14 +96,15 @@ the pinned rev before coding against remembered names.
   It additionally owns the leadership lifecycle. `is_active_leader()` means
   both lock owner and fully hydrated; every automatic/destructive entry point
   (refresh and shuffle timers, download/thumbnail/prune work, automatic apply,
-  lock-screen poke, accent compute/write, and full-entry config persistence) is
+  lock-screen poke, accent compute/write, and leader-owned config transitions) is
   gated on it. A follower's manual refresh is a coordination-mailbox request,
   coalesced into the leader's current or next fetch and settled by a covering
   completion counter. A follower may apply navigation choices directly, then
   posts an apply notice; the leader verifies cosmic-bg's live wallpaper before
   updating `current`, spending `ColdStart`, and recomputing the accent.
-  Followers persist ordinary settings and the accent-enabled flag one key at a
-  time, so they cannot rewrite leader-owned accent records from stale memory.
+  Both roles persist ordinary settings through one asynchronous raw per-key
+  queue: leaders adopt before enqueueing, followers only after success. Thus
+  neither can rewrite unrelated leader-owned accent records from stale memory.
   On lock takeover, the winner remains inert while a blocking task reloads the
   complete applet config, coordination entry, and live wallpaper; watcher
   events invalidate that snapshot. Follower popup opens and peer-refresh
@@ -285,9 +286,8 @@ the pinned rev before coding against remembered names.
     preserves its in-memory snapshot/last-written fields until a takeover
     hydration replaces the complete trio from disk. Its popup toggle persists
     only the raw enabled key and runs no snapshot, restore, compute, or write.
-    The completion reconciles once: a recorded user toggle wins (a
-    concurrent `set_config` full-entry write can rewrite the pinned disk
-    flag from stale memory), else a genuine external flip — evidenced by
+    The completion reconciles once: a recorded user toggle wins (it is the
+    newest action whose ordering is known), else a genuine external flip — evidenced by
     the disk flag read **before the completion's own persists** (they
     rewrite that very key: `arm_accent_enable` pins it `true`, a disable
     completion's `set_config` rewrites it `false` — reading after them

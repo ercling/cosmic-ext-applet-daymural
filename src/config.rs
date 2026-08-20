@@ -4,11 +4,12 @@
 // `$XDG_CONFIG_HOME/cosmic/<APP_ID>/v1/<field>` and generates per-field
 // `set_<field>(&mut self, &Config, value) -> Result<bool>` setters that write
 // to disk only when the value actually changed. The applet persists whole
-// configs via `write_entry` (`Window::set_config`, which merely warns on
-// failure) — except for the accent state machine's critical persists
-// (snapshot / last-written / the enable toggle in `app.rs`), which go through
-// the generated setters precisely because those return the error: a silently
-// lost accent persist is how a snapshot gets destroyed on the next startup.
+// settings one key at a time: ordinary controls use an asynchronous raw-key
+// queue, while `Window::set_config` writes only fields changed by the current
+// leader-owned accent transition. The accent state machine's critical
+// persists (snapshot / last-written / the enable toggle in `app.rs`) use the
+// generated setters precisely because those return the error: a silently lost
+// accent persist is how a snapshot gets destroyed on the next startup.
 // Note the setters mutate the field *before* writing, so a caller that must
 // stay consistent on failure has to roll the field back itself.
 
