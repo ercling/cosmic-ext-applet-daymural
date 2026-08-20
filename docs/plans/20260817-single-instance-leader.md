@@ -2,497 +2,523 @@
 
 ## Overview
 
-cosmic-panel spawns one applet process **per output** (`output: All` in the
-panel config), so a multi-monitor session runs two (or more) full instances of
-this applet. The whole runtime — timers, refresh pipeline, wallpaper applies,
-lock-screen pokes, and above all the accent state machine — was built on a
-documented single-instance assumption, and two instances demonstrably fight:
+`cosmic-panel` starts one applet process per output. On a multi-monitor
+session, every process currently arms refresh and shuffle timers, runs
+thumbnail producers and pruning, reacts to lock events, and owns an
+independent copy of the accent state machine over the same on-disk state.
+The duplicated accent owner is known to self-disarm after one instance
+enables the feature, and the other automatic jobs can race or run twice.
 
-- **Diagnosed 2026-08-17 (live trace, reproduced + control-tested):** user
-  toggles accent on in instance A's popup → A persists `accent_enabled=true`
-  and spawns the theme write → instance B's `ConfigUpdated` routes the flip as
-  an *external enable*, snapshots the pre-write accents, computes, and reads
-  A's freshly written builder accents ≠ its own stand-in snapshot → gap
-  `Disarm { keep_snapshot: true }` flips the toggle off (~140 ms after enable)
-  → A's write completion reconciles disk `false` vs spawn-time `true` as an
-  external disable → `DisableRestore` puts the snapshot back. Net effect:
-  "accent turns on for a few seconds, then reverts". With one instance
-  SIGSTOPped the same enable sticks permanently — the second instance is
-  conclusively the trigger.
-- The same duplication silently doubles every automatic behavior: two refresh
-  timers (double Bing fetches), two shuffle timers (images skipped at double
-  rate), two auto-applies, two lock-poke ladders, two thumbnail passes and
-  prune sweeps racing over one state dir.
+Restore the applet's single-owner premise with an advisory file-lock leader:
 
-**Fix (approach A, chosen):** advisory file-lock leader election. Exactly one
-instance — the leader — runs all automatic/background work and the accent
-lifecycle. Non-leaders stay fully interactive: the popup renders, navigation
-and manual applies still work, and the accent toggler works by writing the
-config flag to disk, which the leader already consumes through its existing
-external-flip routing (`ConfigUpdated` → `set_accent_enabled`). The lock is
-released automatically on process exit, so unplugging the monitor that hosted
-the leader lets the survivor take over.
+- exactly one **active leader** owns scheduled refresh/shuffle work,
+  downloads, thumbnail production and reconciliation, pruning, automatic
+  applies, lock-screen pokes, and every accent lifecycle entry point;
+- non-leaders keep the same popup and settings controls, apply selected
+  wallpapers locally, proxy manual refresh requests to the leader, and notify
+  the leader after a successful local apply so it updates `current`, spends
+  `ColdStart`, and recomputes the accent;
+- non-leader settings use raw per-key persists, so stale in-memory accent
+  snapshot fields can never be written over the leader's authoritative state;
+- a surviving non-leader retries the lock periodically and, after the old
+  leader process exits, hydrates fresh disk/live state before arming the same
+  duties as an initial leader.
 
-**The accent lifecycle must be unreachable on a non-leader through *every*
-entry point, not just the toggler/watcher.** `start_accent_compute`
-(`src/app.rs:1240`) is reachable from `Message::ApplyImage` →
-`on_apply_success` (~2551), `RefreshFinished` → `finish_refresh` →
-`on_apply_success` (~1174), and `Message::ThumbnailsReady` (~2685) — all of
-which stay user-reachable on a non-leader by design. Gating only the toggler
-would reproduce the traced self-disarm through a "next"-click. The gate
-therefore lives at the choke point (see Technical Details).
+The proxy is required, not optional polish. A non-leader-local refresh would
+reintroduce cross-process thumbnail-producer/sweep races, while a local apply
+without a leader notification would leave the leader's accent and cold-start
+state stale.
 
-## Context (from discovery)
+## Context
 
-- Files/components involved:
-  - `src/app.rs` — `init` (~line 2313: arms `schedule_refresh`, `sync_shuffle`,
-    `start_thumbnail_pass_over`, startup accent reconciliation),
-    `Message::RefreshDue`/`ShuffleDue`/`LockEvent`/`LockPokeDue` handlers,
-    `finish_refresh` (~1135: unconditional `schedule_refresh` + `sync_shuffle`
-    re-arm), `ConfigUpdated` (~2469: accent flip routing, `prune_immediately`,
-    `sync_shuffle`), `set_accent_enabled` (~1664), `set_config` (~852:
-    **full-entry** `write_entry` persist — the accent-trio clobber hazard),
-    `persist_accent_flag` (~1870), `start_accent_compute` (~1240),
-    `restore_catalogue` (~1957: persists the startup sweep and runs
-    `thumbs::reconcile` — destructive), `state_dir()` (~50),
-    `Message::SetAccentEnabled` (~2642), `SetRetention` (~2635, direct
-    `prune_immediately`), `TogglePopup` (~2411).
-  - `src/view.rs` — `accent_toggler` (~386) routes to
-    `Message::SetAccentEnabled`; no view changes expected (same UI on both
-    instances; `status_line` degrades correctly on a restored catalogue — the
-    zero-new-strings claim is intentional, not an oversight).
-  - New: `src/leader.rs` — the lock primitive.
-- Related patterns found: pure decision functions + injected dirs/paths for
-  tests (`Config::with_custom_path`, tempdir-rooted state), one-shot
-  generation-counter timers (`schedule_refresh` ~872 — the codebase's timer
-  idiom, reused for the takeover tick), the external-flip routing in
-  `ConfigUpdated` that the non-leader toggler proxy reuses wholesale,
-  `wallpaper::synced_current` (`src/wallpaper.rs:277`) for re-syncing
-  `self.current` against the live cosmic-bg config.
-- Dependencies identified: **none new** — rustc is 1.97.1 and
-  `std::fs::File::try_lock` (stable since 1.89) provides advisory locking.
-  Verified empirically on this toolchain: it is `flock`-backed (per open file
-  description), so two separate opens of the same path *in the same process*
-  conflict (`Err(TryLockError::WouldBlock)`), and a third handle acquires
-  after the first is dropped — the primitive is unit-testable in-process.
-  Caveat for tests: cargo runs tests as threads of one process, so **every
-  lock test needs its own tempdir**.
-- Environment facts worth keeping straight: this system's COSMIC 1.5.0 reads
-  theme **v2** dirs (`~/.config/cosmic/com.system76.CosmicTheme.*/v2/`); the
-  `v1` dirs are stale leftovers. The theme writes themselves work — the bug is
-  purely the instance fight.
+- **Files and components:** `src/app.rs` owns initialization, all timers,
+  refresh completion, popup opening, config watchers, catalogue restore, and
+  accent orchestration; `src/config.rs` defines the existing per-key applet
+  config; `src/catalogue.rs`, `src/thumbs.rs`, and `src/wallpaper.rs` provide
+  the persisted and live state used during leadership hydration. New
+  `src/leader.rs` owns the advisory lock primitive.
+- **Existing patterns:** one-shot generation-counter timers; fresh disk reads
+  for watcher-sensitive accent decisions; pure decision helpers; blocking
+  work returned through guarded completion messages; tempdir-rooted config and
+  state in tests; `wallpaper::synced_current` for conservative live-state
+  reconciliation.
+- **Dependencies:** none. Rust 1.97.1 provides `std::fs::File::try_lock`; the
+  pinned libcosmic `Core::watch_config<T>` supports a second config-entry type
+  over the same app ID, keyed independently by `TypeId`.
+- **Constraints:** preserve the pinned dependencies, Rust edition/toolchain,
+  popup ledger, accent state-machine invariants, single-monitor behavior, and
+  all filesystem/network/theme test isolation rules. Do not add UI strings.
 
 ## Development Approach
 
-- **testing approach**: Regular (code first, then tests within the same task)
-- complete each task fully before moving to the next
-- make small, focused changes
-- **CRITICAL: every task MUST include new/updated tests** for code changes in that task
-  - tests are not optional - they are a required part of the checklist
-  - write unit tests for new functions/methods
-  - write unit tests for modified functions/methods
-  - add new test cases for new code paths
-  - update existing test cases if behavior changes
-  - tests cover both success and error scenarios
-- **CRITICAL: all tests must pass before starting next task** - no exceptions
-- **CRITICAL: update this plan file when scope changes during implementation**
-- run tests after each change (`just check` — exports the required
-  `PKG_CONFIG_PATH`; raw `cargo` needs it exported manually)
-- maintain backward compatibility: a single-monitor session must behave
-  byte-for-byte as today (one instance always wins the lock at startup)
+- **Testing approach:** regular code-then-tests within each task.
+- Complete each task before starting the next and keep this file synchronized
+  with implementation.
+- Add success, failure, stale-event, and rollback tests for every changed
+  decision path.
+- Run each task's focused tests, then `just check`, before continuing.
+- Preserve unrelated working-tree changes and make no incidental dependency
+  updates.
 
 ## Testing Strategy
 
-- **unit tests**: required for every task (see Development Approach above).
-  Tests never touch real user config/state — inject tempdir-rooted paths, as
-  the whole suite already does; `arm_leader_duties` takes the live-wallpaper
-  value as a parameter precisely so tests can pass a hermetic one.
-  `Leadership` implements `Default` **as leader**, so the existing
-  `Window::default()`-based suite (~43 fixture sites) keeps its current
-  semantics with zero edits; only the new non-leader tests use
-  `Leadership::forced(false)`.
-- **e2e tests**: none in this project (iced view code is exempt by
-  convention); the two-instance regression test in Task 4 is the closest
-  equivalent — two `Window`s over one shared tempdir config replaying the
-  exact traced failure sequence, including the compute-path trigger.
+- **Unit/integration tests:** colocated Rust tests. Lock tests use a separate
+  `tempfile::TempDir` per test. Config, catalogue, thumbnail, and coordination
+  tests use injected tempdir roots. Tests invoke pure completion handlers with
+  injected `CurrentWallpaper` values instead of reading real cosmic-bg state.
+- **Two-instance regression tests:** two `Window` fixtures share tempdir-rooted
+  applet/coordination config and catalogue state, with one real lock winner and
+  one loser. They replay the diagnosed accent fight, peer refresh, peer apply,
+  and takeover sequences without contacting Bing or the real desktop.
+- **End-to-end tests:** iced view construction remains exempt. Real panel,
+  compositor, lock screen, and monitor removal behavior is verified manually
+  under Post-Completion.
+- **Full-suite command:** `just check`.
 
 ## Progress Tracking
 
-- mark completed items with `[x]` immediately when done
-- add newly discovered tasks with ➕ prefix
-- document issues/blockers with ⚠️ prefix
-- update plan if implementation deviates from original scope
-- keep plan in sync with actual work done
+- Mark completed work with `[x]` immediately.
+- Add discovered scope with a `➕` prefix.
+- Record blockers or deviations with a `⚠️` prefix.
+- Do not mark a task complete until its test gate passes.
 
 ## Solution Overview
 
-- **One primitive, one question.** `src/leader.rs` owns a `Leadership` value:
-  an exclusive advisory lock on `state_dir()/leader.lock`, acquired
-  non-blocking at `init`, re-attemptable later. Everything else asks
-  `window.is_leader()`.
-- **Leader**: identical to today's behavior. No code path changes for it.
-- **Non-leader**: restores catalogue + config for display **without side
-  effects** (load only — no sweep persist, no `thumbs::reconcile`), renders
-  the same popup, but arms **no** automatic work: no refresh timer, no shuffle
-  timer, no startup thumbnail pass, no startup accent reconciliation, no lock
-  pokes, no watcher-driven prune/shuffle re-arming, and **no accent lifecycle
-  through any entry point** — the choke-point gate in `start_accent_compute`
-  covers apply/refresh/thumbnail triggers, and the toggler/watcher paths are
-  gated besides. Its accent toggler becomes a proxy: persist the flag raw and
-  let the leader's existing external-flip path do the real work. Its settings
-  persists go through raw per-key writes so the leader's on-disk accent trio
-  is never clobbered by a stale full-entry `set_config`.
-- **Takeover**: while not leader, a slow periodic retry (one-shot
-  generation-counter timer, the codebase's timer idiom) re-attempts the lock.
-  On acquisition, the instance adopts the on-disk config wholesale (its
-  in-memory accent trio is cold and no flights exist, so at this boundary —
-  and only here — disk is authoritative) and then runs the same arming
-  sequence `init` runs for a leader, factored into one shared
-  `arm_leader_duties`.
-- **User-initiated actions stay local**: prev/next/newest/apply and the manual
-  refresh button keep working on whichever instance the user clicked — but
-  their *re-arming side effects* (`finish_refresh`'s `schedule_refresh` +
-  `sync_shuffle`, `ApplyImage`'s `sync_shuffle`) are leader-only, so a
-  non-leader click never leaves a timer armed behind it. Catalogue writes are
-  atomic (temp-then-rename) and last-writer-wins; a non-leader reloads the
-  catalogue *and re-syncs `self.current`* from disk when its popup opens so it
-  never navigates a stale list.
+### Leadership
+
+`Leadership` holds an exclusive advisory lock on
+`state_dir()/leader.lock`. `WouldBlock` means non-leader; another lock/open
+error warns and fails open as leader so a lone instance still functions.
+The open `File` holds the lock and process exit releases it, including when
+COSMIC removes the panel applet for a disconnected output.
+
+An initial winner is immediately active after ordinary startup state loading.
+A takeover winner is temporarily **not ready** while a blocking task reloads
+the complete applet config, coordination state, and live wallpaper. All
+leader-only gates ask `is_active_leader()` (owns the lock and is ready), so a
+half-hydrated takeover cannot run watcher or timer work. Config/coordination
+events observed during hydration invalidate that snapshot and trigger a fresh
+one before duties are armed.
+
+### Coordination mailbox
+
+`src/config.rs` gains a second `CosmicConfigEntry` over the existing app ID and
+version. Its keys are disjoint from `AppletConfig`, so `AppletConfig::write_entry`
+cannot clobber them:
+
+- `refresh_request: u64` — monotonically increased by a non-leader refresh
+  click;
+- `refresh_completion: PeerRefreshCompletion { request: u64, outcome }` — the
+  leader acknowledges every observed request up to `request` after the fetch
+  it was attached to completes;
+- `apply_notice: Option<PeerApplyNotice { generation: u64, path: PathBuf }>` —
+  written after a non-leader successfully applies a wallpaper.
+
+Request/notice read-modify-write operations run on the blocking pool under a
+short-lived advisory `state_dir()/coordination.lock`, then write one key
+atomically through `ConfigSet::set`. This serializes counter allocation across
+processes without extending the leader lock to user interaction. Concurrent
+refresh requests receive distinct counters but still coalesce onto one leader
+fetch. The practical `u64` exhaustion case is rejected rather than wrapping.
+Each process subscribes to `CoordinationConfig` separately from
+`AppletConfig`.
+
+A non-leader refresh click first persists the request, then marks its popup
+pending and arms a generation-guarded acknowledgement timeout. The active
+leader starts a refresh if none is running; otherwise the request joins the
+current refresh. Completion reports success/network/disk class, allowing the
+requesting popup to reuse existing status strings, clear pending state, and
+reload catalogue/live state asynchronously. A failed request persist never
+shows a false pending state; a missing completion eventually clears through
+the timeout and performs the same safe reload.
+
+After a non-leader apply succeeds locally, it updates its own display state
+without running accent work, then writes `apply_notice`. The leader treats a
+notice as evidence, reads cosmic-bg's live wallpaper on the blocking pool, and
+checks a notice generation on completion. It never trusts a stale payload path
+as the displayed wallpaper. A current `File` result flows through
+`on_apply_success`, which updates the leader's `current`, spends `ColdStart`,
+and uses the existing accent path. Startup/takeover live-state reconciliation
+covers a notice lost because the prior leader died.
+
+### Non-leader behavior
+
+Non-leaders do not run refresh pipelines, thumbnail passes, pruning, shuffle
+timers, lock pokes, or accent jobs. Their shuffle/retention/accent settings are
+persisted one key at a time for the leader's existing config watcher. A
+non-leader popup reload is an asynchronous read-only snapshot; it never saves,
+prunes, or reconciles thumbnails. Successful local applies invalidate any
+older popup-reload completion so live navigation state cannot move backward.
 
 ## Technical Details
 
-- **Lock mechanics**: `File::options().create(true).write(true).open(path)`
-  then `try_lock()`. Holding the open `File` in the struct holds the lock;
-  process death (including SIGKILL and the panel reaping an output's applets)
-  releases it. `Err(TryLockError::WouldBlock)` = someone else leads; any other
-  error (unwritable state dir, filesystem without working flock) logs the
-  **reason at warn level** — so live verification can tell "won the lock" from
-  "gave up on locking" — and resolves to **leader**: a lone instance that
-  cannot lock must still do its job, and two instances both failing the same
-  way is no worse than today.
-- **`Leadership` shape** (`src/leader.rs`): explicit
-  `{ leader: bool, file: Option<File> }` — the flag is not derived from
-  `file.is_some()` because the error-path leader holds no file, and because
-  `#[derive(Default)] struct Window` (app.rs:67) requires
-  `impl Default for Leadership`, which must be **leader** so all ~43 existing
-  `Window::default()` fixtures keep today's semantics untouched. Production
-  cannot pick the default up silently: `init` builds `Window` exhaustively
-  (~2363), so the new field is a compile error there until set from
-  `acquire()`. API:
-  - `acquire(dir: &Path) -> Leadership` — create dir best-effort, attempt lock.
-  - `is_leader(&self) -> bool`
-  - `try_acquire(&mut self) -> bool` — returns `true` only on the
-    not-leader → leader edge (the takeover trigger).
-  - `#[cfg(test)] forced(leader: bool) -> Leadership`.
-- **Gating points in `app.rs`** (each checks `self.is_leader()`):
-  - `init`: the arming block (refresh timer, `sync_shuffle`,
-    `start_thumbnail_pass_over`, startup accent reconciliation / auto-apply)
-    moves into
-    `fn arm_leader_duties(&mut self, live: wallpaper::CurrentWallpaper) -> app::Task<Message>`
-    — the `live` value is a **parameter** (a no-arg version would have to call
-    `wallpaper::current_wallpaper()` itself, which reads the real cosmic-bg
-    config and breaks test hermeticity); the refresh `delay` is computed
-    inside from `self.catalogue`. `init` calls it only when leader.
-  - `restore_catalogue` on a non-leader: **load only** — no sweep persist, no
-    `thumbs::reconcile`. The current restore persists the startup sweep and
-    deletes thumbnails; racing the leader's in-flight startup pass from a
-    second process is exactly the race `may_sweep_thumbnails` exists to
-    prevent within one process, and a non-leader has no visibility into the
-    leader's pass.
-  - **`start_accent_compute` (~1241): the accent choke point** — return
-    `Task::none()` when not leader. Defense in depth: `AccentComputed` and
-    `AccentWriteFinished` are also dropped on a non-leader (none should ever
-    exist there).
-  - `Message::RefreshDue` / `Message::ShuffleDue` / `Message::LockEvent` /
-    `Message::LockPokeDue`: drop when not leader, even with a matching
-    generation (a takeover must not activate generations armed before it).
-  - `finish_refresh` (~1210-1213): the `schedule_refresh(plan.delay)` and
-    `sync_shuffle(false)` re-arms are leader-only; the merge/prune/save of a
-    user-initiated refresh still completes locally. Same for the
-    `sync_shuffle(true)` in the `ApplyImage` arm (~2552).
-  - `ConfigUpdated` when not leader: keep adopting shuffle/retention values
-    into memory (display mirrors) but skip `prune_immediately` and the
-    `sync_shuffle` re-arm; for the accent flag, adopt from a **fresh disk
-    read** for toggler display only (same freshness rule the leader uses;
-    payloads can be late) and never route `set_accent_enabled`. The
-    snapshot/last-written fields keep their never-adopt-from-payload rule on
-    both sides.
-  - `Message::SetRetention` on a non-leader: persist the value but skip the
-    direct `prune_immediately` (~2639) — the leader prunes when its watcher
-    sees the change. (Pruning deletes image files; a stale non-leader
-    catalogue must not drive that.)
-  - `Message::SetAccentEnabled` when not leader: set
-    `self.config.accent_enabled = desired` for immediate toggler feedback and
-    `persist_accent_flag(desired)`; the leader's watcher picks the flip up as
-    an external toggle and runs the real lifecycle. No snapshot, no compute,
-    no task on the non-leader, ever. `persist_accent_flag` with no
-    `config_context` currently no-ops silently — add a `tracing::warn!`.
-  - **Non-leader persists never use full-entry `set_config`**: `set_config`
-    persists via `write_entry` — *all* fields, from in-memory state — and a
-    non-leader's accent trio is stale by design, so a shuffle/retention change
-    from the second monitor's popup would wipe the leader's on-disk
-    `accent_snapshot` (the only record of the user's pre-feature accents:
-    unrecoverable) and `accent_last_written` (creating the gap-disarm shape).
-    On a non-leader, settings persists go through raw per-key
-    `ConfigSet::set` (the `persist_accent_flag` shape). CLAUDE.md already
-    names this exact hazard ("a concurrent `set_config` full-entry write can
-    rewrite the pinned disk flag from stale memory").
-- **Takeover sequence**: a one-shot generation-counter timer (the
-  `schedule_refresh` idiom, ~60 s period, armed at `init` when not leader and
-  re-armed after each failed attempt) fires `Message::LeadershipTick(u64)`;
-  stale generations are dropped. Handler: `try_acquire()` → on the edge:
-  reload the config from disk via `AppletConfig::load(context).normalize()`
-  (all fields, accent trio included — cold state, no flights, the one
-  boundary where disk is authoritative; with `config_context: None` keep
-  memory), then `arm_leader_duties(wallpaper::current_wallpaper())`. The
-  accent arming is the same startup reconciliation the leader runs from
-  `init` — a steady-state recompute Skips for free, and a disk-enabled state
-  left behind by a dead leader arms correctly because snapshot/last-written
-  are read fresh. No new subscription: `subscription()` (~2693) is currently
-  a fixed unconditional batch, and this plan keeps it that way. The
-  `lockwatch::subscription()` zbus stream stays live on non-leaders
-  deliberately — only the `LockEvent` handler gates — so a takeover needs no
-  D-Bus re-establishment; the idle cost is one parked stream.
-- **Popup-open reload** (non-leader only, and only when no local refresh is
-  pending): in the `TogglePopup` create branch, reload the catalogue from
-  disk and re-sync `self.current` via
-  `wallpaper::synced_current(&wallpaper::current_wallpaper(), self.current.take())`
-  (the existing helper) — the leader applies wallpapers all day, and
-  `self.current` is otherwise set once at `init`, so navigation targets would
-  drift stale without this. Leader keeps its in-memory-authoritative
-  catalogue untouched.
-- **What deliberately does NOT change**: the accent state machine itself (all
-  its invariants held — the premise it rests on is being restored, exactly as
-  the popup-crash fix restored the no-crash premise), the popup ledger, i18n
-  (no new strings — both instances render identical UI), `wallpaper.rs`
-  internals, `lockwatch.rs` internals (only the `app.rs` handlers gate).
+### Lock API and ordering
+
+Create `src/leader.rs` with:
+
+- `Leadership { leader: bool, file: Option<File> }`;
+- `acquire(dir: &Path) -> Leadership`;
+- `is_leader(&self) -> bool`;
+- `try_acquire(&mut self) -> bool`, true only on the non-leader-to-leader edge;
+- a blocking-pool-only helper for the short `coordination.lock` critical
+  section used by coordination read-modify-write operations;
+- `#[cfg(test)] forced(bool)` and `Default`, both retaining leader-by-default
+  semantics for existing `Window::default()` fixtures.
+
+Production `init` must acquire leadership **before** catalogue restoration, so
+the loser never runs the current destructive startup sweep before learning its
+role. A deterministic file-as-directory path tests the fail-open error path;
+permission-based "unwritable" fixtures are not reliable under every test user.
+
+### Initialization and duty arming
+
+Factor leader startup into
+`arm_leader_duties(live: CurrentWallpaper) -> Task<Message>`: next refresh,
+shuffle synchronization, startup thumbnail pass, and startup accent
+reconciliation. The helper receives `live` so tests remain hermetic. Initial
+leaders use the already-read live value and immediately service a persisted
+refresh request whose completion counter is behind. Non-leaders arm only the
+leadership retry timer and subscriptions.
+
+Catalogue restore accepts the role explicitly. Active leaders retain the
+existing load/rebuild, vanished-entry prune/save, and thumbnail reconciliation.
+Non-leaders call `Catalogue::load_or_rebuild` only.
+
+### Runtime gates
+
+Gate every automatic or destructive entry point on `is_active_leader()`:
+
+- `RefreshDue`, `ShuffleDue`, `LockEvent`, and `LockPokeDue`, including valid
+  generations;
+- both the success tail and the early error-retry return in `finish_refresh`;
+- refresh/shuffle rearming after applies and refreshes;
+- watcher-driven and direct retention pruning;
+- startup/finish thumbnail reconciliation and `ThumbnailsReady` accent retry;
+- `start_accent_compute`, plus defensive drops for `AccentComputed` and
+  `AccentWriteFinished`;
+- all full-entry `set_config` call sites reachable from settings controls.
+
+`RefreshNow` is local only for the active leader; a non-leader sends the peer
+request. A non-leader failed `ApplyImage` skips `prune_immediately` because its
+catalogue may be stale. It refreshes read-only state on the next popup reload.
+
+Non-leader shuffle/interval/retention changes update memory only after their
+raw per-key persist succeeds (or preserve the established memory-only behavior
+for ordinary settings when no context exists), and never arm or prune locally.
+The non-leader accent toggle is stricter: without a persistable config it warns
+and remains unchanged, because displaying an enabled state that no leader can
+consume would be false. With a context, it persists the raw flag and updates
+the toggler, but never snapshots, computes, restores, or adopts snapshot fields.
+
+### Takeover
+
+Use a one-shot `LeadershipTick(u64)` at approximately 60 seconds. A failed
+attempt re-arms with a new generation; stale/already-active ticks do nothing.
+On the acquisition edge:
+
+1. mark leadership as owned but not ready and invalidate the retry generation;
+2. spawn a blocking hydration read for `AppletConfig`, `CoordinationConfig`,
+   and `wallpaper::current_wallpaper()`;
+3. if config/coordination watcher events arrived during the read, discard and
+   repeat it;
+4. otherwise adopt the full accent trio only at this boundary, mark active,
+   arm leader duties, and service any refresh request newer than its recorded
+   completion.
+
+No filesystem or cosmic-config read is added inline to `Application::update`.
+The logind subscription remains alive in every process; only its handlers are
+gated, so takeover requires no D-Bus resubscription.
+
+### Asynchronous non-leader reload
+
+Opening a non-leader popup immediately creates the surface and, when no peer
+refresh is pending, batches a blocking read of the catalogue and live
+wallpaper. `NonLeaderReloaded { generation, ... }` is adopted only if the
+window is still non-leader and its generation is current. A successful local
+apply bumps that generation. A peer refresh completion/timeout uses the same
+reload helper. Leaders keep their in-memory-authoritative catalogue.
 
 ## What Goes Where
 
-- **Implementation Steps** (`[ ]` checkboxes): code, tests, and doc updates in
-  this repository.
-- **Post-Completion** (no checkboxes): live two-monitor verification and
-  behaviors only observable on real hardware.
+- Implementation Steps contain repository changes and test gates.
+- Post-Completion contains real COSMIC/compositor verification without
+  checkboxes.
 
 ## Implementation Steps
 
 ### Task 1: Leadership lock primitive
 
 **Files:**
+
 - Create: `src/leader.rs`
-- Modify: `src/main.rs` (module declaration)
+- Modify: `src/main.rs`
+- Test: `src/leader.rs`
 
-- [ ] create `src/leader.rs` with `Leadership { leader: bool, file: Option<File> }`,
-      `acquire(dir)`, `is_leader()`, `try_acquire()`,
-      `#[cfg(test)] forced(bool)`, and `impl Default` = **leader** (required
-      by `#[derive(Default)] struct Window`; production sets the field
-      explicitly in `init`, so the default cannot leak there)
-- [ ] lock file is `<dir>/leader.lock` via `std::fs::File::try_lock`;
-      `Err(TryLockError::WouldBlock)` → non-leader; any other error logs the
-      reason at **warn** and resolves to leader; log the won role at info
-- [ ] declare `mod leader;` in `src/main.rs`
-- [ ] write tests (each in its own tempdir — tests share one process): second
-      `acquire` on the same dir is not leader; `try_acquire` flips to leader
-      after the first `Leadership` is dropped and reports the edge exactly
-      once (and returns false when still locked out / already leader);
-      `forced(true)`/`forced(false)` and `Default` report correctly;
-      unwritable dir resolves to leader (error path)
-- [ ] run `just check` - must pass before task 2
+- [ ] implement the leader-lock API and fail-open logging described above;
+      retain the
+      opened file on both lock-winner and `WouldBlock` paths so the loser can
+      retry the same handle
+- [ ] implement the blocking-pool-only coordination critical-section helper;
+      it must release on success, closure error, and unwind/process exit
+- [ ] declare `mod leader;`
+- [ ] **success tests:** two opens in one tempdir produce one leader; dropping the winner
+      lets the loser acquire exactly once; still-blocked/already-leader retries
+      return false; concurrent coordination critical sections serialize;
+      `forced(true)`, `forced(false)`, and defaults report the intended role
+- [ ] **failure/edge tests:** a closure error releases `coordination.lock`; the
+      deterministic file-as-directory leader-lock error resolves to leader and
+      logs without using real user paths
+- [ ] run `PKG_CONFIG_PATH=/usr/lib64/pkgconfig:/usr/share/pkgconfig cargo test leader`
+      and `just check`; both must pass before Task 2
 
-### Task 2: Thread leadership through `Window`; gate `init` arming and make the non-leader restore non-destructive
-
-**Files:**
-- Modify: `src/app.rs`
-
-- [ ] add `leadership: Leadership` to `Window` (the `Default` derive picks up
-      leader-by-default, so no fixture edits); `init` sets it from
-      `Leadership::acquire(state_dir())`; add `fn is_leader(&self) -> bool`
-- [ ] extract `init`'s automatic arming block into
-      `fn arm_leader_duties(&mut self, live: wallpaper::CurrentWallpaper) -> app::Task<Message>`
-      (refresh timer with `delay` computed inside from `self.catalogue`,
-      `sync_shuffle`, `start_thumbnail_pass_over`, startup accent
-      reconciliation / restore auto-apply); `init` calls it only when leader
-- [ ] non-leader `restore_catalogue` path: load only — skip the sweep persist
-      and the `thumbs::reconcile` call (a second process must never delete
-      thumbnails under the leader's in-flight startup pass)
-- [ ] write tests: a `Leadership::forced(false)` window through the
-      `init`-shaped path arms nothing (no refresh scheduled, no thumbnail
-      pass pending, no accent compute) and leaves the state dir's thumbnails
-      and the saved catalogue untouched by its restore; a leader window arms
-      exactly what `init` armed before this change (hermetic: pass
-      `CurrentWallpaper::NoFile`-style values, per the existing
-      startup-thumbnail-pass test's pattern)
-- [ ] confirm the full existing suite passes unmodified (the
-      leader-by-default guarantee) — no fixture churn permitted
-- [ ] run `just check` - must pass before task 3
-
-### Task 3: Gate runtime automatic work (timers, re-arms, watcher work, lock pokes, raw non-leader persists)
+### Task 2: Add the coordination config protocol
 
 **Files:**
-- Modify: `src/app.rs`
 
-- [ ] `Message::RefreshDue` and `Message::ShuffleDue`: drop (log at debug)
-      when not leader, even with a matching generation
-- [ ] `finish_refresh`: the `schedule_refresh(plan.delay)` +
-      `sync_shuffle(false)` re-arm block is leader-only (a non-leader's
-      manual refresh still merges/prunes/saves); same for `sync_shuffle(true)`
-      in the `ApplyImage` arm
-- [ ] `Message::LockEvent` and `Message::LockPokeDue`: drop when not leader —
-      one poke ladder per session, not per output (the zbus subscription
-      itself deliberately stays live; see Technical Details)
-- [ ] `ConfigUpdated` when not leader: keep adopting shuffle/retention values
-      into memory for display, but skip `prune_immediately` and the
-      `sync_shuffle` re-arm; `Message::SetRetention` when not leader: persist
-      the value, skip the direct `prune_immediately`
-- [ ] non-leader settings persists (`SetShuffleEnabled`, `SetShuffleInterval`,
-      `SetRetention`) go through raw per-key `ConfigSet::set` instead of the
-      full-entry `set_config`, so the leader's on-disk
-      `accent_snapshot`/`accent_last_written` are never rewritten from the
-      non-leader's stale memory
-- [ ] write tests: non-leader drops `RefreshDue`/`ShuffleDue`/`LockPokeDue`
-      with a *current* generation (leader still acts); a non-leader
-      user-initiated refresh completing does not schedule the next refresh or
-      re-arm shuffle (and a subsequent takeover does not inherit a stale
-      armed generation); non-leader `ConfigUpdated` with reduced retention
-      does not prune and with changed shuffle does not re-arm, yet in-memory
-      values update; a non-leader shuffle-interval change leaves
-      `accent_snapshot`/`accent_last_written` on disk **byte-identical**
-- [ ] run `just check` - must pass before task 4
+- Modify: `src/config.rs`
+- Test: `src/config.rs`
 
-### Task 4: Non-leader accent gating (choke point + proxy) and the two-instance regression test
+- [ ] add `CoordinationConfig`, `PeerApplyNotice`,
+      `PeerRefreshCompletion`, and the success/network/disk outcome enum with
+      defaults and serde/config derives; keep keys disjoint from `AppletConfig`
+- [ ] add tempdir-rooted load helpers that degrade missing/corrupt keys to
+      defaults without rewriting them
+- [ ] add blocking-worker helpers for incrementing `refresh_request`, writing
+      `apply_notice`, and recording completion; reject `u64::MAX`
+- [ ] **success tests:** request counters remain strictly monotonic under
+      concurrent writers; apply-notice and completion values round-trip as
+      atomic single keys
+- [ ] **failure/edge tests:** missing/corrupt keys load defaults without
+      writes; max-counter allocation and config writes fail without regressing
+      the persisted mailbox
+- [ ] test an `AppletConfig::write_entry` leaves all coordination key bytes
+      unchanged
+- [ ] run `PKG_CONFIG_PATH=/usr/lib64/pkgconfig:/usr/share/pkgconfig cargo test config`
+      and `just check`; both must pass before Task 3
+
+### Task 3: Thread leadership through startup and make restoration role-safe
 
 **Files:**
+
 - Modify: `src/app.rs`
+- Test: `src/app.rs`
 
-- [ ] **`start_accent_compute`: return `Task::none()` when not leader** — this
-      covers every lifecycle trigger (`on_apply_success` from
-      `ApplyImage`/`RefreshFinished`, and `ThumbnailsReady`); defensively
-      drop `AccentComputed` and `AccentWriteFinished` on a non-leader too
-- [ ] `Message::SetAccentEnabled` when not leader: set
-      `self.config.accent_enabled` for immediate toggler rendering, call
-      `persist_accent_flag(desired)`, spawn nothing — no snapshot, no
-      compute, no theme task; add the missing `tracing::warn!` to
-      `persist_accent_flag`'s silent no-`config_context` path
-- [ ] `ConfigUpdated` when not leader: adopt `accent_enabled` for display from
-      a fresh disk read (never the payload), never route
-      `set_accent_enabled`; snapshot/last-written stay never-adopted
-- [ ] write tests: non-leader toggle writes only the raw flag (snapshot and
-      last-written untouched on disk and in memory; error path: no
-      `config_context` → warns, changes nothing); non-leader `ConfigUpdated`
-      enable-flip performs no snapshot capture and spawns no task but the
-      toggler state follows the disk flag; **non-leader `on_apply_success`
-      and `ThumbnailsReady` with `accent_enabled=true` spawn nothing and
-      leave the accent trio untouched in memory and on disk**
-- [ ] write the regression test replaying the traced 2026-08-17 fight: leader
-      window and non-leader window over one shared tempdir config; leader
-      enables (snapshot + write task settle via the existing
-      `settle_accent_tasks` machinery); deliver the resulting `ConfigUpdated`
-      to the non-leader **and then drive the non-leader's compute path too**
-      (give it a `current` + cached thumbnail, run `on_apply_success` /
-      `ThumbnailsReady`); assert the non-leader neither disarms nor writes
-      `accent_enabled=false` through either route, and the leader's enabled
-      state survives — the exact sequence that previously self-destructed in
-      ~2 s
-- [ ] run `just check` - must pass before task 5
+- [ ] add `Leadership`, ready/hydration state, coordination state, and the new
+      timer/generation fields to `Window`; keep existing fixtures leader-ready
+      through a readiness wrapper whose `Default` is ready, while production
+      initializes every field explicitly
+- [ ] acquire the lock before catalogue restore; leader restore keeps today's
+      prune/save/reconcile behavior, non-leader restore is read-only
+- [ ] extract `arm_leader_duties(CurrentWallpaper)` and call it only for the
+      initial active leader; a non-leader arms only takeover retry
+- [ ] add the second `CoordinationConfig` subscription without changing the
+      lockwatch subscription or popup surface routing
+- [ ] **success tests:** the leader init-shaped helper arms exactly today's
+      duties and consumes an outstanding peer refresh; the non-leader arms only
+      takeover retry
+- [ ] **failure/edge tests:** non-leader restoration with missing, corrupt, or
+      stale catalogue data performs no catalogue save, prune, or cache mutation
+- [ ] confirm the existing `Window::default()` suite retains leader behavior
+      without fixture churn
+- [ ] run focused startup/restore tests and `just check`; both must pass before
+      Task 4
 
-### Task 5: Takeover — periodic retry and become-leader adoption
+### Task 4: Gate runtime automatic, destructive, and persistence paths
 
 **Files:**
+
 - Modify: `src/app.rs`
+- Test: `src/app.rs`
 
-- [ ] add `Message::LeadershipTick(u64)` on the one-shot generation-counter
-      idiom (`schedule_refresh` shape, ~60 s): armed at `init` when not
-      leader, re-armed after each failed attempt, stale generations dropped;
-      already-leader ticks are no-ops and arm nothing
-- [ ] handler: `try_acquire()`; on the not-leader → leader edge, reload the
-      config via `AppletConfig::load(context).normalize()` (whole struct,
-      accent trio included — cold state, no flights, the one boundary where
-      disk is authoritative; `config_context: None` keeps memory), then
-      return `arm_leader_duties(wallpaper::current_wallpaper())`
-- [ ] write tests: a forced-non-leader window whose `Leadership` can now
-      acquire (other lock dropped, own tempdir) processes `LeadershipTick` →
-      becomes leader, adopts a config edited on disk meanwhile (e.g.
-      `accent_enabled=true` + snapshot left by the dead leader), and arms
-      duties (refresh scheduled; accent reconciliation runs and Skips in
-      steady state); a tick while still locked out re-arms and changes
-      nothing; a stale-generation tick is dropped
-- [ ] run `just check` - must pass before task 6
+- [ ] add every runtime gate listed in Technical Details, including
+      `finish_refresh`'s early error-retry branch and non-leader apply-failure
+      pruning
+- [ ] route non-leader shuffle/interval/retention persists through raw per-key
+      writes; skip local timer changes and pruning
+- [ ] keep leader control behavior byte-for-byte unchanged
+- [ ] **success tests:** current-generation automatic messages still act for a
+      ready leader, and leader settings retain existing timer/prune behavior
+- [ ] **failure/edge tests:** those same current-generation messages are
+      dropped by a non-leader; both successful and failed refresh completions cannot re-arm a
+      non-leader, and non-leader apply failure cannot prune
+- [ ] test each non-leader setting persist leaves the on-disk
+      `accent_snapshot`/`accent_last_written` bytes unchanged; cover missing and
+      failing config contexts
+- [ ] run focused timer/config/prune tests and `just check`; both must pass
+      before Task 5
 
-### Task 6: Non-leader popup reload (catalogue + current)
+### Task 5: Proxy non-leader manual refresh and acknowledge completion
 
 **Files:**
+
 - Modify: `src/app.rs`
+- Test: `src/app.rs`
 
-- [ ] in the `TogglePopup` create branch: when not leader and no local
-      refresh is pending, reload the catalogue from disk
-      (`Catalogue::load_or_rebuild` with the same injected dirs) **and
-      re-sync `self.current` via
-      `wallpaper::synced_current(&wallpaper::current_wallpaper(), self.current.take())`**
-      so navigation targets follow the leader's applies
-- [ ] write tests: non-leader popup open picks up entries the "leader" (a
-      direct on-disk catalogue save in the test) added and dropped, and
-      `prev_target`/`next_target` follow the applied file recorded on disk;
-      leader popup open does not reload (in-memory stays authoritative); a
-      non-leader with `refresh_pending` does not reload
-- [ ] run `just check` - must pass before task 7
+- [ ] route non-leader `RefreshNow` through the blocking coordination-request
+      helper; show pending only after a successful/coalesced request persist
+- [ ] make an active leader consume an outstanding request, attaching it to an
+      in-flight refresh or starting one; never start a second concurrent fetch
+- [ ] after `RefreshFinished`, persist completion for the latest request the
+      leader had observed, including success/network/disk outcome
+- [ ] on a matching-or-newer completion, clear the requester's pending state,
+      update the existing status class, invalidate its timeout, and request a
+      read-only reload
+- [ ] add a generation-guarded acknowledgement timeout that clears false
+      pending state and reloads without starting work locally
+- [ ] **success tests:** success/network/disk outcomes reach the requester;
+      multiple requesters and a request arriving during a running refresh
+      coalesce onto one fetch and all settle from a covering completion counter
+- [ ] **failure/edge tests:** request-write failure never shows pending;
+      completion-write failure settles through timeout/reload; stale or
+      non-covering completion and timeout messages cannot clear a newer request
+- [ ] run focused peer-refresh tests and `just check`; both must pass before
+      Task 6
 
-### Task 7: Verify acceptance criteria
+### Task 6: Gate accent ownership and notify the leader after peer applies
 
-- [ ] verify all requirements from Overview are implemented: exactly one
-      instance runs timers/fetch/apply-automation/pokes/accent; the toggler
-      works from either popup; takeover arms a survivor within one tick
-- [ ] verify edge cases: leader dies mid-accent-flight (survivor's takeover
-      reconciliation Skips or disarms per the existing gap rules — no new
-      states introduced); both instances racing `acquire` at startup (flock
-      atomicity — one wins); single-monitor session identical to today
-- [ ] run full test suite: `just check` (fmt + clippy `-D warnings` + tests)
-- [ ] grep for ungated automatic entry points — every caller of
-      `schedule_refresh`, `sync_shuffle`, `start_thumbnail_pass_over`,
-      `start_accent_compute`, `accent_compute_for_current`,
-      `on_apply_success`, `prune_immediately`, `finish_refresh`, poke arming,
-      and every non-leader-reachable `set_config` is leader-gated,
-      user-initiated-and-side-effect-free, or raw-per-key
-- [ ] verify no i18n changes leaked in (no new `fl!` ids — otherwise 73
-      catalogues would be due)
+**Files:**
 
-### Task 8: [Final] Update documentation
+- Modify: `src/app.rs`
+- Test: `src/app.rs`
 
-- [ ] update `CLAUDE.md`: new `src/leader.rs` bullet; amend the accent
-      section's "single-instance assumption" to state how leadership restores
-      it; amend the `ConfigUpdated` rule "in-memory accent state is
-      authoritative (single-instance assumption)" with the explicit
-      non-leader exception (flag adopted from disk for display only); note
-      the per-output spawning fact, the takeover tick, and the
-      non-leader raw-per-key persist rule
-- [ ] update the session memory note if implementation details diverge from
-      the diagnosis write-up
-- [ ] move this plan to `docs/plans/completed/`
+- [ ] gate `start_accent_compute` at the choke point and defensively drop
+      accent compute/write completions on non-leaders
+- [ ] implement the non-leader accent toggler proxy: raw flag only, immediate
+      state only after persist success, no lifecycle; warn and remain unchanged
+      without a config context
+- [ ] keep non-leader `ConfigUpdated` display-only for the accent flag using
+      the existing fresh-disk rule; never adopt snapshot/last-written or route
+      `set_accent_enabled`
+- [ ] after a successful non-leader apply, update local navigation state,
+      invalidate stale reloads, and persist `apply_notice` off the UI thread;
+      do not arm shuffle or accent locally
+- [ ] on the active leader, validate a new notice by reading live wallpaper on
+      the blocking pool, drop stale notice completions, and route a current
+      file through `on_apply_success`
+- [ ] **success tests:** a peer apply produces one leader
+      current/ColdStart/accent update and a non-leader toggle changes only the
+      raw flag
+- [ ] **failure/edge tests:** absent/failing config, stale watcher/notice
+      completions, no-file/unknown live wallpaper, and apply-notice persist
+      failure run no non-leader lifecycle and cannot regress leader state
+- [ ] replay the original two-window accent fight: non-leader config echoes and
+      every compute entry point remain inert, while a peer apply notice causes
+      only the leader to recompute and the enabled state/snapshot survive
+- [ ] run focused accent/peer-apply tests and `just check`; both must pass before
+      Task 7
+
+### Task 7: Implement asynchronous takeover hydration
+
+**Files:**
+
+- Modify: `src/app.rs`
+- Test: `src/app.rs`
+
+- [ ] implement `LeadershipTick`, failed-attempt rearming, stale/already-active
+      drops, and the owns-lock-but-not-ready transition
+- [ ] load complete applet config, coordination state, and live wallpaper on
+      the blocking pool; add generation/dirty-event guards and a pure
+      completion handler accepting injected values
+- [ ] on a valid completion, adopt disk state, become active, arm ordinary
+      duties, and service an unacknowledged peer refresh request
+- [ ] test takeover using two real `Leadership::acquire(tempdir)` values—not
+      `forced(false)`—then drop the winner and verify the loser acquires once
+- [ ] **success tests:** takeover adopts disk config/accent fields, recovers an
+      outstanding request, and arms each leader duty exactly once
+- [ ] **failure/edge tests:** config/coordination changes during hydration force
+      a fresh read; stale hydration/timer messages, continued lockout, and a
+      missing config context cannot arm from stale state
+- [ ] run focused takeover tests and `just check`; both must pass before Task 8
+
+### Task 8: Make non-leader popup and completion reloads asynchronous
+
+**Files:**
+
+- Modify: `src/app.rs`
+- Test: `src/app.rs`
+
+- [ ] add the generation-guarded read-only reload helper and completion
+      message for catalogue plus live wallpaper
+- [ ] batch reload with popup creation for a non-leader when no peer refresh is
+      pending; never delay or bypass the popup ledger action
+- [ ] reuse the helper after peer refresh completion/timeout and invalidate it
+      after a successful local apply or takeover
+- [ ] **success tests:** reload adopts added/dropped entries and applies
+      `synced_current` after popup open and peer refresh settlement
+- [ ] **failure/edge tests:** stale completion after apply/takeover,
+      pending-refresh suppression, corrupt/missing catalogue fallback, and a
+      leader popup cannot overwrite authoritative in-memory state
+- [ ] run focused popup/reload tests and `just check`; both must pass before
+      Task 9
+
+### Task 9: Verify acceptance criteria
+
+- [ ] audit every caller of `schedule_refresh`, `sync_shuffle`,
+      `start_thumbnail_pass_over`, `start_accent_compute`,
+      `accent_compute_for_current`, `on_apply_success`, `prune_immediately`,
+      `finish_refresh`, poke arming, and full-entry `set_config`
+- [ ] verify exactly one active instance owns automatic work and every
+      thumbnail producer/sweep; non-leader refresh is a leader request, not a
+      local pipeline
+- [ ] verify settings and accent toggles work from either popup without stale
+      full-entry writes, and a non-leader apply promptly updates leader
+      current/ColdStart/accent state
+- [ ] verify startup races yield one lock winner; leader death during accent or
+      refresh work is reconciled by fresh takeover state without adopting stale
+      async completions
+- [ ] verify all tests use injected paths and no test/diagnostic can contact
+      Bing or real COSMIC config/theme/state
+- [ ] verify no popup ledger, dependency, or Fluent catalogue changes leaked
+      into the implementation
+- [ ] run `just check`
+
+### Task 10: [Final] Update documentation
+
+**Files:**
+
+- Modify: `README.md`
+- Modify: `CLAUDE.md`
+- Move: `docs/plans/20260817-single-instance-leader.md` to
+  `docs/plans/completed/`
+
+- [ ] document multi-output single-owner behavior and transparent peer refresh
+      routing in `README.md`
+- [ ] update `CLAUDE.md` with `src/leader.rs`, the coordination config keys,
+      active-leader gates, per-key non-leader persists, async takeover/reload,
+      and the explicit non-leader exception to in-memory accent authority
+- [ ] record any implementation deviation in this plan before marking tasks
+      complete
+- [ ] move the synchronized plan to `docs/plans/completed/`
+- [ ] run `just check` after documentation changes
 
 ## Post-Completion
 
-*Items requiring manual intervention or external systems - no checkboxes, informational only*
+### Manual verification
 
-**Manual verification on the real two-monitor session:**
-- `just install`, restart the panel (or re-log), confirm two applet processes
-  and exactly one holds the lock — path:
-  `~/.local/state/io.github.ercling.CosmicBingWallpaper/leader.lock`
-  (`lslocks` / `fuser`)
-- toggle accent from **each** monitor's popup: it must arm and stay armed
-  (watch `~/.config/cosmic/io.github.ercling.CosmicBingWallpaper/v1/accent_enabled`
-  and the **v2** theme dirs — not v1)
-- click prev/next on the *non-leader* popup with accent enabled: wallpaper
-  changes, accent recomputes on the leader (watch v2), and the toggle stays on
-- unplug the leader's monitor: within ~60 s the survivor takes over
-  (`lslocks` moves; a later refresh/shuffle still fires); replug and confirm
-  the new instance comes up as non-leader
-- lock/unlock the screen once: exactly one poke ladder in `RUST_LOG` output
+- Install intentionally, restart the panel or session, and confirm one applet
+  process per panel output but exactly one holder of
+  `~/.local/state/io.github.ercling.CosmicBingWallpaper/leader.lock`.
+- Trigger refresh from the non-leader popup. Its existing checking/error status
+  must settle from the leader's completion, with one Bing request pipeline and
+  one thumbnail producer in logs.
+- With accent matching enabled, apply previous/next/newest from the non-leader.
+  The wallpaper must change immediately, the leader must recompute the v2
+  theme accent, and the toggle/snapshot must remain armed.
+- Disconnect the monitor hosting the leader. Confirm its applet process exits,
+  the kernel releases the lock, and the surviving applet becomes active within
+  one retry interval (about 60 seconds), reloads disk/live state, and resumes
+  refresh/shuffle/accent/lock-poke duties. Reconnect and confirm the new applet
+  remains non-leader.
+- Lock/unlock once and verify exactly one poke ladder.
 
-**Known accepted limitations (documented, not fixed here):**
-- Catalogue writes from user-initiated actions on a non-leader are
-  last-writer-wins against the leader's background saves (atomic writes, no
-  corruption; worst case one merge is redone on the next refresh). A
-  non-leader `SetRetention` no longer prunes locally — the prune happens on
-  the leader when the watcher delivers the change
-- A non-leader's toggler reflects a leader-side disarm only when the watcher
-  event arrives (sub-second in practice)
-- A filesystem where flock itself errors (not WouldBlock) yields two leaders —
-  logged at warn, no worse than today's behavior
+### Accepted limitations
+
+- Takeover latency is bounded by the retry interval plus state hydration. If
+  COSMIC keeps the old output's applet process alive, that process continues
+  to hold the lock and remains the functioning leader.
+- A coordination persist failure is logged. Refresh requesters recover their
+  UI through the acknowledgement timeout/reload; an apply-notice failure is
+  reconciled at the next leader startup/takeover or ordinary recompute.
+- A filesystem where advisory locking itself errors fails open and may yield
+  multiple leaders; the warning distinguishes this from ordinary lock loss and
+  behavior is no worse than the current release.
