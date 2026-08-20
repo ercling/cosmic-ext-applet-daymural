@@ -943,6 +943,10 @@ impl Window {
     fn set_config(&mut self, config: AppletConfig) {
         use cosmic_config::CosmicConfigEntry as _;
 
+        if !self.is_active_leader() {
+            tracing::debug!("dropping full applet-config persist from a non-leader");
+            return;
+        }
         if self.config == config {
             return;
         }
@@ -954,6 +958,35 @@ impl Window {
         }
     }
 
+    /// Persist one ordinary setting without serializing the leader-owned
+    /// accent snapshot fields. A follower adopts the value only after the
+    /// write lands; a memory-only fixture retains the applet's established
+    /// in-memory settings behavior.
+    fn set_non_leader_setting<T>(
+        &mut self,
+        key: &'static str,
+        value: T,
+        adopt: impl FnOnce(&mut AppletConfig, T),
+    ) where
+        T: serde::Serialize + Clone,
+    {
+        use cosmic_config::ConfigSet as _;
+
+        let persisted = match &self.config_context {
+            Some(context) => match context.set(key, value.clone()) {
+                Ok(_) => true,
+                Err(error) => {
+                    tracing::warn!("failed to persist applet setting {key}: {error}");
+                    false
+                }
+            },
+            None => true,
+        };
+        if persisted {
+            adopt(&mut self.config, value);
+        }
+    }
+
     /// Arm the one-shot refresh timer for `delay` from now, invalidating any
     /// previously armed timer via the generation counter.
     ///
@@ -961,6 +994,9 @@ impl Window {
     /// monotonic and does not advance during system suspend, so a refresh
     /// due while suspended fires late after resume instead of immediately.
     fn schedule_refresh(&mut self, delay: Duration) -> app::Task<Message> {
+        if !self.is_active_leader() {
+            return Task::none();
+        }
         self.timer_generation += 1;
         let generation = self.timer_generation;
         tracing::info!("next refresh in {}s", delay.as_secs());
@@ -973,6 +1009,9 @@ impl Window {
     /// Arm (or re-arm) the one-shot shuffle timer for one full (sanitized)
     /// interval, invalidating any pending tick.
     fn arm_shuffle(&mut self) -> app::Task<Message> {
+        if !self.is_active_leader() {
+            return Task::none();
+        }
         self.shuffle_generation += 1;
         self.shuffle_armed = true;
         let generation = self.shuffle_generation;
@@ -986,6 +1025,9 @@ impl Window {
 
     /// Invalidate any pending shuffle tick.
     fn disarm_shuffle(&mut self) {
+        if !self.is_active_leader() {
+            return;
+        }
         self.shuffle_generation += 1;
         self.shuffle_armed = false;
     }
@@ -1005,6 +1047,9 @@ impl Window {
     /// [`lockwatch::toggle_wallpapers`] tolerates by design and is cleaned
     /// by the next poke's normalization.
     fn arm_lock_pokes(&mut self) -> app::Task<Message> {
+        if !self.is_active_leader() {
+            return Task::none();
+        }
         self.lock_poke_generation += 1;
         let generation = self.lock_poke_generation;
         Task::batch(lockwatch::POKE_DELAYS.map(|delay| {
@@ -1020,7 +1065,7 @@ impl Window {
     /// `None` when the rung is stale (a newer ladder replaced it) or no
     /// state handle exists.
     fn due_lock_poke(&self, generation: u64) -> Option<cosmic_config::Config> {
-        if generation != self.lock_poke_generation {
+        if !self.is_active_leader() || generation != self.lock_poke_generation {
             return None;
         }
         self.poke_config.clone()
@@ -1031,6 +1076,9 @@ impl Window {
     /// `reset_countdown` to force a re-arm even when a tick is already
     /// pending (manual navigation, settings changes).
     fn sync_shuffle(&mut self, reset_countdown: bool) -> app::Task<Message> {
+        if !self.is_active_leader() {
+            return Task::none();
+        }
         let should_run = self.config.shuffle_enabled && self.catalogue.images.len() >= 2;
         if !should_run {
             self.disarm_shuffle();
@@ -1048,6 +1096,9 @@ impl Window {
     /// protected; the shuffle timer follows the (possibly shrunken)
     /// catalogue.
     fn prune_immediately(&mut self) -> app::Task<Message> {
+        if !self.is_active_leader() {
+            return Task::none();
+        }
         self.prune_and_persist();
         // Pruning may leave fewer than two images — disarm shuffle if so.
         self.sync_shuffle(false)
@@ -1068,6 +1119,9 @@ impl Window {
     /// entirely — protecting only the possibly stale `self.current` could
     /// delete a Bing image some output actually displays.
     fn prune_and_persist(&mut self) -> Option<PathBuf> {
+        if !self.is_active_leader() {
+            return None;
+        }
         self.prune_over(
             wallpaper::current_wallpaper(),
             &wallpaper::download_dir(),
@@ -1087,6 +1141,9 @@ impl Window {
         state_dir: &Path,
         catalogue_path: &Path,
     ) -> Option<PathBuf> {
+        if !self.is_active_leader() {
+            return live.into_file();
+        }
         self.current = wallpaper::synced_current(&live, self.current.take());
         self.catalogue.prune(
             download_dir,
@@ -1135,7 +1192,7 @@ impl Window {
     /// pipeline only fetches and downloads; merge/prune/save happen back
     /// on the UI thread in `RefreshFinished` against the live state.
     fn start_refresh(&mut self) -> app::Task<Message> {
-        if self.refresh_pending {
+        if !self.is_active_leader() || self.refresh_pending {
             return Task::none();
         }
         // The backfill skips what the prune after this refresh will delete,
@@ -1152,6 +1209,9 @@ impl Window {
     /// (injected so tests can stage a wallpaper the applet has not seen
     /// itself apply). The caller has established that no fetch is in flight.
     fn start_refresh_over(&mut self, live: wallpaper::CurrentWallpaper) -> app::Task<Message> {
+        if !self.is_active_leader() {
+            return Task::none();
+        }
         self.refresh_pending = true;
         let catalogue = self.catalogue.clone();
         let retention_days = self.config.retention_days;
@@ -1190,6 +1250,9 @@ impl Window {
         &mut self,
         live: wallpaper::CurrentWallpaper,
     ) -> app::Task<Message> {
+        if !self.is_active_leader() {
+            return Task::none();
+        }
         self.thumbnail_pass_pending = true;
         let catalogue = self.catalogue.clone();
         let retention_days = self.config.retention_days;
@@ -1217,6 +1280,9 @@ impl Window {
     /// [`Window::may_sweep_thumbnails`]).
     fn finish_thumbnail_pass(&mut self, state_dir: &Path) {
         self.thumbnail_pass_pending = false;
+        if !self.is_active_leader() {
+            return;
+        }
         self.sweep_thumbnails(state_dir);
     }
 
@@ -1228,6 +1294,10 @@ impl Window {
         result: Result<Vec<ImageEntry>, RefreshError>,
     ) -> app::Task<Message> {
         self.refresh_pending = false;
+        if !self.is_active_leader() {
+            tracing::debug!("dropping refresh completion after leadership changed");
+            return Task::none();
+        }
         let fetched = match result {
             Ok(fetched) => fetched,
             Err(error) => {
@@ -1324,12 +1394,23 @@ impl Window {
         self.start_accent_compute(path)
     }
 
+    /// Remove a vanished image after an apply failure, but only while this
+    /// process owns the authoritative catalogue.
+    fn on_apply_failure(&mut self, path: &Path) -> app::Task<Message> {
+        if self.is_active_leader() && !path.is_file() {
+            self.prune_immediately()
+        } else {
+            Task::none()
+        }
+    }
+
     /// Arm the async accent extraction for `source` (a freshly applied
     /// wallpaper, or the startup-restored current). Gated on the setting and
     /// on usable theme handles; finishes in [`Message::AccentComputed`],
     /// whose handler re-checks everything against live state.
     fn start_accent_compute(&self, source: PathBuf) -> app::Task<Message> {
-        if !self.config.accent_enabled || self.accent_handles.is_none() {
+        if !self.is_active_leader() || !self.config.accent_enabled || self.accent_handles.is_none()
+        {
             return Task::none();
         }
         cosmic::task::future(async move {
@@ -1347,6 +1428,9 @@ impl Window {
     /// — the wallpaper may have changed (the `source` guard) and so may the
     /// builder accents (read fresh here, right before the plan).
     fn finish_accent_compute(&mut self, source: PathBuf, hue: Option<f32>) -> app::Task<Message> {
+        if !self.is_active_leader() {
+            return Task::none();
+        }
         if self.current.as_deref() != Some(source.as_path()) {
             tracing::debug!("dropping stale accent result for {}", source.display());
             return Task::none();
@@ -1522,6 +1606,9 @@ impl Window {
     /// **fresh** read of the on-disk config, never the possibly-stale echo
     /// payloads suppressed meanwhile) and a queued recompute.
     fn finish_accent_task(&mut self, generation: u64, success: bool) -> app::Task<Message> {
+        if !self.is_active_leader() {
+            return Task::none();
+        }
         if generation != self.accent_write_generation {
             // Same contract as the timers: a superseded task's completion
             // must not touch the guard state of the current one.
@@ -1753,6 +1840,13 @@ impl Window {
     /// toggler to render, pinned onto the disk config, and routed through
     /// this same dispatcher by the completion's fresh-disk-read reconcile.
     fn set_accent_enabled(&mut self, enabled: bool) -> app::Task<Message> {
+        if !self.is_active_leader() {
+            tracing::debug!(
+                enabled,
+                "dropping accent lifecycle request from a non-leader"
+            );
+            return Task::none();
+        }
         if self.accent_inflight.is_some() {
             if enabled == self.accent_toggler_state() {
                 return Task::none();
@@ -2595,6 +2689,12 @@ impl cosmic::Application for Window {
                     || config.shuffle_interval_secs != self.config.shuffle_interval_secs;
                 let retention_reduced =
                     schedule::retention_reduced(self.config.retention_days, config.retention_days);
+                if !self.is_active_leader() {
+                    config.accent_snapshot = self.config.accent_snapshot;
+                    config.accent_last_written = self.config.accent_last_written;
+                    self.config = config;
+                    return Task::none();
+                }
                 // An external flip of `accent_enabled` must run the same
                 // lifecycle as the popup toggler — snapshot + compute on
                 // enable, restore + clear on disable — not silently adopt
@@ -2661,7 +2761,7 @@ impl cosmic::Application for Window {
             }
             Message::RefreshDue(generation) => {
                 // Stale timers (replaced by a newer reschedule) are ignored.
-                if generation == self.timer_generation {
+                if self.is_active_leader() && generation == self.timer_generation {
                     return self.start_refresh();
                 }
             }
@@ -2674,7 +2774,11 @@ impl cosmic::Application for Window {
                 match wallpaper::apply(&path) {
                     Ok(()) => {
                         let accent = self.on_apply_success(path);
-                        let shuffle = self.sync_shuffle(true);
+                        let shuffle = if self.is_active_leader() {
+                            self.sync_shuffle(true)
+                        } else {
+                            Task::none()
+                        };
                         return Task::batch([accent, shuffle]);
                     }
                     Err(error) => {
@@ -2684,9 +2788,7 @@ impl cosmic::Application for Window {
                         // prune drops entries whose file is gone, so the
                         // dead image leaves the popup instead of failing
                         // on every further click until the next fetch.
-                        if !path.is_file() {
-                            return self.prune_immediately();
-                        }
+                        return self.on_apply_failure(&path);
                     }
                 }
             }
@@ -2706,7 +2808,7 @@ impl cosmic::Application for Window {
             }
             Message::ShuffleDue(generation) => {
                 // Stale ticks (replaced by a newer re-arm) are ignored.
-                if generation != self.shuffle_generation {
+                if !self.is_active_leader() || generation != self.shuffle_generation {
                     return Task::none();
                 }
                 self.shuffle_armed = false;
@@ -2738,6 +2840,12 @@ impl cosmic::Application for Window {
                 return Task::batch([accent, shuffle]);
             }
             Message::SetShuffleEnabled(enabled) => {
+                if !self.is_active_leader() {
+                    self.set_non_leader_setting("shuffle_enabled", enabled, |config, value| {
+                        config.shuffle_enabled = value;
+                    });
+                    return Task::none();
+                }
                 let mut config = self.config.clone();
                 config.shuffle_enabled = enabled;
                 self.set_config(config);
@@ -2745,14 +2853,29 @@ impl cosmic::Application for Window {
                 return self.sync_shuffle(true);
             }
             Message::SetShuffleInterval(index) => {
+                let interval = view::shuffle_interval_secs(index);
+                if !self.is_active_leader() {
+                    self.set_non_leader_setting(
+                        "shuffle_interval_secs",
+                        interval,
+                        |config, value| config.shuffle_interval_secs = value,
+                    );
+                    return Task::none();
+                }
                 let mut config = self.config.clone();
-                config.shuffle_interval_secs = view::shuffle_interval_secs(index);
+                config.shuffle_interval_secs = interval;
                 self.set_config(config);
                 // Picking an interval restarts the countdown at that length.
                 return self.sync_shuffle(true);
             }
             Message::SetRetention(index) => {
                 let new_days = view::retention_days(index);
+                if !self.is_active_leader() {
+                    self.set_non_leader_setting("retention_days", new_days, |config, value| {
+                        config.retention_days = value;
+                    });
+                    return Task::none();
+                }
                 let reduced = schedule::retention_reduced(self.config.retention_days, new_days);
                 let mut config = self.config.clone();
                 config.retention_days = new_days;
@@ -2766,13 +2889,24 @@ impl cosmic::Application for Window {
             }
             Message::SetAccentEnabled(enabled) => return self.set_accent_enabled(enabled),
             Message::AccentComputed { source, hue } => {
+                if !self.is_active_leader() {
+                    return Task::none();
+                }
                 return self.finish_accent_compute(source, hue);
             }
             Message::AccentWriteFinished {
                 generation,
                 success,
-            } => return self.finish_accent_task(generation, success),
+            } => {
+                if !self.is_active_leader() {
+                    return Task::none();
+                }
+                return self.finish_accent_task(generation, success);
+            }
             Message::LockEvent(event) => {
+                if !self.is_active_leader() {
+                    return Task::none();
+                }
                 tracing::debug!(?event, "arming lock-screen poke ladder");
                 return self.arm_lock_pokes();
             }
@@ -2804,6 +2938,9 @@ impl cosmic::Application for Window {
             // preview generated while it was open shows up by itself.
             Message::ThumbnailsReady => {
                 self.finish_thumbnail_pass(state_dir());
+                if !self.is_active_leader() {
+                    return Task::none();
+                }
                 // The startup (or enable-time) accent compute may have found
                 // a cold cache and dropped its answer; the pass that just
                 // ended is what writes those thumbnails, so this is the
@@ -4324,6 +4461,195 @@ mod tests {
             window.timer_generation > generation,
             "the retry timer replaces the pending one"
         );
+    }
+
+    #[test]
+    fn non_leader_drops_current_generation_automatic_messages() {
+        use cosmic::Application as _;
+
+        let mut window = Window {
+            leadership: Leadership::forced(false),
+            timer_generation: 7,
+            shuffle_generation: 11,
+            shuffle_armed: true,
+            lock_poke_generation: 13,
+            ..Window::default()
+        };
+        window.config.shuffle_enabled = true;
+
+        drop(window.update(Message::RefreshDue(7)));
+        assert!(!window.refresh_pending, "a follower cannot start a fetch");
+        assert_eq!(window.timer_generation, 7);
+
+        drop(window.update(Message::ShuffleDue(11)));
+        assert!(
+            window.shuffle_armed,
+            "a follower cannot consume a shuffle tick"
+        );
+        assert_eq!(window.shuffle_generation, 11);
+
+        drop(window.update(Message::LockEvent(lockwatch::LockEvent::Locked)));
+        assert_eq!(window.lock_poke_generation, 13);
+        assert!(window.due_lock_poke(13).is_none());
+    }
+
+    #[test]
+    fn non_leader_refresh_completions_clear_the_producer_without_rearming_or_merging() {
+        use cosmic::Application as _;
+
+        for result in [
+            Ok(vec![entry_in_memory("20260808", "Fresh_ROW1")]),
+            Err(RefreshError::Network("offline".to_owned())),
+        ] {
+            let existing = entry_in_memory("20260807", "Existing_ROW1");
+            let mut window = Window {
+                leadership: Leadership::forced(false),
+                catalogue: Catalogue {
+                    images: vec![existing.clone()],
+                },
+                refresh_pending: true,
+                timer_generation: 9,
+                last_error: Some(RefreshError::Disk("old".to_owned())),
+                ..Window::default()
+            };
+
+            drop(window.update(Message::RefreshFinished(result)));
+
+            assert!(!window.refresh_pending);
+            assert_eq!(window.timer_generation, 9, "no retry or success timer");
+            assert_eq!(window.catalogue.images, vec![existing], "no merge/prune");
+            assert!(matches!(window.last_error, Some(RefreshError::Disk(_))));
+        }
+    }
+
+    #[test]
+    fn non_leader_apply_failure_and_thumbnail_completion_are_non_destructive() {
+        let dir = tempfile::tempdir().unwrap();
+        let images = dir.path().join("images");
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&images).unwrap();
+        std::fs::create_dir_all(state.join("thumbs")).unwrap();
+        let missing = images.join("20260807-Gone_ROW1_UHD.jpg");
+        let entry = ImageEntry {
+            filename: missing.clone(),
+            ..entry_in_memory("20260807", "Gone_ROW1")
+        };
+        let orphan = state.join("thumbs/orphan.jpg");
+        std::fs::write(&orphan, b"keep").unwrap();
+        let mut window = Window {
+            leadership: Leadership::forced(false),
+            catalogue: Catalogue {
+                images: vec![entry.clone()],
+            },
+            thumbnail_pass_pending: true,
+            ..Window::default()
+        };
+
+        drop(window.on_apply_failure(&missing));
+        window.finish_thumbnail_pass(&state);
+
+        assert_eq!(window.catalogue.images, vec![entry]);
+        assert!(orphan.is_file(), "a stale follower completion cannot sweep");
+        assert!(!window.thumbnail_pass_pending);
+    }
+
+    #[test]
+    fn non_leader_settings_persist_only_their_own_keys() {
+        use cosmic::Application as _;
+        use cosmic_config::CosmicConfigEntry as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("config");
+        let context =
+            cosmic_config::Config::with_custom_path(APP_ID, AppletConfig::VERSION, root.clone())
+                .unwrap();
+        let snapshot = AccentSnapshot {
+            light: Some([1, 2, 3]),
+            dark: None,
+        };
+        let last_written = AccentPair {
+            light: [4, 5, 6],
+            dark: [7, 8, 9],
+        };
+        let seeded = AppletConfig {
+            accent_enabled: true,
+            accent_snapshot: Some(snapshot),
+            accent_last_written: Some(last_written),
+            ..Default::default()
+        };
+        seeded.write_entry(&context).unwrap();
+        let version_dir = root.join("cosmic").join(APP_ID).join("v1");
+        let snapshot_path = version_dir.join("accent_snapshot");
+        let last_written_path = version_dir.join("accent_last_written");
+        let accent_bytes = || {
+            (
+                std::fs::read(&snapshot_path).unwrap(),
+                std::fs::read(&last_written_path).unwrap(),
+            )
+        };
+        let before = accent_bytes();
+        let mut window = Window {
+            leadership: Leadership::forced(false),
+            config: seeded,
+            config_context: Some(context),
+            ..Window::default()
+        };
+        let timer_generation = window.timer_generation;
+        let shuffle_generation = window.shuffle_generation;
+
+        drop(window.update(Message::SetShuffleEnabled(true)));
+        drop(window.update(Message::SetShuffleInterval(0)));
+        drop(window.update(Message::SetRetention(0)));
+
+        assert!(window.config.shuffle_enabled);
+        assert_eq!(window.config.shuffle_interval_secs, 1_800);
+        assert_eq!(window.config.retention_days, 3);
+        assert_eq!(window.timer_generation, timer_generation);
+        assert_eq!(window.shuffle_generation, shuffle_generation);
+        assert_eq!(accent_bytes(), before, "accent key bytes are leader-owned");
+        let persisted = AppletConfig::load(window.config_context.as_ref().unwrap());
+        assert_eq!(persisted.accent_snapshot, Some(snapshot));
+        assert_eq!(persisted.accent_last_written, Some(last_written));
+    }
+
+    #[test]
+    fn non_leader_settings_handle_missing_and_failing_config_contexts() {
+        use cosmic::Application as _;
+        use cosmic_config::CosmicConfigEntry as _;
+
+        let mut memory_only = Window {
+            leadership: Leadership::forced(false),
+            ..Window::default()
+        };
+        drop(memory_only.update(Message::SetShuffleEnabled(true)));
+        drop(memory_only.update(Message::SetShuffleInterval(0)));
+        drop(memory_only.update(Message::SetRetention(0)));
+        assert!(memory_only.config.shuffle_enabled);
+        assert_eq!(memory_only.config.shuffle_interval_secs, 1_800);
+        assert_eq!(memory_only.config.retention_days, 3);
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("config");
+        let context =
+            cosmic_config::Config::with_custom_path(APP_ID, AppletConfig::VERSION, root.clone())
+                .unwrap();
+        AppletConfig::default().write_entry(&context).unwrap();
+        let version_dir = root.join("cosmic").join(APP_ID).join("v1");
+        std::fs::remove_dir_all(&version_dir).unwrap();
+        std::fs::write(&version_dir, b"not a directory").unwrap();
+        let mut failing = Window {
+            leadership: Leadership::forced(false),
+            config_context: Some(context),
+            ..Window::default()
+        };
+        let before = failing.config.clone();
+
+        drop(failing.update(Message::SetShuffleEnabled(true)));
+        drop(failing.update(Message::SetShuffleInterval(0)));
+        drop(failing.update(Message::SetRetention(0)));
+
+        assert_eq!(failing.config, before, "failed persists are not adopted");
+        assert!(!failing.shuffle_armed);
     }
 
     #[test]

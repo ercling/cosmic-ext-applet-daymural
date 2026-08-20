@@ -330,21 +330,21 @@ reload helper. Leaders keep their in-memory-authoritative catalogue.
 - Modify: `src/app.rs`
 - Test: `src/app.rs`
 
-- [ ] add every runtime gate listed in Technical Details, including
+- [x] add every runtime gate listed in Technical Details, including
       `finish_refresh`'s early error-retry branch and non-leader apply-failure
       pruning
-- [ ] route non-leader shuffle/interval/retention persists through raw per-key
+- [x] route non-leader shuffle/interval/retention persists through raw per-key
       writes; skip local timer changes and pruning
-- [ ] keep leader control behavior byte-for-byte unchanged
-- [ ] **success tests:** current-generation automatic messages still act for a
+- [x] keep leader control behavior byte-for-byte unchanged
+- [x] **success tests:** current-generation automatic messages still act for a
       ready leader, and leader settings retain existing timer/prune behavior
-- [ ] **failure/edge tests:** those same current-generation messages are
+- [x] **failure/edge tests:** those same current-generation messages are
       dropped by a non-leader; both successful and failed refresh completions cannot re-arm a
       non-leader, and non-leader apply failure cannot prune
-- [ ] test each non-leader setting persist leaves the on-disk
+- [x] test each non-leader setting persist leaves the on-disk
       `accent_snapshot`/`accent_last_written` bytes unchanged; cover missing and
       failing config contexts
-- [ ] run focused timer/config/prune tests and `just check`; both must pass
+- [x] run focused timer/config/prune tests and `just check`; both must pass
       before Task 5
 
 ### Task 5: Proxy non-leader manual refresh and acknowledge completion
