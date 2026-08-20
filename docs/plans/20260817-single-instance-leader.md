@@ -278,22 +278,22 @@ reload helper. Leaders keep their in-memory-authoritative catalogue.
 - Modify: `src/config.rs`
 - Test: `src/config.rs`
 
-- [ ] add `CoordinationConfig`, `PeerApplyNotice`,
+- [x] add `CoordinationConfig`, `PeerApplyNotice`,
       `PeerRefreshCompletion`, and the success/network/disk outcome enum with
       defaults and serde/config derives; keep keys disjoint from `AppletConfig`
-- [ ] add tempdir-rooted load helpers that degrade missing/corrupt keys to
+- [x] add tempdir-rooted load helpers that degrade missing/corrupt keys to
       defaults without rewriting them
-- [ ] add blocking-worker helpers for incrementing `refresh_request`, writing
+- [x] add blocking-worker helpers for incrementing `refresh_request`, writing
       `apply_notice`, and recording completion; reject `u64::MAX`
-- [ ] **success tests:** request counters remain strictly monotonic under
+- [x] **success tests:** request counters remain strictly monotonic under
       concurrent writers; apply-notice and completion values round-trip as
       atomic single keys
-- [ ] **failure/edge tests:** missing/corrupt keys load defaults without
+- [x] **failure/edge tests:** missing/corrupt keys load defaults without
       writes; max-counter allocation and config writes fail without regressing
       the persisted mailbox
-- [ ] test an `AppletConfig::write_entry` leaves all coordination key bytes
+- [x] test an `AppletConfig::write_entry` leaves all coordination key bytes
       unchanged
-- [ ] run `PKG_CONFIG_PATH=/usr/lib64/pkgconfig:/usr/share/pkgconfig cargo test config`
+- [x] run `PKG_CONFIG_PATH=/usr/lib64/pkgconfig:/usr/share/pkgconfig cargo test config`
       and `just check`; both must pass before Task 3
 
 ### Task 3: Thread leadership through startup and make restoration role-safe
