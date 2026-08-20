@@ -354,24 +354,24 @@ reload helper. Leaders keep their in-memory-authoritative catalogue.
 - Modify: `src/app.rs`
 - Test: `src/app.rs`
 
-- [ ] route non-leader `RefreshNow` through the blocking coordination-request
+- [x] route non-leader `RefreshNow` through the blocking coordination-request
       helper; show pending only after a successful/coalesced request persist
-- [ ] make an active leader consume an outstanding request, attaching it to an
+- [x] make an active leader consume an outstanding request, attaching it to an
       in-flight refresh or starting one; never start a second concurrent fetch
-- [ ] after `RefreshFinished`, persist completion for the latest request the
+- [x] after `RefreshFinished`, persist completion for the latest request the
       leader had observed, including success/network/disk outcome
-- [ ] on a matching-or-newer completion, clear the requester's pending state,
+- [x] on a matching-or-newer completion, clear the requester's pending state,
       update the existing status class, invalidate its timeout, and request a
       read-only reload
-- [ ] add a generation-guarded acknowledgement timeout that clears false
+- [x] add a generation-guarded acknowledgement timeout that clears false
       pending state and reloads without starting work locally
-- [ ] **success tests:** success/network/disk outcomes reach the requester;
+- [x] **success tests:** success/network/disk outcomes reach the requester;
       multiple requesters and a request arriving during a running refresh
       coalesce onto one fetch and all settle from a covering completion counter
-- [ ] **failure/edge tests:** request-write failure never shows pending;
+- [x] **failure/edge tests:** request-write failure never shows pending;
       completion-write failure settles through timeout/reload; stale or
       non-covering completion and timeout messages cannot clear a newer request
-- [ ] run focused peer-refresh tests and `just check`; both must pass before
+- [x] run focused peer-refresh tests and `just check`; both must pass before
       Task 6
 
 ### Task 6: Gate accent ownership and notify the leader after peer applies

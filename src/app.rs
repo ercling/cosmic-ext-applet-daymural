@@ -23,7 +23,10 @@ use cosmic::{
 };
 
 use crate::catalogue::{self, Catalogue, ImageEntry};
-use crate::config::{AppletConfig, CoordinationConfig};
+use crate::config::{
+    AppletConfig, CoordinationConfig, PeerRefreshCompletion, PeerRefreshOutcome,
+    increment_refresh_request, record_refresh_completion,
+};
 use crate::leader::Leadership;
 // No `fl!` here: every user-visible string this applet renders lives in the
 // popup (`view.rs`). The panel contributes an icon and nothing else.
@@ -37,6 +40,11 @@ const PANEL_ICON: &str = "preferences-desktop-wallpaper-symbolic";
 
 /// How often a surviving panel instance checks whether the leader exited.
 const LEADERSHIP_RETRY_DELAY: Duration = Duration::from_secs(60);
+
+/// Give the leader ample time for a slow UHD download before a requester
+/// stops presenting the refresh as pending. A timeout never starts local
+/// work; it only restores an honest popup state and requests a disk reload.
+const PEER_REFRESH_ACK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 pub fn run() -> cosmic::iced::Result {
     cosmic::applet::run::<Window>(())
@@ -224,8 +232,22 @@ pub struct Window {
     /// Context used for raw, single-key coordination writes.
     #[allow(dead_code, reason = "used by peer mailbox writers in later plan tasks")]
     coordination_context: Option<cosmic_config::Config>,
+    /// Injectable directory containing the short-lived coordination lock.
+    /// Production uses [`state_dir`]; tests always provide a tempdir.
+    coordination_state_dir: PathBuf,
     /// Newest peer refresh request attached to the current fetch.
     peer_refresh_request: Option<u64>,
+    /// Request this non-leader popup is waiting for the leader to cover.
+    requested_peer_refresh: Option<u64>,
+    /// A blocking request-counter persist is in flight. Kept separate from
+    /// `refresh_pending`: the popup must not claim to be checking until the
+    /// write has actually landed.
+    peer_refresh_write_pending: bool,
+    /// One-shot acknowledgement timeout generation.
+    peer_refresh_timeout_generation: u64,
+    /// Read-only reload request generation. Task 8 attaches the asynchronous
+    /// catalogue/live-state load to this already-guarded request point.
+    non_leader_reload_generation: u64,
     /// All downloaded images (restored from disk at startup — no network).
     pub(crate) catalogue: Catalogue,
     /// Our idea of the currently applied wallpaper file. Refreshed from
@@ -531,6 +553,18 @@ pub enum Message {
     /// The fetch pipeline finished (payload: the freshly fetched entries,
     /// merged into the live catalogue on the UI thread).
     RefreshFinished(Result<Vec<ImageEntry>, RefreshError>),
+    /// A non-leader's blocking mailbox counter allocation completed.
+    PeerRefreshRequested(Result<u64, String>),
+    /// The leader's blocking acknowledgement persist completed.
+    PeerRefreshCompletionWritten {
+        completion: PeerRefreshCompletion,
+        result: Result<bool, String>,
+    },
+    /// A non-leader did not observe a covering acknowledgement in time.
+    PeerRefreshTimeout {
+        generation: u64,
+        request: u64,
+    },
     /// The startup thumbnail pass finished. Also re-renders the popup, so
     /// previews generated while it was open appear without a reopen.
     ThumbnailsReady,
@@ -1205,6 +1239,160 @@ impl Window {
         self.start_refresh_over(wallpaper::current_wallpaper())
     }
 
+    /// Handle the popup refresh button according to this process's role.
+    fn refresh_now(&mut self) -> app::Task<Message> {
+        if self.is_active_leader() {
+            return self.start_refresh();
+        }
+        if self.refresh_pending || self.peer_refresh_write_pending {
+            return Task::none();
+        }
+        let Some(config) = self.coordination_context.clone() else {
+            tracing::warn!("cannot request a peer refresh without coordination config");
+            return Task::none();
+        };
+        let state = self.coordination_state_dir.clone();
+        self.peer_refresh_write_pending = true;
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                increment_refresh_request(&config, &state).map_err(|error| error.to_string())
+            })
+            .await
+            .unwrap_or_else(|error| Err(format!("peer refresh request task failed: {error}")));
+            Message::PeerRefreshRequested(result)
+        })
+    }
+
+    fn finish_peer_refresh_request(&mut self, result: Result<u64, String>) -> app::Task<Message> {
+        self.peer_refresh_write_pending = false;
+        if self.is_active_leader() {
+            return Task::none();
+        }
+        let request = match result {
+            Ok(request) => request,
+            Err(error) => {
+                tracing::warn!("failed to request peer refresh: {error}");
+                return Task::none();
+            }
+        };
+        self.coordination.refresh_request = self.coordination.refresh_request.max(request);
+        self.requested_peer_refresh = Some(request);
+        self.refresh_pending = true;
+        self.peer_refresh_timeout_generation = self.peer_refresh_timeout_generation.wrapping_add(1);
+        if self.coordination.refresh_completion.request >= request {
+            return self.settle_peer_refresh(self.coordination.refresh_completion);
+        }
+        let generation = self.peer_refresh_timeout_generation;
+        cosmic::task::future(async move {
+            tokio::time::sleep(PEER_REFRESH_ACK_TIMEOUT).await;
+            Message::PeerRefreshTimeout {
+                generation,
+                request,
+            }
+        })
+    }
+
+    /// Mark the point where Task 8 performs a read-only catalogue/live-state
+    /// reload. Keeping the generation here makes completion and timeout
+    /// settlement observable and already safe against later applies/reloads.
+    fn request_non_leader_reload(&mut self) -> app::Task<Message> {
+        self.non_leader_reload_generation = self.non_leader_reload_generation.wrapping_add(1);
+        Task::none()
+    }
+
+    fn settle_peer_refresh(&mut self, completion: PeerRefreshCompletion) -> app::Task<Message> {
+        let Some(request) = self.requested_peer_refresh else {
+            return Task::none();
+        };
+        if self.is_active_leader() || completion.request < request {
+            return Task::none();
+        }
+
+        self.requested_peer_refresh = None;
+        self.refresh_pending = false;
+        self.peer_refresh_timeout_generation = self.peer_refresh_timeout_generation.wrapping_add(1);
+        match completion.outcome {
+            PeerRefreshOutcome::Success => {
+                self.last_updated = Some(Utc::now());
+                self.last_error = None;
+            }
+            PeerRefreshOutcome::Network => {
+                self.last_error = Some(RefreshError::Network(String::new()));
+            }
+            PeerRefreshOutcome::Disk => {
+                self.last_error = Some(RefreshError::Disk(String::new()));
+            }
+        }
+        self.request_non_leader_reload()
+    }
+
+    fn timeout_peer_refresh(&mut self, generation: u64, request: u64) -> app::Task<Message> {
+        if self.is_active_leader()
+            || generation != self.peer_refresh_timeout_generation
+            || self.requested_peer_refresh != Some(request)
+        {
+            return Task::none();
+        }
+        self.requested_peer_refresh = None;
+        self.refresh_pending = false;
+        self.peer_refresh_timeout_generation = self.peer_refresh_timeout_generation.wrapping_add(1);
+        self.request_non_leader_reload()
+    }
+
+    /// Attach every currently outstanding mailbox request to the one fetch
+    /// in flight, or start that fetch when idle.
+    fn consume_peer_refresh_request(&mut self) -> app::Task<Message> {
+        self.consume_peer_refresh_request_over(wallpaper::current_wallpaper())
+    }
+
+    /// [`Window::consume_peer_refresh_request`] with injected live wallpaper
+    /// state for hermetic decision tests.
+    fn consume_peer_refresh_request_over(
+        &mut self,
+        live: wallpaper::CurrentWallpaper,
+    ) -> app::Task<Message> {
+        if !self.is_active_leader()
+            || self.coordination.refresh_request <= self.coordination.refresh_completion.request
+        {
+            return Task::none();
+        }
+        self.peer_refresh_request = Some(
+            self.peer_refresh_request
+                .unwrap_or_default()
+                .max(self.coordination.refresh_request),
+        );
+        if self.refresh_pending {
+            Task::none()
+        } else {
+            self.start_refresh_over(live)
+        }
+    }
+
+    fn record_peer_refresh_completion(
+        &self,
+        request: u64,
+        outcome: PeerRefreshOutcome,
+    ) -> app::Task<Message> {
+        let Some(config) = self.coordination_context.clone() else {
+            tracing::warn!(
+                request,
+                "cannot persist peer refresh completion without config"
+            );
+            return Task::none();
+        };
+        let state = self.coordination_state_dir.clone();
+        let completion = PeerRefreshCompletion { request, outcome };
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                record_refresh_completion(&config, &state, completion)
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .unwrap_or_else(|error| Err(format!("peer refresh completion task failed: {error}")));
+            Message::PeerRefreshCompletionWritten { completion, result }
+        })
+    }
+
     /// [`Window::start_refresh`] against an already-read cosmic-bg state
     /// (injected so tests can stage a wallpaper the applet has not seen
     /// itself apply). The caller has established that no fetch is in flight.
@@ -1298,12 +1486,22 @@ impl Window {
             tracing::debug!("dropping refresh completion after leadership changed");
             return Task::none();
         }
+        let peer_request = self.peer_refresh_request.take();
+        let peer_outcome = match &result {
+            Ok(_) => PeerRefreshOutcome::Success,
+            Err(RefreshError::Network(_)) => PeerRefreshOutcome::Network,
+            Err(RefreshError::Disk(_)) => PeerRefreshOutcome::Disk,
+        };
         let fetched = match result {
             Ok(fetched) => fetched,
             Err(error) => {
                 tracing::warn!("refresh failed: {error}");
                 self.last_error = Some(error);
-                return self.schedule_refresh(schedule::ERROR_RETRY_DELAY);
+                let retry = self.schedule_refresh(schedule::ERROR_RETRY_DELAY);
+                let acknowledgement = peer_request.map_or_else(Task::none, |request| {
+                    self.record_peer_refresh_completion(request, peer_outcome)
+                });
+                return Task::batch([retry, acknowledgement]);
             }
         };
 
@@ -1372,7 +1570,10 @@ impl Window {
         // A grown catalogue may unlock a waiting shuffle (≥2 images); a
         // pending tick keeps its countdown.
         let shuffle = self.sync_shuffle(false);
-        Task::batch([refresh_timer, shuffle, accent])
+        let acknowledgement = peer_request.map_or_else(Task::none, |request| {
+            self.record_peer_refresh_completion(request, peer_outcome)
+        });
+        Task::batch([refresh_timer, shuffle, accent, acknowledgement])
     }
 
     /// Shared state transition for every path that successfully applied a
@@ -2587,7 +2788,12 @@ impl cosmic::Application for Window {
             config_context,
             coordination,
             coordination_context,
+            coordination_state_dir: state_dir().to_path_buf(),
             peer_refresh_request: None,
+            requested_peer_refresh: None,
+            peer_refresh_write_pending: false,
+            peer_refresh_timeout_generation: 0,
+            non_leader_reload_generation: 0,
             catalogue,
             current,
             refresh_pending: false,
@@ -2751,8 +2957,13 @@ impl cosmic::Application for Window {
                 }
             }
             Message::CoordinationUpdated(coordination) => {
+                let completion = coordination.refresh_completion;
                 self.coordination = coordination;
                 self.leadership_state_generation = self.leadership_state_generation.wrapping_add(1);
+                if self.is_active_leader() {
+                    return self.consume_peer_refresh_request();
+                }
+                return self.settle_peer_refresh(completion);
             }
             // Task 7 completes acquisition and hydration. Keeping the message
             // explicit now makes the startup retry an isolated one-shot.
@@ -2765,7 +2976,28 @@ impl cosmic::Application for Window {
                     return self.start_refresh();
                 }
             }
-            Message::RefreshNow => return self.start_refresh(),
+            Message::RefreshNow => return self.refresh_now(),
+            Message::PeerRefreshRequested(result) => {
+                return self.finish_peer_refresh_request(result);
+            }
+            Message::PeerRefreshCompletionWritten { completion, result } => match result {
+                Ok(true) => {
+                    if completion.request > self.coordination.refresh_completion.request {
+                        self.coordination.refresh_completion = completion;
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        request = completion.request,
+                        "failed to persist peer refresh completion: {error}"
+                    );
+                }
+            },
+            Message::PeerRefreshTimeout {
+                generation,
+                request,
+            } => return self.timeout_peer_refresh(generation, request),
             Message::ApplyImage(path) => {
                 // Browsing is setting: prev/next/newest apply immediately.
                 // Manual navigation also resets the shuffle countdown —
@@ -3002,6 +3234,7 @@ impl cosmic::Application for Window {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cosmic::cosmic_config::CosmicConfigEntry as _;
     use std::collections::BTreeMap;
 
     fn file_snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
@@ -4520,6 +4753,315 @@ mod tests {
             assert_eq!(window.catalogue.images, vec![existing], "no merge/prune");
             assert!(matches!(window.last_error, Some(RefreshError::Disk(_))));
         }
+    }
+
+    fn peer_follower(request: u64) -> Window {
+        Window {
+            leadership: Leadership::forced(false),
+            requested_peer_refresh: Some(request),
+            refresh_pending: true,
+            peer_refresh_timeout_generation: request,
+            ..Window::default()
+        }
+    }
+
+    #[test]
+    fn peer_refresh_outcomes_settle_requester_status_and_request_reload() {
+        use cosmic::Application as _;
+
+        for (outcome, expected) in [
+            (PeerRefreshOutcome::Success, "success"),
+            (PeerRefreshOutcome::Network, "network"),
+            (PeerRefreshOutcome::Disk, "disk"),
+        ] {
+            let mut window = peer_follower(4);
+            let timeout_generation = window.peer_refresh_timeout_generation;
+            drop(
+                window.update(Message::CoordinationUpdated(CoordinationConfig {
+                    refresh_request: 4,
+                    refresh_completion: PeerRefreshCompletion {
+                        request: 4,
+                        outcome,
+                    },
+                    ..Default::default()
+                })),
+            );
+
+            assert!(!window.refresh_pending);
+            assert_eq!(window.requested_peer_refresh, None);
+            assert!(window.peer_refresh_timeout_generation > timeout_generation);
+            assert_eq!(window.non_leader_reload_generation, 1);
+            match expected {
+                "success" => {
+                    assert!(window.last_updated.is_some());
+                    assert!(window.last_error.is_none());
+                }
+                "network" => assert!(matches!(window.last_error, Some(RefreshError::Network(_)))),
+                "disk" => assert!(matches!(window.last_error, Some(RefreshError::Disk(_)))),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn covering_completion_settles_multiple_requesters() {
+        use cosmic::Application as _;
+
+        let completion = PeerRefreshCompletion {
+            request: 9,
+            outcome: PeerRefreshOutcome::Success,
+        };
+        let mut first = peer_follower(7);
+        let mut second = peer_follower(9);
+        for window in [&mut first, &mut second] {
+            drop(
+                window.update(Message::CoordinationUpdated(CoordinationConfig {
+                    refresh_request: 9,
+                    refresh_completion: completion,
+                    ..Default::default()
+                })),
+            );
+            assert!(!window.refresh_pending);
+            assert_eq!(window.non_leader_reload_generation, 1);
+        }
+    }
+
+    #[test]
+    fn leader_coalesces_requests_arriving_during_one_fetch() {
+        let mut window = Window {
+            coordination: CoordinationConfig {
+                refresh_request: 2,
+                ..Default::default()
+            },
+            ..Window::default()
+        };
+
+        drop(window.consume_peer_refresh_request_over(wallpaper::CurrentWallpaper::NoFile));
+        assert!(window.refresh_pending);
+        assert_eq!(window.peer_refresh_request, Some(2));
+
+        window.coordination.refresh_request = 5;
+        let second = window.consume_peer_refresh_request_over(wallpaper::CurrentWallpaper::NoFile);
+        assert_eq!(second.units(), 0, "no second fetch is started");
+        assert!(window.refresh_pending);
+        assert_eq!(window.peer_refresh_request, Some(5));
+    }
+
+    #[test]
+    fn stale_completion_and_timeout_cannot_clear_a_newer_request() {
+        use cosmic::Application as _;
+
+        let mut window = peer_follower(8);
+        drop(
+            window.update(Message::CoordinationUpdated(CoordinationConfig {
+                refresh_request: 8,
+                refresh_completion: PeerRefreshCompletion {
+                    request: 7,
+                    outcome: PeerRefreshOutcome::Success,
+                },
+                ..Default::default()
+            })),
+        );
+        assert!(window.refresh_pending, "non-covering completion is ignored");
+
+        drop(window.update(Message::PeerRefreshTimeout {
+            generation: 7,
+            request: 7,
+        }));
+        assert!(window.refresh_pending, "stale timeout is ignored");
+        assert_eq!(window.requested_peer_refresh, Some(8));
+        assert_eq!(window.non_leader_reload_generation, 0);
+    }
+
+    #[test]
+    fn completion_observed_before_request_write_result_still_settles() {
+        let mut window = Window {
+            leadership: Leadership::forced(false),
+            peer_refresh_write_pending: true,
+            coordination: CoordinationConfig {
+                refresh_request: 3,
+                refresh_completion: PeerRefreshCompletion {
+                    request: 3,
+                    outcome: PeerRefreshOutcome::Network,
+                },
+                ..Default::default()
+            },
+            ..Window::default()
+        };
+
+        drop(window.finish_peer_refresh_request(Ok(3)));
+        assert!(!window.refresh_pending);
+        assert_eq!(window.requested_peer_refresh, None);
+        assert!(matches!(window.last_error, Some(RefreshError::Network(_))));
+        assert_eq!(window.non_leader_reload_generation, 1);
+    }
+
+    #[test]
+    fn current_timeout_clears_pending_and_requests_reload_without_local_work() {
+        use cosmic::Application as _;
+
+        let mut window = peer_follower(6);
+        drop(window.update(Message::PeerRefreshTimeout {
+            generation: 6,
+            request: 6,
+        }));
+        assert!(!window.refresh_pending);
+        assert_eq!(window.requested_peer_refresh, None);
+        assert_eq!(window.non_leader_reload_generation, 1);
+        assert_eq!(window.timer_generation, 0, "no local refresh was armed");
+    }
+
+    async fn app_messages(task: app::Task<Message>) -> Vec<Message> {
+        crate::testutil::drained_task_outputs(task, |action| match action {
+            cosmic::iced::runtime::Action::Output(cosmic::Action::App(message)) => Some(message),
+            _ => None,
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn request_write_failure_never_shows_pending() {
+        use cosmic::Application as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_root = dir.path().join("config");
+        let context =
+            cosmic_config::Config::with_custom_path(APP_ID, AppletConfig::VERSION, config_root)
+                .unwrap();
+        let invalid_state = dir.path().join("not-a-directory");
+        std::fs::write(&invalid_state, b"file").unwrap();
+        let mut window = Window {
+            leadership: Leadership::forced(false),
+            coordination_context: Some(context),
+            coordination_state_dir: invalid_state,
+            ..Window::default()
+        };
+
+        let task = window.update(Message::RefreshNow);
+        assert!(!window.refresh_pending, "persist has not succeeded yet");
+        let mut messages = app_messages(task).await;
+        assert_eq!(messages.len(), 1);
+        drop(window.update(messages.pop().unwrap()));
+        assert!(!window.refresh_pending);
+        assert!(!window.peer_refresh_write_pending);
+        assert_eq!(window.requested_peer_refresh, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn successful_request_persist_starts_pending_only_after_completion() {
+        use cosmic::Application as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let context = cosmic_config::Config::with_custom_path(
+            APP_ID,
+            AppletConfig::VERSION,
+            dir.path().join("config"),
+        )
+        .unwrap();
+        let mut window = Window {
+            leadership: Leadership::forced(false),
+            coordination_context: Some(context),
+            coordination_state_dir: dir.path().join("state"),
+            ..Window::default()
+        };
+
+        let task = window.update(Message::RefreshNow);
+        assert!(!window.refresh_pending);
+        let mut messages = app_messages(task).await;
+        assert_eq!(messages.len(), 1);
+        let timeout = window.update(messages.pop().unwrap());
+        assert!(window.refresh_pending);
+        assert_eq!(window.requested_peer_refresh, Some(1));
+
+        let mut timeout_messages = app_messages(timeout).await;
+        assert_eq!(timeout_messages.len(), 1);
+        drop(window.update(timeout_messages.pop().unwrap()));
+        assert!(!window.refresh_pending);
+        assert_eq!(window.non_leader_reload_generation, 1);
+    }
+
+    #[tokio::test]
+    async fn leader_persists_each_peer_outcome_and_requester_observes_it() {
+        use cosmic::Application as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let context = cosmic_config::Config::with_custom_path(
+            APP_ID,
+            AppletConfig::VERSION,
+            dir.path().join("config"),
+        )
+        .unwrap();
+        let mut leader = Window {
+            coordination_context: Some(context),
+            coordination_state_dir: dir.path().join("state"),
+            ..Window::default()
+        };
+
+        for (request, outcome) in [
+            (1, PeerRefreshOutcome::Success),
+            (2, PeerRefreshOutcome::Network),
+            (3, PeerRefreshOutcome::Disk),
+        ] {
+            let mut messages =
+                app_messages(leader.record_peer_refresh_completion(request, outcome)).await;
+            assert_eq!(messages.len(), 1);
+            drop(leader.update(messages.pop().unwrap()));
+            assert_eq!(
+                leader.coordination.refresh_completion,
+                PeerRefreshCompletion { request, outcome }
+            );
+
+            let mut follower = peer_follower(request);
+            drop(
+                follower.update(Message::CoordinationUpdated(CoordinationConfig {
+                    refresh_request: request,
+                    refresh_completion: leader.coordination.refresh_completion,
+                    ..Default::default()
+                })),
+            );
+            assert!(!follower.refresh_pending);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_completion_persist_leaves_requester_for_timeout_settlement() {
+        use cosmic::Application as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let context = cosmic_config::Config::with_custom_path(
+            APP_ID,
+            AppletConfig::VERSION,
+            dir.path().join("config"),
+        )
+        .unwrap();
+        let invalid_state = dir.path().join("not-a-directory");
+        std::fs::write(&invalid_state, b"file").unwrap();
+        let leader = Window {
+            coordination_context: Some(context),
+            coordination_state_dir: invalid_state,
+            ..Window::default()
+        };
+        let mut requester = peer_follower(1);
+
+        let mut messages =
+            app_messages(leader.record_peer_refresh_completion(1, PeerRefreshOutcome::Network))
+                .await;
+        assert_eq!(messages.len(), 1);
+        let Message::PeerRefreshCompletionWritten { result, .. } = messages.pop().unwrap() else {
+            panic!("expected completion persist result")
+        };
+        assert!(result.is_err());
+        assert!(
+            requester.refresh_pending,
+            "no acknowledgement was published"
+        );
+
+        drop(requester.update(Message::PeerRefreshTimeout {
+            generation: 1,
+            request: 1,
+        }));
+        assert!(!requester.refresh_pending);
+        assert_eq!(requester.non_leader_reload_generation, 1);
     }
 
     #[test]
