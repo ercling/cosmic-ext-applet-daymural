@@ -24,8 +24,8 @@ use cosmic::{
 
 use crate::catalogue::{self, Catalogue, ImageEntry};
 use crate::config::{
-    AppletConfig, CoordinationConfig, PeerRefreshCompletion, PeerRefreshOutcome,
-    increment_refresh_request, record_refresh_completion,
+    AppletConfig, CoordinationConfig, PeerApplyNotice, PeerRefreshCompletion, PeerRefreshOutcome,
+    increment_refresh_request, record_refresh_completion, write_apply_notice,
 };
 use crate::leader::Leadership;
 // No `fl!` here: every user-visible string this applet renders lives in the
@@ -248,6 +248,9 @@ pub struct Window {
     /// Read-only reload request generation. Task 8 attaches the asynchronous
     /// catalogue/live-state load to this already-guarded request point.
     non_leader_reload_generation: u64,
+    /// Newest peer-apply notice observed by this process. The generation is
+    /// also the staleness guard for the leader's blocking cosmic-bg read.
+    peer_apply_notice_generation: u64,
     /// All downloaded images (restored from disk at startup — no network).
     pub(crate) catalogue: Catalogue,
     /// Our idea of the currently applied wallpaper file. Refreshed from
@@ -564,6 +567,15 @@ pub enum Message {
     PeerRefreshTimeout {
         generation: u64,
         request: u64,
+    },
+    /// A follower's blocking apply-notice persist completed.
+    PeerApplyNoticeWritten(Result<PeerApplyNotice, String>),
+    /// The leader finished validating a peer apply against live cosmic-bg
+    /// state. The notice generation guards against a newer apply overtaking
+    /// this blocking read.
+    PeerApplyValidated {
+        generation: u64,
+        live: wallpaper::CurrentWallpaper,
     },
     /// The startup thumbnail pass finished. Also re-renders the popup, so
     /// previews generated while it was open appear without a reopen.
@@ -1339,6 +1351,89 @@ impl Window {
         self.request_non_leader_reload()
     }
 
+    /// Persist evidence of a successful follower apply without trusting the
+    /// follower's path as the leader's view of cosmic-bg state.
+    fn write_peer_apply_notice(&self, path: PathBuf) -> app::Task<Message> {
+        let Some(config) = self.coordination_context.clone() else {
+            tracing::warn!(
+                "cannot notify the leader about an applied wallpaper without coordination config"
+            );
+            return Task::none();
+        };
+        let state = self.coordination_state_dir.clone();
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                write_apply_notice(&config, &state, path).map_err(|error| error.to_string())
+            })
+            .await
+            .unwrap_or_else(|error| Err(format!("peer apply notice task failed: {error}")));
+            Message::PeerApplyNoticeWritten(result)
+        })
+    }
+
+    /// Shared manual-apply success tail. Followers update only their local
+    /// navigation view and mailbox; the leader alone spends its cold-start
+    /// state, owns shuffle timing, and enters the accent lifecycle.
+    fn finish_manual_apply(&mut self, path: PathBuf) -> app::Task<Message> {
+        if self.is_active_leader() {
+            let accent = self.on_apply_success(path);
+            let shuffle = self.sync_shuffle(true);
+            return Task::batch([accent, shuffle]);
+        }
+
+        self.current = Some(path.clone());
+        self.non_leader_reload_generation = self.non_leader_reload_generation.wrapping_add(1);
+        self.write_peer_apply_notice(path)
+    }
+
+    /// Observe a newer peer apply and validate it with a fresh blocking read
+    /// of cosmic-bg. Notice paths are evidence only: another apply may have
+    /// won before the watcher event reached this process.
+    fn consume_peer_apply_notice(&mut self, notice: Option<PeerApplyNotice>) -> app::Task<Message> {
+        if !self.is_active_leader() {
+            return Task::none();
+        }
+        let Some(notice) = notice else {
+            return Task::none();
+        };
+        if notice.generation <= self.peer_apply_notice_generation {
+            return Task::none();
+        }
+        self.peer_apply_notice_generation = notice.generation;
+        let generation = notice.generation;
+        tracing::debug!(
+            generation,
+            path = %notice.path.display(),
+            "validating a peer wallpaper apply"
+        );
+        cosmic::task::future(async move {
+            let live = tokio::task::spawn_blocking(wallpaper::current_wallpaper)
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!("peer apply validation task failed: {error}");
+                    wallpaper::CurrentWallpaper::Unknown
+                });
+            Message::PeerApplyValidated { generation, live }
+        })
+    }
+
+    fn finish_peer_apply_validation(
+        &mut self,
+        generation: u64,
+        live: wallpaper::CurrentWallpaper,
+    ) -> app::Task<Message> {
+        if !self.is_active_leader() || generation != self.peer_apply_notice_generation {
+            return Task::none();
+        }
+        match live {
+            wallpaper::CurrentWallpaper::File(path) => self.on_apply_success(path),
+            wallpaper::CurrentWallpaper::NoFile | wallpaper::CurrentWallpaper::Unknown => {
+                tracing::debug!(generation, "peer apply no longer resolves to one live file");
+                Task::none()
+            }
+        }
+    }
+
     /// Attach every currently outstanding mailbox request to the one fetch
     /// in flight, or start that fetch when idle.
     fn consume_peer_refresh_request(&mut self) -> app::Task<Message> {
@@ -2042,10 +2137,7 @@ impl Window {
     /// this same dispatcher by the completion's fresh-disk-read reconcile.
     fn set_accent_enabled(&mut self, enabled: bool) -> app::Task<Message> {
         if !self.is_active_leader() {
-            tracing::debug!(
-                enabled,
-                "dropping accent lifecycle request from a non-leader"
-            );
+            self.set_non_leader_accent_enabled(enabled);
             return Task::none();
         }
         if self.accent_inflight.is_some() {
@@ -2090,6 +2182,31 @@ impl Window {
                 config.accent_last_written = None;
                 self.set_config(config);
                 Task::none()
+            }
+        }
+    }
+
+    /// Proxy the follower's accent toggle through the one raw flag the
+    /// leader watches. No snapshot, builder read/write, restore, or compute
+    /// is permitted here. Unlike ordinary follower settings, a missing
+    /// config context is not allowed to create a memory-only enabled state:
+    /// no leader could observe or safely own that lifecycle.
+    fn set_non_leader_accent_enabled(&mut self, enabled: bool) {
+        use cosmic_config::ConfigSet as _;
+
+        if enabled == self.config.accent_enabled {
+            return;
+        }
+        let Some(context) = &self.config_context else {
+            tracing::warn!(
+                "cannot change accent-from-wallpaper from a non-leader: applet config is not persistable"
+            );
+            return;
+        };
+        match context.set("accent_enabled", enabled) {
+            Ok(_) => self.config.accent_enabled = enabled,
+            Err(error) => {
+                tracing::warn!("failed to persist the requested non-leader accent toggle: {error}")
             }
         }
     }
@@ -2742,6 +2859,10 @@ impl cosmic::Application for Window {
             .as_ref()
             .map(CoordinationConfig::load)
             .unwrap_or_default();
+        let peer_apply_notice_generation = coordination
+            .apply_notice
+            .as_ref()
+            .map_or(0, |notice| notice.generation);
 
         // Same degradation for the theme configs: without them the accent
         // feature is inert, everything else keeps working.
@@ -2794,6 +2915,7 @@ impl cosmic::Application for Window {
             peer_refresh_write_pending: false,
             peer_refresh_timeout_generation: 0,
             non_leader_reload_generation: 0,
+            peer_apply_notice_generation,
             catalogue,
             current,
             refresh_pending: false,
@@ -2896,6 +3018,16 @@ impl cosmic::Application for Window {
                 let retention_reduced =
                     schedule::retention_reduced(self.config.retention_days, config.retention_days);
                 if !self.is_active_leader() {
+                    // Watcher payloads can be stale. Followers own only the
+                    // displayed flag, and confirm it from disk just like the
+                    // leader confirms evidence of an external flip. The
+                    // leader-owned snapshot and last-written record remain
+                    // authoritative until takeover hydration.
+                    config.accent_enabled = self
+                        .config_context
+                        .as_ref()
+                        .map(|context| AppletConfig::load(context).accent_enabled)
+                        .unwrap_or(config.accent_enabled);
                     config.accent_snapshot = self.config.accent_snapshot;
                     config.accent_last_written = self.config.accent_last_written;
                     self.config = config;
@@ -2958,10 +3090,13 @@ impl cosmic::Application for Window {
             }
             Message::CoordinationUpdated(coordination) => {
                 let completion = coordination.refresh_completion;
+                let apply_notice = coordination.apply_notice.clone();
                 self.coordination = coordination;
                 self.leadership_state_generation = self.leadership_state_generation.wrapping_add(1);
                 if self.is_active_leader() {
-                    return self.consume_peer_refresh_request();
+                    let refresh = self.consume_peer_refresh_request();
+                    let apply = self.consume_peer_apply_notice(apply_notice);
+                    return Task::batch([refresh, apply]);
                 }
                 return self.settle_peer_refresh(completion);
             }
@@ -2998,21 +3133,29 @@ impl cosmic::Application for Window {
                 generation,
                 request,
             } => return self.timeout_peer_refresh(generation, request),
+            Message::PeerApplyNoticeWritten(result) => match result {
+                Ok(notice) => {
+                    let current = self
+                        .coordination
+                        .apply_notice
+                        .as_ref()
+                        .map_or(0, |current| current.generation);
+                    if notice.generation > current {
+                        self.coordination.apply_notice = Some(notice);
+                    }
+                }
+                Err(error) => tracing::warn!("failed to persist peer apply notice: {error}"),
+            },
+            Message::PeerApplyValidated { generation, live } => {
+                return self.finish_peer_apply_validation(generation, live);
+            }
             Message::ApplyImage(path) => {
                 // Browsing is setting: prev/next/newest apply immediately.
                 // Manual navigation also resets the shuffle countdown —
                 // and spends the cold-start flag (any successful apply
                 // fulfills its purpose; see `on_apply_success`).
                 match wallpaper::apply(&path) {
-                    Ok(()) => {
-                        let accent = self.on_apply_success(path);
-                        let shuffle = if self.is_active_leader() {
-                            self.sync_shuffle(true)
-                        } else {
-                            Task::none()
-                        };
-                        return Task::batch([accent, shuffle]);
-                    }
+                    Ok(()) => return self.finish_manual_apply(path),
                     Err(error) => {
                         tracing::warn!("failed to apply {}: {error}", path.display());
                         // If the file vanished externally (the common way
@@ -6040,6 +6183,329 @@ mod tests {
     /// The applet config as persisted in `window`'s TempDir-rooted context.
     fn persisted_config(window: &Window) -> AppletConfig {
         AppletConfig::load(window.config_context.as_ref().unwrap())
+    }
+
+    #[test]
+    fn non_leader_accent_toggle_persists_only_the_raw_flag() {
+        use cosmic::Application as _;
+        use cosmic_config::CosmicConfigEntry as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = accent_window(&dir);
+        window.leadership = Leadership::forced(false);
+        window.config.accent_snapshot = Some(AccentSnapshot {
+            light: Some([1, 2, 3]),
+            dark: Some([4, 5, 6]),
+        });
+        window.config.accent_last_written = Some(AccentPair {
+            light: [7, 8, 9],
+            dark: [10, 11, 12],
+        });
+        window
+            .config
+            .write_entry(window.config_context.as_ref().unwrap())
+            .unwrap();
+        let snapshot = window.config.accent_snapshot;
+        let last_written = window.config.accent_last_written;
+        let write_generation = window.accent_write_generation;
+
+        drop(window.update(Message::SetAccentEnabled(false)));
+
+        assert!(!window.config.accent_enabled);
+        let disk = persisted_config(&window);
+        assert!(!disk.accent_enabled);
+        assert_eq!(disk.accent_snapshot, snapshot);
+        assert_eq!(disk.accent_last_written, last_written);
+        assert!(window.accent_inflight.is_none());
+        assert_eq!(window.accent_write_generation, write_generation);
+    }
+
+    #[test]
+    fn non_leader_accent_toggle_requires_a_successful_persist() {
+        use cosmic::Application as _;
+        use cosmic_config::CosmicConfigEntry as _;
+
+        let mut absent = Window {
+            leadership: Leadership::forced(false),
+            ..Window::default()
+        };
+        drop(absent.update(Message::SetAccentEnabled(true)));
+        assert!(!absent.config.accent_enabled);
+        assert!(absent.accent_inflight.is_none());
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("config");
+        let context =
+            cosmic_config::Config::with_custom_path(APP_ID, AppletConfig::VERSION, root.clone())
+                .unwrap();
+        AppletConfig::default().write_entry(&context).unwrap();
+        let version_dir = root.join("cosmic").join(APP_ID).join("v1");
+        std::fs::remove_dir_all(&version_dir).unwrap();
+        std::fs::write(&version_dir, b"not a directory").unwrap();
+        let mut failing = Window {
+            leadership: Leadership::forced(false),
+            config_context: Some(context),
+            ..Window::default()
+        };
+        drop(failing.update(Message::SetAccentEnabled(true)));
+        assert!(!failing.config.accent_enabled);
+        assert!(failing.accent_inflight.is_none());
+    }
+
+    #[test]
+    fn non_leader_config_echo_uses_fresh_flag_and_keeps_accent_records() {
+        use cosmic::Application as _;
+        use cosmic_config::ConfigSet as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = accent_window(&dir);
+        window.leadership = Leadership::forced(false);
+        let snapshot = Some(AccentSnapshot {
+            light: Some([1, 2, 3]),
+            dark: None,
+        });
+        let last_written = Some(AccentPair {
+            light: [4, 5, 6],
+            dark: [7, 8, 9],
+        });
+        window.config.accent_snapshot = snapshot;
+        window.config.accent_last_written = last_written;
+        window
+            .config_context
+            .as_ref()
+            .unwrap()
+            .set("accent_enabled", false)
+            .unwrap();
+
+        let mut stale = window.config.clone();
+        stale.accent_enabled = true;
+        stale.accent_snapshot = None;
+        stale.accent_last_written = None;
+        drop(window.update(Message::ConfigUpdated(stale)));
+
+        assert!(!window.config.accent_enabled, "fresh disk flag wins");
+        assert_eq!(window.config.accent_snapshot, snapshot);
+        assert_eq!(window.config.accent_last_written, last_written);
+        assert!(window.accent_inflight.is_none());
+    }
+
+    #[tokio::test]
+    async fn follower_apply_updates_navigation_and_persists_notice_off_thread() {
+        use cosmic::Application as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let context = cosmic_config::Config::with_custom_path(
+            APP_ID,
+            AppletConfig::VERSION,
+            dir.path().join("config"),
+        )
+        .unwrap();
+        let mut window = Window {
+            leadership: Leadership::forced(false),
+            coordination_context: Some(context),
+            coordination_state_dir: dir.path().join("state"),
+            cold_start: ColdStart::Pending,
+            config: AppletConfig {
+                accent_enabled: true,
+                ..Default::default()
+            },
+            ..Window::default()
+        };
+        let applied = PathBuf::from("/images/peer-applied.jpg");
+
+        let task = window.finish_manual_apply(applied.clone());
+        assert_eq!(window.current, Some(applied.clone()));
+        assert_eq!(window.cold_start, ColdStart::Pending, "leader owns it");
+        assert_eq!(window.non_leader_reload_generation, 1);
+        assert!(window.accent_inflight.is_none());
+        assert_eq!(window.shuffle_generation, 0);
+
+        let mut messages = app_messages(task).await;
+        assert_eq!(messages.len(), 1);
+        drop(window.update(messages.pop().unwrap()));
+        let notice = CoordinationConfig::load(window.coordination_context.as_ref().unwrap())
+            .apply_notice
+            .unwrap();
+        assert_eq!(notice.generation, 1);
+        assert_eq!(notice.path, applied);
+    }
+
+    #[tokio::test]
+    async fn missing_or_failed_apply_notice_does_not_start_follower_lifecycle() {
+        let applied = PathBuf::from("/images/peer-applied.jpg");
+        let mut absent = Window {
+            leadership: Leadership::forced(false),
+            cold_start: ColdStart::Pending,
+            ..Window::default()
+        };
+        let task = absent.finish_manual_apply(applied.clone());
+        assert_eq!(task.units(), 0);
+        assert_eq!(absent.current, Some(applied.clone()));
+        assert_eq!(absent.cold_start, ColdStart::Pending);
+        assert!(absent.accent_inflight.is_none());
+
+        let dir = tempfile::tempdir().unwrap();
+        let context = cosmic_config::Config::with_custom_path(
+            APP_ID,
+            AppletConfig::VERSION,
+            dir.path().join("config"),
+        )
+        .unwrap();
+        let invalid_state = dir.path().join("not-a-directory");
+        std::fs::write(&invalid_state, b"file").unwrap();
+        let mut failing = Window {
+            leadership: Leadership::forced(false),
+            coordination_context: Some(context),
+            coordination_state_dir: invalid_state,
+            cold_start: ColdStart::Pending,
+            ..Window::default()
+        };
+        let mut messages = app_messages(failing.finish_manual_apply(applied.clone())).await;
+        assert_eq!(messages.len(), 1);
+        let Message::PeerApplyNoticeWritten(Err(_)) = messages.pop().unwrap() else {
+            panic!("expected a failed notice persist")
+        };
+        assert_eq!(failing.current, Some(applied));
+        assert_eq!(failing.cold_start, ColdStart::Pending);
+        assert!(failing.accent_inflight.is_none());
+    }
+
+    #[test]
+    fn stale_and_non_file_peer_apply_validations_cannot_regress_leader() {
+        let original = PathBuf::from("/images/current.jpg");
+        let stale = PathBuf::from("/images/stale.jpg");
+        let mut leader = Window {
+            current: Some(original.clone()),
+            cold_start: ColdStart::Pending,
+            ..Window::default()
+        };
+
+        assert_eq!(
+            leader
+                .consume_peer_apply_notice(Some(PeerApplyNotice {
+                    generation: 2,
+                    path: stale.clone(),
+                }))
+                .units(),
+            1
+        );
+        assert_eq!(
+            leader
+                .consume_peer_apply_notice(Some(PeerApplyNotice {
+                    generation: 3,
+                    path: PathBuf::from("/images/newer.jpg"),
+                }))
+                .units(),
+            1
+        );
+        drop(leader.finish_peer_apply_validation(2, wallpaper::CurrentWallpaper::File(stale)));
+        drop(leader.finish_peer_apply_validation(3, wallpaper::CurrentWallpaper::NoFile));
+        assert_eq!(leader.current, Some(original.clone()));
+        assert_eq!(leader.cold_start, ColdStart::Pending);
+
+        assert_eq!(
+            leader
+                .consume_peer_apply_notice(Some(PeerApplyNotice {
+                    generation: 2,
+                    path: PathBuf::from("/images/older.jpg"),
+                }))
+                .units(),
+            0,
+            "stale watcher payload is inert"
+        );
+        leader.peer_apply_notice_generation = 4;
+        drop(leader.finish_peer_apply_validation(4, wallpaper::CurrentWallpaper::Unknown));
+        assert_eq!(leader.current, Some(original));
+        assert_eq!(leader.cold_start, ColdStart::Pending);
+    }
+
+    #[tokio::test]
+    async fn two_windows_leave_accent_ownership_with_the_leader_after_peer_apply() {
+        use cosmic::Application as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut leader = accent_window(&dir);
+        start_disabled(&mut leader);
+        drop(leader.update(Message::SetAccentEnabled(true)));
+        let snapshot = leader.config.accent_snapshot;
+        assert!(snapshot.is_some());
+        leader.cold_start = ColdStart::Pending;
+        let old = PathBuf::from("/images/old.jpg");
+        leader.current = Some(old.clone());
+
+        let coordination_context = cosmic_config::Config::with_custom_path(
+            APP_ID,
+            AppletConfig::VERSION,
+            dir.path().join("coordination-config"),
+        )
+        .unwrap();
+        let mut follower = Window {
+            leadership: Leadership::forced(false),
+            config: leader.config.clone(),
+            config_context: leader.config_context.clone(),
+            coordination_context: Some(coordination_context.clone()),
+            coordination_state_dir: dir.path().join("coordination-state"),
+            accent_handles: leader.accent_handles.clone(),
+            current: Some(old),
+            cold_start: ColdStart::Pending,
+            ..Window::default()
+        };
+
+        // The diagnosed fight: late/torn echoes and every follower compute
+        // entry point are display-only/inert.
+        let mut echo = follower.config.clone();
+        echo.accent_snapshot = None;
+        echo.accent_last_written = Some(expected_pair(Some(30.0)));
+        drop(follower.update(Message::ConfigUpdated(echo)));
+        assert_eq!(follower.config.accent_snapshot, snapshot);
+        assert_eq!(
+            follower
+                .start_accent_compute(PathBuf::from("/images/ignored.jpg"))
+                .units(),
+            0
+        );
+        drop(follower.update(Message::AccentComputed {
+            source: PathBuf::from("/images/ignored.jpg"),
+            hue: Some(30.0),
+        }));
+        drop(follower.update(Message::AccentWriteFinished {
+            generation: 1,
+            success: true,
+        }));
+        assert!(follower.accent_inflight.is_none());
+        assert_eq!(follower.config.accent_last_written, None);
+
+        let applied = PathBuf::from("/images/new.jpg");
+        let mut notice_messages = app_messages(follower.finish_manual_apply(applied.clone())).await;
+        drop(follower.update(notice_messages.pop().unwrap()));
+        assert_eq!(follower.current, Some(applied.clone()));
+        assert_eq!(follower.cold_start, ColdStart::Pending);
+
+        let mailbox = CoordinationConfig::load(&coordination_context);
+        let validation = leader.update(Message::CoordinationUpdated(mailbox.clone()));
+        assert_eq!(validation.units(), 1, "only the leader reads live state");
+        let generation = mailbox.apply_notice.unwrap().generation;
+        let accent_task = leader.update(Message::PeerApplyValidated {
+            generation,
+            live: wallpaper::CurrentWallpaper::File(applied.clone()),
+        });
+        assert_eq!(leader.current, Some(applied.clone()));
+        assert_eq!(leader.cold_start, ColdStart::Done);
+        assert_eq!(accent_task.units(), 1, "the leader recomputes once");
+
+        drop(leader.update(Message::AccentComputed {
+            source: applied,
+            hue: Some(200.0),
+        }));
+        settle_accent_tasks(&mut leader);
+        assert!(leader.config.accent_enabled);
+        assert_eq!(leader.config.accent_snapshot, snapshot);
+        assert_eq!(
+            leader.config.accent_last_written,
+            Some(expected_pair(Some(200.0)))
+        );
+        assert_eq!(follower.config.accent_snapshot, snapshot);
+        assert!(follower.accent_inflight.is_none());
     }
 
     /// The sandboxed theme-config trees for the given config ids read-only,

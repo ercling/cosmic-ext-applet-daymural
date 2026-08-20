@@ -381,30 +381,30 @@ reload helper. Leaders keep their in-memory-authoritative catalogue.
 - Modify: `src/app.rs`
 - Test: `src/app.rs`
 
-- [ ] gate `start_accent_compute` at the choke point and defensively drop
+- [x] gate `start_accent_compute` at the choke point and defensively drop
       accent compute/write completions on non-leaders
-- [ ] implement the non-leader accent toggler proxy: raw flag only, immediate
+- [x] implement the non-leader accent toggler proxy: raw flag only, immediate
       state only after persist success, no lifecycle; warn and remain unchanged
       without a config context
-- [ ] keep non-leader `ConfigUpdated` display-only for the accent flag using
+- [x] keep non-leader `ConfigUpdated` display-only for the accent flag using
       the existing fresh-disk rule; never adopt snapshot/last-written or route
       `set_accent_enabled`
-- [ ] after a successful non-leader apply, update local navigation state,
+- [x] after a successful non-leader apply, update local navigation state,
       invalidate stale reloads, and persist `apply_notice` off the UI thread;
       do not arm shuffle or accent locally
-- [ ] on the active leader, validate a new notice by reading live wallpaper on
+- [x] on the active leader, validate a new notice by reading live wallpaper on
       the blocking pool, drop stale notice completions, and route a current
       file through `on_apply_success`
-- [ ] **success tests:** a peer apply produces one leader
+- [x] **success tests:** a peer apply produces one leader
       current/ColdStart/accent update and a non-leader toggle changes only the
       raw flag
-- [ ] **failure/edge tests:** absent/failing config, stale watcher/notice
+- [x] **failure/edge tests:** absent/failing config, stale watcher/notice
       completions, no-file/unknown live wallpaper, and apply-notice persist
       failure run no non-leader lifecycle and cannot regress leader state
-- [ ] replay the original two-window accent fight: non-leader config echoes and
+- [x] replay the original two-window accent fight: non-leader config echoes and
       every compute entry point remain inert, while a peer apply notice causes
       only the leader to recompute and the enabled state/snapshot survive
-- [ ] run focused accent/peer-apply tests and `just check`; both must pass before
+- [x] run focused accent/peer-apply tests and `just check`; both must pass before
       Task 7
 
 ### Task 7: Implement asynchronous takeover hydration
