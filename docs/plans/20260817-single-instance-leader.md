@@ -414,21 +414,21 @@ reload helper. Leaders keep their in-memory-authoritative catalogue.
 - Modify: `src/app.rs`
 - Test: `src/app.rs`
 
-- [ ] implement `LeadershipTick`, failed-attempt rearming, stale/already-active
+- [x] implement `LeadershipTick`, failed-attempt rearming, stale/already-active
       drops, and the owns-lock-but-not-ready transition
-- [ ] load complete applet config, coordination state, and live wallpaper on
+- [x] load complete applet config, coordination state, and live wallpaper on
       the blocking pool; add generation/dirty-event guards and a pure
       completion handler accepting injected values
-- [ ] on a valid completion, adopt disk state, become active, arm ordinary
+- [x] on a valid completion, adopt disk state, become active, arm ordinary
       duties, and service an unacknowledged peer refresh request
-- [ ] test takeover using two real `Leadership::acquire(tempdir)` values—not
+- [x] test takeover using two real `Leadership::acquire(tempdir)` values—not
       `forced(false)`—then drop the winner and verify the loser acquires once
-- [ ] **success tests:** takeover adopts disk config/accent fields, recovers an
+- [x] **success tests:** takeover adopts disk config/accent fields, recovers an
       outstanding request, and arms each leader duty exactly once
-- [ ] **failure/edge tests:** config/coordination changes during hydration force
+- [x] **failure/edge tests:** config/coordination changes during hydration force
       a fresh read; stale hydration/timer messages, continued lockout, and a
       missing config context cannot arm from stale state
-- [ ] run focused takeover tests and `just check`; both must pass before Task 8
+- [x] run focused takeover tests and `just check`; both must pass before Task 8
 
 ### Task 8: Make non-leader popup and completion reloads asynchronous
 

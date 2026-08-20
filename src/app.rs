@@ -216,7 +216,6 @@ pub struct Window {
     /// Generation of the one-shot retry timer used by non-leaders.
     leadership_generation: u64,
     /// Generation of the blocking takeover hydration snapshot.
-    #[allow(dead_code, reason = "used by the takeover task in plan Task 7")]
     leadership_hydration_generation: u64,
     /// Config/mailbox watcher epoch used to invalidate a hydration snapshot.
     leadership_state_generation: u64,
@@ -336,10 +335,6 @@ pub struct Window {
     poke_config: Option<cosmic_config::Config>,
 }
 
-#[allow(
-    dead_code,
-    reason = "Hydrating is entered by the takeover task in plan Task 7"
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum LeaderReadiness {
     #[default]
@@ -419,6 +414,16 @@ enum AccentJob {
         dark: [u8; 3],
     },
     Restore(accent::AccentSnapshot),
+}
+
+/// Fresh state read after a follower acquires the leader lock. Keeping this
+/// payload data-only lets tests exercise the completion decision without
+/// touching the real desktop configuration.
+#[derive(Debug, Clone)]
+pub(crate) struct LeadershipHydration {
+    config: AppletConfig,
+    coordination: CoordinationConfig,
+    live: wallpaper::CurrentWallpaper,
 }
 
 fn accent_job(inflight: &AccentInflight) -> AccentJob {
@@ -551,6 +556,13 @@ pub enum Message {
     CoordinationUpdated(CoordinationConfig),
     /// The one-shot leadership retry timer fired.
     LeadershipTick(u64),
+    /// The blocking takeover snapshot finished. Both generations must still
+    /// match before this process may become an active leader.
+    LeadershipHydrated {
+        generation: u64,
+        state_generation: u64,
+        result: Result<LeadershipHydration, String>,
+    },
     /// The refresh timer fired (payload: the generation it was armed with).
     RefreshDue(u64),
     /// The fetch pipeline finished (payload: the freshly fetched entries,
@@ -667,12 +679,106 @@ impl Window {
     }
 
     fn schedule_leadership_retry(&mut self) -> app::Task<Message> {
-        self.leadership_generation += 1;
+        self.leadership_generation = self.leadership_generation.wrapping_add(1);
         let generation = self.leadership_generation;
         cosmic::task::future(async move {
             tokio::time::sleep(LEADERSHIP_RETRY_DELAY).await;
             Message::LeadershipTick(generation)
         })
+    }
+
+    /// Retry the advisory lock, or retry hydration when the lock is already
+    /// ours but the contexts needed for a complete snapshot were unavailable.
+    fn on_leadership_tick(&mut self, generation: u64) -> app::Task<Message> {
+        if generation != self.leadership_generation || self.is_active_leader() {
+            return Task::none();
+        }
+
+        if self.leadership.is_leader() {
+            return self.start_leadership_hydration();
+        }
+        if !self.leadership.try_acquire() {
+            return self.schedule_leadership_retry();
+        }
+
+        // Owning the file lock is intentionally not sufficient to run shared
+        // work: first invalidate this timer and hydrate state written by the
+        // former leader and peers.
+        self.leader_readiness = LeaderReadiness::Hydrating;
+        self.leadership_generation = self.leadership_generation.wrapping_add(1);
+        self.start_leadership_hydration()
+    }
+
+    /// Read every takeover-owned input away from the UI thread. A missing
+    /// context cannot yield a complete snapshot, so remain inert and retry.
+    fn start_leadership_hydration(&mut self) -> app::Task<Message> {
+        if !self.leadership.is_leader() || self.leader_readiness != LeaderReadiness::Hydrating {
+            return Task::none();
+        }
+        let (Some(config_context), Some(coordination_context)) = (
+            self.config_context.clone(),
+            self.coordination_context.clone(),
+        ) else {
+            tracing::warn!("cannot hydrate takeover without both config contexts");
+            return self.schedule_leadership_retry();
+        };
+
+        self.leadership_hydration_generation = self.leadership_hydration_generation.wrapping_add(1);
+        let generation = self.leadership_hydration_generation;
+        let state_generation = self.leadership_state_generation;
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || LeadershipHydration {
+                config: AppletConfig::load(&config_context),
+                coordination: CoordinationConfig::load(&coordination_context),
+                live: wallpaper::current_wallpaper(),
+            })
+            .await
+            .map_err(|error| format!("leadership hydration task failed: {error}"));
+            Message::LeadershipHydrated {
+                generation,
+                state_generation,
+                result,
+            }
+        })
+    }
+
+    /// Adopt an injected takeover snapshot when it is still current. This is
+    /// the sole readiness transition, and deliberately performs no reads.
+    fn finish_leadership_hydration(
+        &mut self,
+        generation: u64,
+        state_generation: u64,
+        result: Result<LeadershipHydration, String>,
+    ) -> app::Task<Message> {
+        if !self.leadership.is_leader()
+            || self.leader_readiness != LeaderReadiness::Hydrating
+            || generation != self.leadership_hydration_generation
+        {
+            return Task::none();
+        }
+        let hydration = match result {
+            Ok(hydration) => hydration,
+            Err(error) => {
+                tracing::warn!("cannot hydrate takeover state: {error}");
+                return self.schedule_leadership_retry();
+            }
+        };
+        if state_generation != self.leadership_state_generation {
+            tracing::debug!("takeover state changed during hydration; reading it again");
+            return self.start_leadership_hydration();
+        }
+
+        self.config = hydration.config;
+        self.coordination = hydration.coordination;
+        self.peer_apply_notice_generation = self
+            .coordination
+            .apply_notice
+            .as_ref()
+            .map_or(0, |notice| notice.generation);
+        self.current = wallpaper::synced_current(&hydration.live, self.current.take());
+        self.non_leader_reload_generation = self.non_leader_reload_generation.wrapping_add(1);
+        self.leader_readiness = LeaderReadiness::Ready;
+        self.arm_leader_duties(hydration.live)
     }
 
     /// Arm ordinary leader startup work. An outstanding peer refresh starts
@@ -3005,6 +3111,14 @@ impl cosmic::Application for Window {
             Message::PopupClosed(id) => return self.on_popup_closed(id),
             Message::ConfigUpdated(config) => {
                 self.leadership_state_generation = self.leadership_state_generation.wrapping_add(1);
+                if self.leadership.is_leader()
+                    && self.leader_readiness == LeaderReadiness::Hydrating
+                {
+                    // The blocking takeover read will be discarded and
+                    // repeated. Do not adopt a possibly older watcher payload
+                    // (or synchronously confirm it from disk) in between.
+                    return Task::none();
+                }
                 // Our own setter writes echo back here unchanged (no-op);
                 // an *external* edit of the shuffle settings restarts the
                 // countdown against the new values, and an externally
@@ -3089,10 +3203,15 @@ impl cosmic::Application for Window {
                 }
             }
             Message::CoordinationUpdated(coordination) => {
+                self.leadership_state_generation = self.leadership_state_generation.wrapping_add(1);
+                if self.leadership.is_leader()
+                    && self.leader_readiness == LeaderReadiness::Hydrating
+                {
+                    return Task::none();
+                }
                 let completion = coordination.refresh_completion;
                 let apply_notice = coordination.apply_notice.clone();
                 self.coordination = coordination;
-                self.leadership_state_generation = self.leadership_state_generation.wrapping_add(1);
                 if self.is_active_leader() {
                     let refresh = self.consume_peer_refresh_request();
                     let apply = self.consume_peer_apply_notice(apply_notice);
@@ -3100,10 +3219,13 @@ impl cosmic::Application for Window {
                 }
                 return self.settle_peer_refresh(completion);
             }
-            // Task 7 completes acquisition and hydration. Keeping the message
-            // explicit now makes the startup retry an isolated one-shot.
-            Message::LeadershipTick(generation) => {
-                let _ = generation;
+            Message::LeadershipTick(generation) => return self.on_leadership_tick(generation),
+            Message::LeadershipHydrated {
+                generation,
+                state_generation,
+                result,
+            } => {
+                return self.finish_leadership_hydration(generation, state_generation, result);
             }
             Message::RefreshDue(generation) => {
                 // Stale timers (replaced by a newer reschedule) are ignored.
@@ -3468,6 +3590,273 @@ mod tests {
             "ordinary timer also remains armed"
         );
         assert_eq!(task.units(), 2, "timer plus immediate refresh");
+    }
+
+    fn takeover_contexts(root: &Path) -> (cosmic_config::Config, cosmic_config::Config) {
+        let config = cosmic_config::Config::with_custom_path(
+            APP_ID,
+            AppletConfig::VERSION,
+            root.to_path_buf(),
+        )
+        .unwrap();
+        (config.clone(), config)
+    }
+
+    fn hydration(
+        config: AppletConfig,
+        coordination: CoordinationConfig,
+        live: wallpaper::CurrentWallpaper,
+    ) -> LeadershipHydration {
+        LeadershipHydration {
+            config,
+            coordination,
+            live,
+        }
+    }
+
+    #[test]
+    fn real_lock_loser_takes_over_once_and_stays_inert_until_hydrated() {
+        use cosmic::Application as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let winner = Leadership::acquire(dir.path());
+        let loser = Leadership::acquire(dir.path());
+        assert!(winner.is_leader());
+        assert!(!loser.is_leader());
+        let (config_context, coordination_context) = takeover_contexts(&dir.path().join("config"));
+        let mut window = Window {
+            leadership: loser,
+            leadership_generation: 1,
+            config_context: Some(config_context),
+            coordination_context: Some(coordination_context),
+            ..Window::default()
+        };
+
+        let blocked = window.update(Message::LeadershipTick(1));
+        assert!(!window.leadership.is_leader());
+        assert_eq!(window.leadership_generation, 2, "lockout rearms once");
+        assert_eq!(blocked.units(), 1);
+        assert_eq!(
+            window.update(Message::LeadershipTick(1)).units(),
+            0,
+            "stale retry is dropped"
+        );
+
+        drop(winner);
+        let hydration_task = window.update(Message::LeadershipTick(2));
+        assert!(window.leadership.is_leader());
+        assert_eq!(window.leader_readiness, LeaderReadiness::Hydrating);
+        assert!(!window.is_active_leader());
+        assert_eq!(hydration_task.units(), 1, "one blocking snapshot is armed");
+        assert!(
+            !window.leadership.try_acquire(),
+            "acquisition edge fires once"
+        );
+        assert_eq!(
+            window.update(Message::LeadershipTick(2)).units(),
+            0,
+            "the consumed takeover tick cannot arm another snapshot"
+        );
+    }
+
+    #[test]
+    fn takeover_adopts_full_disk_state_and_recovers_outstanding_request_once() {
+        use cosmic::Application as _;
+
+        let snapshot = accent::AccentSnapshot {
+            light: Some([1, 2, 3]),
+            dark: None,
+        };
+        let written = accent::AccentPair {
+            light: [4, 5, 6],
+            dark: [7, 8, 9],
+        };
+        let config = AppletConfig {
+            shuffle_enabled: true,
+            shuffle_interval_secs: 1_800,
+            retention_days: 30,
+            accent_enabled: true,
+            accent_snapshot: Some(snapshot),
+            accent_last_written: Some(written),
+        };
+        let coordination = CoordinationConfig {
+            refresh_request: 9,
+            refresh_completion: PeerRefreshCompletion {
+                request: 7,
+                outcome: PeerRefreshOutcome::Success,
+            },
+            apply_notice: Some(PeerApplyNotice {
+                generation: 11,
+                path: PathBuf::from("/mailbox-evidence.jpg"),
+            }),
+        };
+        let live_path = PathBuf::from("/currently-applied.jpg");
+        let mut window = Window {
+            leadership: Leadership::forced(true),
+            leader_readiness: LeaderReadiness::Hydrating,
+            leadership_hydration_generation: 3,
+            leadership_state_generation: 5,
+            config: AppletConfig::default(),
+            coordination: CoordinationConfig::default(),
+            current: Some(PathBuf::from("/stale.jpg")),
+            ..Window::default()
+        };
+
+        let duties = window.finish_leadership_hydration(
+            3,
+            5,
+            Ok(hydration(
+                config.clone(),
+                coordination.clone(),
+                wallpaper::CurrentWallpaper::File(live_path.clone()),
+            )),
+        );
+
+        assert!(window.is_active_leader());
+        assert_eq!(window.config, config, "the complete accent trio is adopted");
+        assert_eq!(window.coordination, coordination);
+        assert_eq!(window.current, Some(live_path));
+        assert_eq!(window.peer_apply_notice_generation, 11);
+        assert_eq!(window.peer_refresh_request, Some(9));
+        assert!(
+            window.refresh_pending,
+            "the outstanding request is serviced"
+        );
+        assert!(!window.thumbnail_pass_pending, "there is only one producer");
+        assert_eq!(window.timer_generation, 1, "refresh duty armed once");
+        assert_eq!(window.shuffle_generation, 1, "shuffle duty considered once");
+        assert_eq!(duties.units(), 2, "timer plus peer refresh producer");
+
+        let duplicate = window.finish_leadership_hydration(
+            3,
+            5,
+            Ok(hydration(
+                AppletConfig::default(),
+                CoordinationConfig::default(),
+                wallpaper::CurrentWallpaper::NoFile,
+            )),
+        );
+        assert_eq!(duplicate.units(), 0);
+        assert_eq!(window.timer_generation, 1);
+        assert_eq!(window.peer_refresh_request, Some(9));
+        assert_eq!(
+            window.update(Message::LeadershipTick(0)).units(),
+            0,
+            "an active leader drops takeover ticks"
+        );
+    }
+
+    #[test]
+    fn takeover_watcher_events_dirty_snapshot_and_force_one_fresh_read() {
+        use cosmic::Application as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (config_context, coordination_context) = takeover_contexts(&dir.path().join("config"));
+        let original_config = AppletConfig::default();
+        let original_coordination = CoordinationConfig::default();
+        let mut window = Window {
+            leadership: Leadership::forced(true),
+            leader_readiness: LeaderReadiness::Hydrating,
+            leadership_hydration_generation: 4,
+            leadership_state_generation: 8,
+            config: original_config.clone(),
+            coordination: original_coordination.clone(),
+            config_context: Some(config_context),
+            coordination_context: Some(coordination_context),
+            ..Window::default()
+        };
+
+        let mut changed_config = original_config.clone();
+        changed_config.accent_enabled = true;
+        let changed_coordination = CoordinationConfig {
+            refresh_request: 12,
+            ..Default::default()
+        };
+        assert_eq!(
+            window
+                .update(Message::ConfigUpdated(changed_config))
+                .units(),
+            0
+        );
+        assert_eq!(
+            window
+                .update(Message::CoordinationUpdated(changed_coordination))
+                .units(),
+            0
+        );
+        assert_eq!(window.leadership_state_generation, 10);
+        assert_eq!(
+            window.config, original_config,
+            "watcher payload is not adopted"
+        );
+        assert_eq!(window.coordination, original_coordination);
+
+        let reread = window.finish_leadership_hydration(
+            4,
+            8,
+            Ok(hydration(
+                AppletConfig::default(),
+                CoordinationConfig::default(),
+                wallpaper::CurrentWallpaper::NoFile,
+            )),
+        );
+        assert_eq!(reread.units(), 1);
+        assert_eq!(window.leader_readiness, LeaderReadiness::Hydrating);
+        assert_eq!(window.leadership_hydration_generation, 5);
+        assert_eq!(window.timer_generation, 0, "dirty state cannot arm duties");
+    }
+
+    #[test]
+    fn stale_failed_and_contextless_takeovers_cannot_arm_from_stale_state() {
+        let mut stale = Window {
+            leadership: Leadership::forced(true),
+            leader_readiness: LeaderReadiness::Hydrating,
+            leadership_hydration_generation: 7,
+            leadership_state_generation: 2,
+            ..Window::default()
+        };
+        assert_eq!(
+            stale
+                .finish_leadership_hydration(
+                    6,
+                    2,
+                    Ok(hydration(
+                        AppletConfig::default(),
+                        CoordinationConfig::default(),
+                        wallpaper::CurrentWallpaper::NoFile,
+                    )),
+                )
+                .units(),
+            0
+        );
+        assert_eq!(stale.timer_generation, 0);
+        assert_eq!(
+            stale
+                .finish_leadership_hydration(7, 2, Err("read failed".into()))
+                .units(),
+            1,
+            "a failed blocking read retries later"
+        );
+        assert_eq!(stale.timer_generation, 0);
+        assert_eq!(stale.leader_readiness, LeaderReadiness::Hydrating);
+
+        let mut contextless = Window {
+            leadership: Leadership::forced(true),
+            leader_readiness: LeaderReadiness::Hydrating,
+            leadership_generation: 3,
+            config_context: None,
+            coordination_context: None,
+            ..Window::default()
+        };
+        assert_eq!(contextless.on_leadership_tick(3).units(), 1);
+        assert_eq!(contextless.leadership_generation, 4);
+        assert_eq!(contextless.timer_generation, 0);
+        assert!(!contextless.is_active_leader());
+        assert_eq!(
+            contextless.on_leadership_tick(3).units(),
+            0,
+            "a stale retry cannot bypass missing contexts"
+        );
     }
 
     #[test]
