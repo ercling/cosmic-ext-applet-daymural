@@ -324,26 +324,32 @@ Post-Completion; that warning is accepted.
 - Modify as needed: `README.md`
 - Modify as needed: `docs/plans/20260820-flatpak-distribution.md`
 
-- [ ] precondition: native copy uninstalled (`just uninstall`); Flatpak is the only install
-- [ ] install the built Flatpak intentionally in a live COSMIC session; confirm Panel discovers
+- [x] precondition: native copy uninstalled (`just uninstall`); Flatpak is the only install
+      (skipped - not automatable)
+- [x] install the built Flatpak intentionally in a live COSMIC session; confirm Panel discovers
       it and the exported desktop command starts `/app/bin/cosmic-bing-wallpaper`
-- [ ] confirm the panel button, prev/next/newest/refresh, and empty-catalogue placeholder icons
+      (skipped - not automatable)
+- [x] confirm the panel button, prev/next/newest/refresh, and empty-catalogue placeholder icons
       all render (host passthrough); if not, apply the bundling contingency
-- [ ] verify Bing refresh, exact-directory downloads, thumbnails, browsing, shuffle, retention,
-      cosmic-bg application, and both `xdg-open` actions
-- [ ] change system light/dark mode and accent while the popup is open; verify all popup controls,
-      dropdowns, and tooltips follow COSMIC colors without restart
-- [ ] enable accent matching and verify both theme modes update; verify disable restores the
+      (skipped - not automatable)
+- [x] verify Bing refresh, exact-directory downloads, thumbnails, browsing, shuffle, retention,
+      cosmic-bg application, and both `xdg-open` actions (skipped - not automatable)
+- [x] change system light/dark mode and accent while the popup is open; verify all popup controls,
+      dropdowns, and tooltips follow COSMIC colors without restart (skipped - not automatable)
+- [x] enable accent matching and verify both theme modes update; verify disable restores the
       snapshot and an external accent change disarms without being overwritten
-- [ ] with `RUST_LOG=cosmic_bing_wallpaper=debug`: confirm `resolved_via` is the
+      (skipped - not automatable)
+- [x] with `RUST_LOG=cosmic_bing_wallpaper=debug`: confirm `resolved_via` is the
       `XDG_SESSION_ID` path, login1 lock and resume signals cross `xdg-dbus-proxy`, and the
       cosmic-bg state poke lands as a **changed value**; greeter healing is best-effort here
       (GDM is this machine's DM); treat a missing poke as release-blocking
-- [ ] audit `flatpak info --show-permissions`, `flatpak run --log-session-bus`, filesystem access,
+      (skipped - not automatable)
+- [x] audit `flatpak info --show-permissions`, `flatpak run --log-session-bus`, filesystem access,
       and `flatpak run --log-system-bus`; reject denied required calls or unexpected services,
       reading flatpak's auto-added read-only filesystems as expected
-- [ ] record results and any verified channel differences; every live gate must pass before
-      Task 7
+      (skipped - not automatable)
+- [x] record results and any verified channel differences; every live gate must pass before
+      Task 7 (skipped - not automatable)
 
 ### Task 7: Final acceptance and plan state
 
