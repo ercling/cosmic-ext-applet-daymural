@@ -21,6 +21,11 @@ just check        # cargo fmt --check, clippy -D warnings, all tests
 just build        # release build
 just install      # per-user install under ~/.local; no sudo
 just uninstall
+just flatpak-sources
+just flatpak-prefetch
+just flatpak-build-offline
+just flatpak-install
+just flatpak-uninstall
 ```
 
 For a raw Cargo command, set:
@@ -72,6 +77,14 @@ needed.
 - `src/localize.rs`: Fluent loader, project `fl!` macro, locale selection, and
   translation guards.
 - `src/testutil.rs`: test-only HTTP/JPEG and popup-surface helpers.
+- `data/`: desktop entry, app-ID icon, and AppStream metainfo installed by
+  both packaging routes.
+- `io.github.ercling.CosmicBingWallpaper.json`: developer Flatpak manifest and
+  the authoritative scoped sandbox contract.
+- `flatpak/`: pinned Cargo source generator and its `uv` wrapper; generated
+  `cargo-sources.json` is deliberately ignored.
+- `.github/workflows/`: native Rust checks and the Freedesktop 25.08 Flatpak
+  build/bundle job.
 - `tests/fixtures/`: hermetic external-data fixtures.
 - `docs/plans/`: design evidence and implementation plans. Read the relevant
   plan before changing a subtle subsystem.
@@ -225,6 +238,10 @@ inline UI strings.
 - Prefer pure decision helpers and dependency/path injection for stateful
   behavior. Test success, failure, stale-event, and rollback paths where they
   apply.
+- Declarative packaging files are embedded in `src/app.rs` tests with
+  `include_str!`. Cross-check their identities, commands, paths, permissions,
+  and workflow inputs there, with both success and deliberate-drift cases;
+  leave syntax validation to the format-specific external tools.
 - Keep UI-thread work small. File/network/theme operations that may block
   belong in async or blocking-pool tasks with completion messages checked
   against live state.

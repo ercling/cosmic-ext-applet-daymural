@@ -303,19 +303,19 @@ Post-Completion; that warning is accepted.
 - Modify: `README.md`
 - Modify: `CLAUDE.md`, `AGENTS.md`
 
-- [ ] document local Flatpak prerequisites (`flatpak-builder`, `uv`, `appstreamcli`, flathub
+- [x] document local Flatpak prerequisites (`flatpak-builder`, `uv`, `appstreamcli`, flathub
       user remote), build/install/uninstall commands, and the COSMIC Store channel
-- [ ] document scoped permissions, shared wallpaper/config locations, Flatpak-private
+- [x] document scoped permissions, shared wallpaper/config locations, Flatpak-private
       catalogue/thumbnail state (and the rescan migration), the Flatpak 1.13+/standard COSMIC
       state-layout requirement, native/Flatpak mutual exclusivity, and the measured sandbox
       facts (PID namespace → `XDG_SESSION_ID` fallback, host icon passthrough, auto-added
       read-only filesystems)
-- [ ] retain the warning to disable accent matching before uninstall when automatic restoration
+- [x] retain the warning to disable accent matching before uninstall when automatic restoration
       is desired
-- [ ] CLAUDE.md/AGENTS.md: add the manifest, `flatpak/`, `.github/workflows/`, metainfo, and
+- [x] CLAUDE.md/AGENTS.md: add the manifest, `flatpak/`, `.github/workflows/`, metainfo, and
       the embedded-declarative-file test convention to the architecture/test sections
-- [ ] verify documented commands and paths against the manifest/justfile tests
-- [ ] run documentation/identity tests; they must pass before Task 6
+- [x] verify documented commands and paths against the manifest/justfile tests
+- [x] run documentation/identity tests; they must pass before Task 6
 
 ### Task 6: Verify live sandbox acceptance
 

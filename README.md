@@ -48,7 +48,7 @@ from the GNOME extension is picked up as-is — no re-downloads.
 - **Localized** — the UI follows your desktop language, with catalogues for the
   73 locales COSMIC itself ships (see [Translations](#translations)).
 
-## Build & install
+## Native build & install
 
 Requires Rust (edition 2024; developed and tested with rustc 1.97),
 [`just`](https://github.com/casey/just), and the native libraries libcosmic
@@ -71,7 +71,9 @@ catalogue/thumbnails (`~/.local/state/io.github.ercling.CosmicBingWallpaper/`),
 and settings (`~/.config/cosmic/io.github.ercling.CosmicBingWallpaper/`) are
 left behind — delete them by hand if you want a clean sweep.
 
-If **Match accent to wallpaper** is on, switch it off *before* uninstalling:
+With either installation method, if **Match accent to wallpaper** is on, switch
+it off *before* uninstalling when you want the applet to restore your previous
+accent automatically:
 the derived accent is written into the system theme and outlives the applet,
 while the snapshot needed to restore your previous accent lives in the
 applet's settings — delete those and the only way back is picking an accent by
@@ -83,6 +85,76 @@ install, override the prefix: `just prefix=/usr/local install` or
 
 After installing, add the applet via **COSMIC Settings → Desktop → Panel →
 Configure panel applets**.
+
+## Flatpak
+
+The repository includes a developer manifest for local builds. The intended
+packaged distribution channel is the **COSMIC Store**, through the
+[`pop-os/cosmic-flatpak`](https://github.com/pop-os/cosmic-flatpak) repository;
+until that external submission is published, build this checkout locally.
+
+Local Flatpak builds require `flatpak-builder`,
+[`uv`](https://docs.astral.sh/uv/), `appstreamcli`, and a user-scoped Flathub
+remote. Add the remote once if it is not already configured:
+
+```bash
+flatpak remote-add --user --if-not-exists flathub \
+  https://flathub.org/repo/flathub.flatpakrepo
+```
+
+Generate the offline Cargo sources before building. The recipes use the root
+manifest `io.github.ercling.CosmicBingWallpaper.json` and a retained
+`build-dir` cache:
+
+```bash
+just flatpak-sources        # generate gitignored cargo-sources.json with uv
+just flatpak-prefetch       # fetch the runtime, SDK, and declared sources
+just flatpak-build-offline  # force-clean build with downloads disabled
+just flatpak-install        # build and install for the current user
+just flatpak-uninstall
+```
+
+`just flatpak-build` is also available when an online build is preferable.
+`appstreamcli validate data/io.github.ercling.CosmicBingWallpaper.metainfo.xml`
+validates the AppStream metadata (the developer metadata currently has no
+screenshot, so that warning is expected).
+
+The sandbox permissions are deliberately narrow:
+
+- Wayland and DRI for the libcosmic UI, and network access for Bing.
+- `~/Pictures/BingWallpaper` for downloaded wallpapers, plus
+  `~/.config/cosmic` for applet, cosmic-bg, and theme settings.
+- `~/.local/state/cosmic` for cosmic-bg's lock-screen state update.
+- the COSMIC Settings Daemon names on the session bus and logind on the system
+  bus for live theme/config notifications and lock/resume events.
+
+No home-wide or host-wide filesystem grant, unrestricted D-Bus socket, X11
+socket, or persistent sandbox-home path is requested. Flatpak itself may show
+additional read-only access to GTK 3/4 settings, `kdeglobals`, and color
+schemes in `flatpak info --show-permissions`; those are runtime-added rather
+than manifest permissions.
+
+Wallpaper files and COSMIC configuration are intentionally shared with a
+native installation. The catalogue, thumbnail cache, leadership lock, and
+other applet state stay private under
+`~/.var/app/io.github.ercling.CosmicBingWallpaper/.local/state/`. On the first
+Flatpak start, the applet rescans the shared `~/Pictures/BingWallpaper` folder,
+so existing images reappear without being downloaded again even though the
+native catalogue is not copied.
+
+Use Flatpak 1.13 or newer in a standard COSMIC session. It must provide the
+private `XDG_STATE_HOME` layout above. Inside the sandbox the applet is in a
+PID namespace (observed as PID 2), so logind cannot resolve the session from
+its process ID; it relies on COSMIC's forwarded `XDG_SESSION_ID` fallback for
+lock and resume monitoring. The Freedesktop 25.08 runtime does not contain the
+six themed icons used by the popup, so they resolve through Flatpak's standard
+host icon passthrough on `XDG_DATA_DIRS`.
+
+**Do not keep native and Flatpak installs active at the same time.** Their
+leadership locks live in separate private state directories while both can
+write the shared COSMIC configuration, so two instances can race. Run
+`just uninstall` before installing or testing the Flatpak; run
+`just flatpak-uninstall` before returning to `just install`.
 
 ## Settings
 

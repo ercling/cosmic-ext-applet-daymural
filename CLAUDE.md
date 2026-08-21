@@ -15,6 +15,11 @@ just check        # cargo fmt --check + clippy --all-targets -D warnings + cargo
 just build        # cargo build --release
 just install      # install binary + .desktop + icon into ~/.local (no sudo)
 just uninstall
+just flatpak-sources        # generate cargo-sources.json (requires uv)
+just flatpak-prefetch       # retain every Flatpak input in the builder cache
+just flatpak-build-offline  # force-clean build with downloads disabled
+just flatpak-install
+just flatpak-uninstall
 
 # raw cargo (export PKG_CONFIG_PATH first):
 export PKG_CONFIG_PATH=/usr/lib64/pkgconfig:/usr/share/pkgconfig
@@ -48,6 +53,24 @@ uses the bare repo URL to match cosmic-bg-config's transitive cosmic-config
 source id. A second `?rev=` spelling splits that repo and breaks offline Flatpak
 vendoring. libcosmic APIs move fast, so verify against the locked revision before
 coding against remembered names.
+
+Packaging is part of the checked-in architecture. The root
+`io.github.ercling.CosmicBingWallpaper.json` developer manifest installs the
+binary, desktop entry, app-ID icon, and
+`data/io.github.ercling.CosmicBingWallpaper.metainfo.xml` into `/app`. Its
+Freedesktop 25.08 sandbox contract grants only the wallpaper directory, COSMIC
+config/state, Settings Daemon notifications, logind, Wayland/DRI, and network.
+`flatpak/` holds the pinned upstream Cargo source generator and `uv` wrapper;
+`cargo-sources.json` is generated and ignored. `.github/workflows/rust.yml`
+runs the native checks without generated sources, while
+`.github/workflows/flatpak.yml` generates them and emits the Flatpak bundle.
+
+The hand-written packaging identity web is tested by embedding the desktop
+entry, metainfo, manifest, justfile, vendoring scripts, and both workflows with
+`include_str!` in `src/app.rs`. Those tests cross-check names, install paths,
+commands, permissions, runtime versions, and CI inputs, and include deliberate
+drift/failure cases. Do not make them read generated `cargo-sources.json`, and
+do not duplicate `appstreamcli` or desktop-file syntax validation in Rust.
 
 - `src/main.rs` — entry point: `localize()` then `cosmic::applet::run::<Window>(())`.
 - `src/localize.rs` — Fluent i18n: `rust-embed`ded `i18n/<locale>/cosmic_bing_wallpaper.ftl`,
