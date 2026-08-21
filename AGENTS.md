@@ -86,9 +86,12 @@ detail in `docs/plans/` and keep this guide concise.
 
 ## Dependency and Compatibility Rules
 
-Both git dependencies, `libcosmic` and `cosmic-bg-config`, are revision-pinned
-in `Cargo.toml`, and `Cargo.lock` is committed. libcosmic moves quickly: inspect
-the pinned revision or resolved source rather than coding from remembered APIs.
+The committed `Cargo.lock` pins both git dependencies. `cosmic-bg-config` also
+has a `rev` in `Cargo.toml`; `libcosmic` deliberately uses the bare repo URL so
+its source id matches cosmic-bg-config's transitive `cosmic-config`. Adding a
+`?rev=` source id splits the repo and breaks offline Flatpak vendoring.
+libcosmic moves quickly: inspect the locked revision or resolved source rather
+than coding from remembered APIs.
 Do not unpin, update, or add production dependencies as an incidental fix.
 
 Preserve the applet's current Rust edition/toolchain compatibility. Keep the

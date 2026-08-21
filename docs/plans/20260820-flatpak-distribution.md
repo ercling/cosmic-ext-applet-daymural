@@ -200,15 +200,15 @@ Post-Completion; that warning is accepted.
 - Modify: `CLAUDE.md`, `AGENTS.md`
 - Modify: `src/app.rs`
 
-- [ ] drop `rev=` from the `libcosmic` dependency so all 23 crates resolve through the single
+- [x] drop `rev=` from the `libcosmic` dependency so all 23 crates resolve through the single
       bare `git+https://github.com/pop-os/libcosmic#8a017a15…` id; the sha stays pinned by the
       committed `Cargo.lock` (verify `cargo update` was **not** run and the sha is unchanged)
-- [ ] port awake's `every_git_dependency_resolves_through_one_source_id_per_repo` test over
+- [x] port awake's `every_git_dependency_resolves_through_one_source_id_per_repo` test over
       the embedded `Cargo.lock`; add a negative assertion that a `?rev=` and bare id for one
       repo fails it
-- [ ] update CLAUDE.md/AGENTS.md: the pin lives in `Cargo.lock`, and why (`?rev=` splits the
+- [x] update CLAUDE.md/AGENTS.md: the pin lives in `Cargo.lock`, and why (`?rev=` splits the
       source id and breaks offline vendoring)
-- [ ] run `just check`; it must pass before Task 1
+- [x] run `just check`; it must pass before Task 1
 
 ### Task 1: Add AppStream metadata and identity coverage
 

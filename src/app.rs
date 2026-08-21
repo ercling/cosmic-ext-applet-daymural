@@ -5636,6 +5636,55 @@ mod tests {
         assert!(!comment_tags.is_empty());
     }
 
+    fn one_git_source_id_per_repo(lock: &str) -> Result<(), String> {
+        let mut ids_by_repo: std::collections::BTreeMap<&str, std::collections::BTreeSet<&str>> =
+            std::collections::BTreeMap::new();
+        for line in lock.lines() {
+            let Some(source) = line
+                .strip_prefix("source = \"git+")
+                .and_then(|rest| rest.strip_suffix('"'))
+            else {
+                continue;
+            };
+            // `url?query#locked-commit`: the source id is everything before
+            // the fragment; the repository is everything before the query.
+            let id = source.split('#').next().expect("split has a first part");
+            let repo = id.split('?').next().expect("split has a first part");
+            ids_by_repo.entry(repo).or_default().insert(id);
+        }
+
+        if ids_by_repo.is_empty() {
+            return Err("the lock file names no git sources".to_owned());
+        }
+        for (repo, ids) in ids_by_repo {
+            if ids.len() != 1 {
+                return Err(format!(
+                    "`{repo}` is named under {} source ids ({ids:?})",
+                    ids.len()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_git_dependency_resolves_through_one_source_id_per_repo() {
+        // The Flatpak Cargo generator emits one source replacement per
+        // canonical repository URL. If Cargo.lock also names that repository
+        // with `?rev=...`, one source remains unvendored and an offline fetch
+        // attempts the network. Keep libcosmic bare to match the transitive
+        // cosmic-config declaration; Cargo.lock still pins the exact commit.
+        const CARGO_LOCK: &str = include_str!("../Cargo.lock");
+        one_git_source_id_per_repo(CARGO_LOCK)
+            .expect("every git repository must use exactly one Cargo source id");
+
+        let split_source_ids = r#"source = "git+https://example.invalid/repo?rev=abc#abc"
+source = "git+https://example.invalid/repo#abc""#;
+        let error = one_git_source_id_per_repo(split_source_ids)
+            .expect_err("bare and `?rev=` spellings for one repo must fail");
+        assert!(error.contains("2 source ids"), "unexpected error: {error}");
+    }
+
     // -----------------------------------------------------------------
     // `Window::update` — the message loop's state transitions. Only the
     // branches that touch neither cosmic-bg's real config nor the real

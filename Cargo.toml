@@ -7,7 +7,10 @@ description = "COSMIC panel applet that applies Bing's image of the day as wallp
 
 [dependencies]
 # Feature flags copied from pop-os/cosmic-applets workspace (verified 2026-08-07).
-libcosmic = { git = "https://github.com/pop-os/libcosmic", rev = "8a017a15ee7753241c0a631b4294a68edf79b13b", default-features = false, features = [
+# Deliberately no `rev`: cosmic-bg-config's transitive cosmic-config names this
+# repo bare, and a second `?rev=` source id breaks offline Flatpak vendoring.
+# The exact commit remains pinned by the committed Cargo.lock.
+libcosmic = { git = "https://github.com/pop-os/libcosmic", default-features = false, features = [
     "applet",
     "applet-token",
     "dbus-config",
@@ -75,11 +78,10 @@ tempfile = "3"
 # additive features never reach the shipped binary's tokio.
 tokio = { version = "1", features = ["macros", "rt", "time", "test-util"] }
 
-# Note: cosmic-bg-config depends on cosmic-config from the libcosmic repo
-# *unpinned* (default branch). It cannot be unified with our rev-pinned
-# libcosmic source via [patch] (cargo rejects the patch while upstream HEAD ==
-# the pinned rev: "points to the same source"). The committed Cargo.lock pins
-# that transitive source's exact sha instead.
+# Note: cosmic-bg-config depends on cosmic-config from the bare libcosmic repo.
+# Our libcosmic declaration deliberately uses the same source id so Cargo and
+# the Flatpak vendoring generator see one repo spelling. The committed
+# Cargo.lock pins that shared source to its exact sha.
 
 [profile.release]
 opt-level = 3

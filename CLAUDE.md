@@ -42,9 +42,12 @@ Tests never touch real user config/state — they inject paths or
 ## Architecture
 
 Single self-contained libcosmic applet binary, no daemon — timers only run while
-the panel runs. Both git deps (libcosmic, cosmic-bg-config) are **rev-pinned** in
-`Cargo.toml` with `Cargo.lock` committed; libcosmic APIs move fast, verify against
-the pinned rev before coding against remembered names.
+the panel runs. The committed `Cargo.lock` pins both git dependencies;
+cosmic-bg-config also has a `rev` in `Cargo.toml`, while libcosmic deliberately
+uses the bare repo URL to match cosmic-bg-config's transitive cosmic-config
+source id. A second `?rev=` spelling splits that repo and breaks offline Flatpak
+vendoring. libcosmic APIs move fast, so verify against the locked revision before
+coding against remembered names.
 
 - `src/main.rs` — entry point: `localize()` then `cosmic::applet::run::<Window>(())`.
 - `src/localize.rs` — Fluent i18n: `rust-embed`ded `i18n/<locale>/cosmic_bing_wallpaper.ftl`,
