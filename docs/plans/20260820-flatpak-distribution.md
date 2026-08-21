@@ -278,6 +278,8 @@ Post-Completion; that warning is accepted.
       has a generated entry (including the single libcosmic id from Task 0), run the
       source-prefetch recipe, then a force-clean `flatpak-builder --disable-download` build
       using the retained download cache; all must pass before Task 4
+- [x] ➕ harden cached git metadata extraction by fetching and checking out every requested
+      lockfile commit, then comparing the full checked-out hash before reading `Cargo.toml`
 
 ### Task 4: Add Rust and Flatpak CI
 
@@ -297,6 +299,8 @@ Post-Completion; that warning is accepted.
       runtime image, bundle name, and equivalent Rust check commands
 - [x] add negative assertions against runtime-version drift and omitted source generation
 - [x] scan both workflows and run `just check`; both must pass before Task 5
+- [x] ➕ pin the privileged Flatpak builder container by digest and all actions by full commit,
+      restrict the workflow token to `contents: read`, and prevent checkout credential persistence
 
 ### Task 5: Document the distribution and compatibility contract
 

@@ -7,7 +7,8 @@
 # ]
 # ///
 
-# Vendored unmodified (this header aside) from upstream flatpak-builder-tools:
+# Vendored from upstream flatpak-builder-tools, with exact dependency pins and
+# full-hash cached-checkout verification maintained locally:
 #   repo:   https://github.com/flatpak/flatpak-builder-tools
 #   path:   cargo/flatpak-cargo-generator.py
 #   commit: f03a673abe6ce189cea1c2857e2b44af2dd79d1f
@@ -140,21 +141,20 @@ def fetch_git_repo(git_url: str, commit: str) -> str:
     clone_dir = os.path.join(cache_dir, "flatpak-cargo", repo_dir)
     if not os.path.isdir(os.path.join(clone_dir, ".git")):
         subprocess.run(["git", "clone", "--depth=1", git_url, clone_dir], check=True)
+    subprocess.run(
+        ["git", "fetch", "--depth=1", "origin", commit], cwd=clone_dir, check=True
+    )
+    subprocess.run(
+        ["git", "checkout", "--detach", "--force", commit], cwd=clone_dir, check=True
+    )
     rev_parse_proc = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=clone_dir, check=True, stdout=subprocess.PIPE
     )
     head = rev_parse_proc.stdout.decode().strip()
-    if head[:COMMIT_LEN] != commit[:COMMIT_LEN]:
-        subprocess.run(["git", "fetch", "origin", commit], cwd=clone_dir, check=True)
-        try:
-            subprocess.run(["git", "checkout", commit], cwd=clone_dir, check=True)
-        except subprocess.CalledProcessError:
-            logging.info(
-                "Checking out commit %s failed for %s. Trying to force checkout the requested commit",
-                commit,
-                git_url,
-            )
-            subprocess.run(["git", "checkout", "-f", commit], cwd=clone_dir, check=True)
+    if head != commit:
+        raise RuntimeError(
+            f"Checked out {head} for {git_url}, expected locked commit {commit}"
+        )
 
     # Get the submodules as they might contain dependencies. This is a noop if
     # there are no submodules in the repository

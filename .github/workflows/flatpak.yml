@@ -9,15 +9,21 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   flatpak:
     runs-on: ubuntu-latest
     container:
-      # Keep this tag aligned with the manifest's Freedesktop runtime version.
-      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08
+      # Keep this tag aligned with the manifest's Freedesktop runtime version;
+      # the digest pins the exact privileged build environment.
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08@sha256:6f3180c6765cb55e5dcd8ee4127b82aba25163c8c655a161422b7c447c14e4af
       options: --privileged
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
@@ -79,7 +85,7 @@ jobs:
         run: appstreamcli validate --no-net data/io.github.ercling.CosmicBingWallpaper.metainfo.xml
 
       - name: Build and bundle the Flatpak
-        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        uses: flatpak/flatpak-github-actions/flatpak-builder@401fe28a8384095fc1531b9d320b292f0ee45adb # v6
         with:
           manifest-path: io.github.ercling.CosmicBingWallpaper.json
           bundle: cosmic-bing-wallpaper.flatpak

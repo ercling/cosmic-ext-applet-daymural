@@ -5613,6 +5613,10 @@ mod tests {
     const RUST_WORKFLOW: &str = include_str!("../.github/workflows/rust.yml");
     const FLATPAK_WORKFLOW: &str = include_str!("../.github/workflows/flatpak.yml");
     const CARGO_SOURCES_FILENAME: &str = "cargo-sources.json";
+    const CHECKOUT_ACTION: &str = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262";
+    const FLATPAK_BUILDER_ACTION: &str =
+        "flatpak/flatpak-github-actions/flatpak-builder@401fe28a8384095fc1531b9d320b292f0ee45adb";
+    const FLATPAK_BUILDER_IMAGE: &str = "ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08@sha256:6f3180c6765cb55e5dcd8ee4127b82aba25163c8c655a161422b7c447c14e4af";
 
     fn just_var<'a>(justfile: &'a str, name: &str) -> Option<&'a str> {
         justfile
@@ -6240,6 +6244,14 @@ mod tests {
                 && !CARGO_GENERATOR_LOCK.contains("name = \"pyyaml\""),
             "the checked-in uv lock must cover only required generator dependencies"
         );
+        assert!(
+            CARGO_GENERATOR.contains("[\"git\", \"fetch\", \"--depth=1\", \"origin\", commit]")
+                && CARGO_GENERATOR
+                    .contains("[\"git\", \"checkout\", \"--detach\", \"--force\", commit]")
+                && CARGO_GENERATOR.contains("if head != commit:")
+                && !CARGO_GENERATOR.contains("head[:COMMIT_LEN]"),
+            "cached git metadata must be checked out and verified against the full lockfile commit"
+        );
     }
 
     #[test]
@@ -6372,10 +6384,18 @@ mod tests {
             .as_str()
             .ok_or_else(|| "manifest runtime-version".to_owned())?;
         require(
-            flatpak.contains(&format!(
-                "image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-{runtime_version}"
-            )),
-            "flatpak.yml builder image must match the manifest runtime",
+            FLATPAK_BUILDER_IMAGE.contains(&format!("freedesktop-{runtime_version}@sha256:"))
+                && flatpak.contains(&format!("image: {FLATPAK_BUILDER_IMAGE}")),
+            "flatpak.yml builder image must match the manifest runtime and pinned digest",
+        )?;
+        require(
+            flatpak.contains("permissions:\n  contents: read"),
+            "flatpak.yml must grant only read access to repository contents",
+        )?;
+        require(
+            active_workflow_step_containing(&flatpak, CHECKOUT_ACTION)
+                && active_workflow_step_containing(&flatpak, "persist-credentials: false"),
+            "flatpak.yml checkout must be commit-pinned without persisted credentials",
         )?;
         for required in [
             format!("manifest-path: {APP_ID}.json"),
@@ -6385,7 +6405,7 @@ mod tests {
             "astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b".to_owned(),
             "version: \"0.12.1\"".to_owned(),
             "appstreamcli validate --no-net data/io.github.ercling.CosmicBingWallpaper.metainfo.xml".to_owned(),
-            "flatpak/flatpak-github-actions/flatpak-builder@v6".to_owned(),
+            FLATPAK_BUILDER_ACTION.to_owned(),
             format!("bundle: {}.flatpak", env!("CARGO_PKG_NAME")),
         ] {
             require(
@@ -6420,6 +6440,34 @@ mod tests {
                 .is_err(),
             "a commented-out source generation step unexpectedly passed"
         );
+
+        for insecure_workflow in [
+            FLATPAK_WORKFLOW.replace(
+                FLATPAK_BUILDER_IMAGE,
+                "ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08",
+            ),
+            FLATPAK_WORKFLOW.replace(CHECKOUT_ACTION, "actions/checkout@v4"),
+            FLATPAK_WORKFLOW.replace(
+                FLATPAK_BUILDER_ACTION,
+                "flatpak/flatpak-github-actions/flatpak-builder@v6",
+            ),
+            FLATPAK_WORKFLOW.replace(
+                "permissions:\n  contents: read",
+                "permissions:\n  contents: write",
+            ),
+            FLATPAK_WORKFLOW.replace("persist-credentials: false", "persist-credentials: true"),
+        ] {
+            assert!(
+                validate_ci_workflows(
+                    RUST_WORKFLOW,
+                    &insecure_workflow,
+                    FLATPAK_MANIFEST,
+                    JUSTFILE
+                )
+                .is_err(),
+                "an unpinned or over-privileged Flatpak workflow unexpectedly passed"
+            );
+        }
 
         for disabled_rust in [
             RUST_WORKFLOW.replace(
