@@ -5602,11 +5602,140 @@ mod tests {
         assert_eq!(web_url(""), None);
     }
 
+    const DESKTOP: &str = include_str!("../data/io.github.ercling.CosmicBingWallpaper.desktop");
+    const METAINFO: &str =
+        include_str!("../data/io.github.ercling.CosmicBingWallpaper.metainfo.xml");
+    const JUSTFILE: &str = include_str!("../justfile");
+
+    fn desktop_value<'a>(desktop: &'a str, key: &str) -> Option<&'a str> {
+        desktop.lines().find_map(|line| {
+            let (candidate, value) = line.split_once('=')?;
+            (candidate == key).then_some(value)
+        })
+    }
+
+    fn flatpak_identity_is_consistent(
+        desktop: &str,
+        metainfo: &str,
+        metainfo_filename: &str,
+    ) -> Result<(), String> {
+        let expected_desktop = format!("{APP_ID}.desktop");
+        let expected_metainfo = format!("{APP_ID}.metainfo.xml");
+        let expected_icon = format!("{APP_ID}-symbolic");
+        let expected_binary = env!("CARGO_PKG_NAME");
+        let require = |condition: bool, message: &str| {
+            condition.then_some(()).ok_or_else(|| message.to_owned())
+        };
+
+        require(
+            desktop_value(desktop, "Exec") == Some(expected_binary),
+            "desktop Exec must be the bare Cargo binary name",
+        )?;
+        require(
+            desktop_value(desktop, "Icon") == Some(expected_icon.as_str()),
+            "desktop icon must use the app-ID-prefixed symbolic name",
+        )?;
+        require(
+            metainfo_filename == expected_metainfo,
+            "metainfo filename must match APP_ID",
+        )?;
+
+        let before_provides = metainfo.split("<provides>").next().unwrap_or(metainfo);
+        require(
+            before_provides.contains(&format!("<id>{APP_ID}</id>")),
+            "metainfo component id must match APP_ID",
+        )?;
+        require(
+            metainfo.contains(&format!(
+                "<launchable type=\"desktop-id\">{expected_desktop}</launchable>"
+            )),
+            "metainfo launchable must name the app-ID desktop entry",
+        )?;
+
+        let provides = metainfo
+            .split("<provides>")
+            .nth(1)
+            .and_then(|rest| rest.split("</provides>").next())
+            .ok_or_else(|| "metainfo must contain a provides block".to_owned())?;
+        require(
+            provides.contains("<id>com.system76.CosmicApplet</id>"),
+            "metainfo must provide the COSMIC Store applet category",
+        )?;
+        require(
+            provides.contains(&format!("<binary>{expected_binary}</binary>")),
+            "metainfo binary must match the Cargo package name",
+        )?;
+
+        require(
+            metainfo.contains(&format!(
+                "<project_license>{}</project_license>",
+                env!("CARGO_PKG_LICENSE")
+            )),
+            "metainfo project license must match Cargo",
+        )?;
+        require(
+            metainfo.contains("<metadata_license>CC0-1.0</metadata_license>"),
+            "metainfo metadata license must be CC0-1.0",
+        )?;
+        require(
+            metainfo.contains(&format!(
+                "<summary>{}</summary>",
+                env!("CARGO_PKG_DESCRIPTION")
+            )),
+            "metainfo summary must match Cargo",
+        )?;
+        require(
+            metainfo.contains("<description>") && metainfo.contains("<p>"),
+            "metainfo must describe the applet",
+        )?;
+        require(
+            metainfo.contains(&format!(
+                "<name>{}</name>",
+                desktop_value(desktop, "Name").unwrap_or_default()
+            )),
+            "metainfo name must match the desktop entry",
+        )?;
+        let release_prefix = format!("<release version=\"{}\" date=\"", env!("CARGO_PKG_VERSION"));
+        let release_date = metainfo
+            .split_once(&release_prefix)
+            .and_then(|(_, rest)| rest.split_once('"').map(|(date, _)| date))
+            .ok_or_else(|| "metainfo release must match the Cargo version".to_owned())?;
+        require(
+            release_date.len() == 10
+                && release_date.chars().enumerate().all(|(index, character)| {
+                    if matches!(index, 4 | 7) {
+                        character == '-'
+                    } else {
+                        character.is_ascii_digit()
+                    }
+                }),
+            "metainfo release must have a YYYY-MM-DD date",
+        )?;
+        require(
+            metainfo.contains(
+                "<url type=\"homepage\">https://github.com/ercling/cosmic-wallpaper-applet</url>",
+            ),
+            "metainfo homepage must name the project repository",
+        )?;
+        require(
+            metainfo.contains("<developer id=\"io.github.ercling\">")
+                && metainfo.contains("<name>Oleksandr Mykhailiuta</name>"),
+            "metainfo must identify the developer",
+        )?;
+        require(
+            metainfo.contains("<project_group>COSMIC</project_group>"),
+            "metainfo project group must be COSMIC",
+        )?;
+        require(
+            metainfo.contains("<content_rating type=\"oars-1.1\"/>"),
+            "metainfo must carry an OARS 1.1 rating",
+        )
+    }
+
     #[test]
     fn desktop_entry_stays_in_sync_with_the_app_id() {
         // The desktop entry is hand-maintained and never compiled; these are
         // the properties `desktop-file-validate` does not check for us.
-        const DESKTOP: &str = include_str!("../data/io.github.ercling.CosmicBingWallpaper.desktop");
         let mut comment_tags = std::collections::BTreeSet::new();
         let mut has_icon = false;
         for line in DESKTOP.lines() {
@@ -5634,6 +5763,107 @@ mod tests {
         }
         assert!(has_icon, "the desktop entry must name an icon");
         assert!(!comment_tags.is_empty());
+    }
+
+    #[test]
+    fn flatpak_metadata_stays_in_sync_with_the_crate_and_desktop_entry() {
+        assert!(
+            !env!("CARGO_PKG_DESCRIPTION").contains(['&', '<', '>']),
+            "the Cargo description is embedded in XML and must remain unescaped"
+        );
+        assert_eq!(
+            METAINFO,
+            std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("data")
+                    .join(format!("{APP_ID}.metainfo.xml"))
+            )
+            .expect("data/ ships metainfo named for APP_ID")
+        );
+        assert!(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("data/icons")
+                .join(format!("{APP_ID}-symbolic.svg"))
+                .is_file(),
+            "data/ must ship the app-ID-prefixed desktop icon"
+        );
+        flatpak_identity_is_consistent(DESKTOP, METAINFO, &format!("{APP_ID}.metainfo.xml"))
+            .expect("the hand-written Flatpak identity fields must agree");
+        assert!(
+            JUSTFILE.contains("sed -i 's|^Exec=.*|Exec={{bin-dst}}|' {{desktop-dst}}"),
+            "native install must rewrite the bare source Exec to its absolute binary path"
+        );
+    }
+
+    #[test]
+    fn flatpak_identity_checks_reject_desktop_and_metainfo_drift() {
+        for invalid_exec in ["/usr/bin/cosmic-bing-wallpaper", "wrong-binary"] {
+            let desktop = DESKTOP.replace(
+                "Exec=cosmic-bing-wallpaper",
+                &format!("Exec={invalid_exec}"),
+            );
+            let error = flatpak_identity_is_consistent(
+                &desktop,
+                METAINFO,
+                &format!("{APP_ID}.metainfo.xml"),
+            )
+            .expect_err("an absolute or mismatched desktop Exec must fail");
+            assert!(error.contains("desktop Exec"), "unexpected error: {error}");
+        }
+
+        let mismatches = [
+            (
+                "<id>io.github.ercling.CosmicBingWallpaper</id>",
+                "<id>wrong.id</id>",
+            ),
+            (
+                "io.github.ercling.CosmicBingWallpaper.desktop",
+                "wrong.id.desktop",
+            ),
+            (
+                "<binary>cosmic-bing-wallpaper</binary>",
+                "<binary>wrong</binary>",
+            ),
+            (
+                "<id>com.system76.CosmicApplet</id>",
+                "<id>com.example.NotAnApplet</id>",
+            ),
+            (
+                "<project_license>GPL-3.0-only</project_license>",
+                "<project_license>MIT</project_license>",
+            ),
+            (
+                "<summary>COSMIC panel applet that applies Bing's image of the day as wallpaper</summary>",
+                "<summary>Wrong summary</summary>",
+            ),
+            ("<release version=\"0.1.0\"", "<release version=\"9.9.9\""),
+        ];
+        for (valid, invalid) in mismatches {
+            let metainfo = METAINFO.replacen(valid, invalid, 1);
+            assert!(
+                flatpak_identity_is_consistent(
+                    DESKTOP,
+                    &metainfo,
+                    &format!("{APP_ID}.metainfo.xml")
+                )
+                .is_err(),
+                "mismatched metainfo field unexpectedly passed: {invalid}"
+            );
+        }
+
+        assert!(
+            flatpak_identity_is_consistent(DESKTOP, METAINFO, "wrong.metainfo.xml").is_err(),
+            "a metainfo filename that does not match APP_ID must fail"
+        );
+        let desktop = DESKTOP.replace(
+            "Icon=io.github.ercling.CosmicBingWallpaper-symbolic",
+            "Icon=wrong-symbolic",
+        );
+        assert!(
+            flatpak_identity_is_consistent(&desktop, METAINFO, &format!("{APP_ID}.metainfo.xml"))
+                .is_err(),
+            "a mismatched desktop icon must fail"
+        );
     }
 
     fn one_git_source_id_per_repo(lock: &str) -> Result<(), String> {

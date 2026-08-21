@@ -218,17 +218,17 @@ Post-Completion; that warning is accepted.
 - Modify: `data/io.github.ercling.CosmicBingWallpaper.desktop`
 - Modify: `src/app.rs`
 
-- [ ] change the source desktop entry to `Exec=cosmic-bing-wallpaper`; preserve the native
+- [x] change the source desktop entry to `Exec=cosmic-bing-wallpaper`; preserve the native
       justfile rewrite to an absolute installed binary path
-- [ ] add desktop-application metadata with the exact app ID, desktop launchable, applet
+- [x] add desktop-application metadata with the exact app ID, desktop launchable, applet
       category provide, binary, licenses, developer, project group, homepage, OARS rating,
       version, release date, summary (from `Cargo.toml`), and description
-- [ ] add success tests cross-checking APP_ID, Cargo name/version/license/description, desktop
+- [x] add success tests cross-checking APP_ID, Cargo name/version/license/description, desktop
       entry, icon, bare desktop command, metainfo filename, launchable, binary, and Store
       category
-- [ ] add failure assertions for an absolute or mismatched desktop `Exec` and mismatched
+- [x] add failure assertions for an absolute or mismatched desktop `Exec` and mismatched
       identity/category fields (no generic well-formedness checks — `appstreamcli` owns those)
-- [ ] run focused identity tests and `appstreamcli validate
+- [x] run focused identity tests and `appstreamcli validate
       data/io.github.ercling.CosmicBingWallpaper.metainfo.xml` (screenshot warning accepted);
       both must pass before Task 2
 

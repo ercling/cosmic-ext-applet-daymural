@@ -19,9 +19,10 @@ Comment[uk]=Зображення дня Bing як фонове зображен�
 Comment[zh_CN]=将 Bing 每日图片设为 COSMIC 壁纸
 Comment[zh_TW]=將 Bing 每日圖片設為 COSMIC 桌布
 Type=Application
-# Rewritten to the absolute install path by `just install` — cosmic-panel's
-# environment may not have the install bindir (e.g. ~/.local/bin) in PATH.
-Exec=/usr/bin/cosmic-bing-wallpaper
+# Flatpak runs this through the manifest command. `just install` rewrites its
+# installed copy to an absolute path because cosmic-panel may not have the
+# selected native bindir (for example ~/.local/bin) in PATH.
+Exec=cosmic-bing-wallpaper
 Terminal=false
 Categories=COSMIC;
 Keywords=COSMIC;Applet;Bing;Wallpaper;Background;Image;
