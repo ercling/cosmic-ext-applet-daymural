@@ -5607,6 +5607,40 @@ mod tests {
         include_str!("../data/io.github.ercling.CosmicBingWallpaper.metainfo.xml");
     const FLATPAK_MANIFEST: &str = include_str!("../io.github.ercling.CosmicBingWallpaper.json");
     const JUSTFILE: &str = include_str!("../justfile");
+    const CARGO_SOURCES_SCRIPT: &str = include_str!("../flatpak/generate-cargo-sources.sh");
+    const CARGO_GENERATOR: &str = include_str!("../flatpak/flatpak-cargo-generator.py");
+
+    fn keyed_value<'a>(text: &'a str, key: &str, separator: &str) -> Option<&'a str> {
+        text.lines()
+            .filter(|line| !line.starts_with('#'))
+            .find_map(|line| line.strip_prefix(key)?.trim_start().strip_prefix(separator))
+    }
+
+    fn just_var<'a>(justfile: &'a str, name: &str) -> Option<&'a str> {
+        keyed_value(justfile, name, ":=")?
+            .trim()
+            .strip_prefix('\'')?
+            .strip_suffix('\'')
+    }
+
+    fn just_recipe(justfile: &str, name: &str) -> String {
+        justfile
+            .lines()
+            .skip_while(
+                |line| !matches!(line.strip_prefix(name), Some(rest) if rest.starts_with(':')),
+            )
+            .skip(1)
+            .take_while(|line| line.trim().is_empty() || line.starts_with([' ', '\t']))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn sans_comments(text: &str) -> String {
+        text.lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     fn desktop_value<'a>(desktop: &'a str, key: &str) -> Option<&'a str> {
         desktop.lines().find_map(|line| {
@@ -6020,6 +6054,192 @@ mod tests {
         assert!(
             validate_flatpak_manifest("{not json", DESKTOP).is_err(),
             "invalid JSON unexpectedly passed"
+        );
+    }
+
+    fn validate_flatpak_tooling(
+        manifest_text: &str,
+        script_text: &str,
+        justfile: &str,
+    ) -> Result<(), String> {
+        validate_flatpak_manifest(manifest_text, DESKTOP)?;
+        let manifest: serde_json::Value =
+            serde_json::from_str(manifest_text).map_err(|error| error.to_string())?;
+        let require = |condition: bool, message: &str| {
+            condition.then_some(()).ok_or_else(|| message.to_owned())
+        };
+        let module = &manifest["modules"][0];
+        let module_name = module["name"]
+            .as_str()
+            .ok_or_else(|| "module name".to_owned())?;
+        require(
+            manifest["build-options"]["env"]["CARGO_HOME"].as_str()
+                == Some(&format!("/run/build/{module_name}/cargo")),
+            "CARGO_HOME must align with the module name",
+        )?;
+        let generated_source = module["sources"]
+            .as_array()
+            .and_then(|sources| sources.iter().filter_map(|source| source.as_str()).next())
+            .ok_or_else(|| "generated Cargo source".to_owned())?;
+
+        let script = sans_comments(script_text);
+        require(
+            script.contains("command -v uv"),
+            "vendoring script must reject missing uv",
+        )?;
+        require(
+            script.contains("install it") && script.contains("docs.astral.sh/uv"),
+            "missing-uv error must include an install hint",
+        )?;
+        require(
+            script.contains("flatpak/flatpak-cargo-generator.py"),
+            "vendoring script generator path",
+        )?;
+        require(
+            script.contains(" Cargo.lock "),
+            "vendoring script Cargo.lock input",
+        )?;
+        require(
+            script.contains(&format!("-o {generated_source}")),
+            "vendoring output must match the manifest source name",
+        )?;
+
+        require(
+            just_var(justfile, "name") == Some(module_name),
+            "justfile name must match the manifest module",
+        )?;
+        require(
+            just_var(justfile, "appid") == manifest["id"].as_str(),
+            "justfile appid must match the manifest id",
+        )?;
+        let builder = just_var(justfile, "flatpak-builder-cmd")
+            .ok_or_else(|| "shared flatpak-builder-cmd".to_owned())?;
+        require(
+            builder.starts_with("flatpak-builder ")
+                && builder.contains("--user")
+                && builder.contains("--install-deps-from=flathub")
+                && builder.contains("--force-clean"),
+            "shared flatpak-builder invocation",
+        )?;
+        for recipe in [
+            "flatpak-prefetch",
+            "flatpak-build",
+            "flatpak-build-offline",
+            "flatpak-install",
+        ] {
+            let body = just_recipe(justfile, recipe);
+            require(
+                body.contains("{{flatpak-builder-cmd}}"),
+                &format!("{recipe} must use flatpak-builder-cmd"),
+            )?;
+            require(
+                body.contains("build-dir '{{appid}}.json'"),
+                &format!("{recipe} manifest path"),
+            )?;
+        }
+        require(
+            just_recipe(justfile, "flatpak-sources").contains("flatpak/generate-cargo-sources.sh"),
+            "flatpak-sources script path",
+        )?;
+        require(
+            just_recipe(justfile, "flatpak-prefetch").contains("--download-only"),
+            "flatpak-prefetch must download sources",
+        )?;
+        require(
+            just_recipe(justfile, "flatpak-build-offline").contains("--disable-download"),
+            "flatpak-build-offline must disable downloads",
+        )?;
+        require(
+            just_recipe(justfile, "flatpak-install").contains("--install"),
+            "flatpak-install must install",
+        )?;
+        let uninstall = just_recipe(justfile, "flatpak-uninstall");
+        require(
+            uninstall.contains("flatpak uninstall") && uninstall.contains("'{{appid}}'"),
+            "flatpak-uninstall must remove the manifest id",
+        )
+    }
+
+    #[test]
+    fn flatpak_vendoring_and_local_recipes_stay_aligned() {
+        validate_flatpak_tooling(FLATPAK_MANIFEST, CARGO_SOURCES_SCRIPT, JUSTFILE)
+            .expect("vendoring, manifest, and just recipes must agree");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(
+            root.join("flatpak/flatpak-cargo-generator.py").is_file(),
+            "the wrapper's vendored generator must exist"
+        );
+        assert!(
+            CARGO_GENERATOR.contains("https://github.com/flatpak/flatpak-builder-tools")
+                && CARGO_GENERATOR.contains("f03a673abe6ce189cea1c2857e2b44af2dd79d1f"),
+            "the vendored generator must document its exact upstream commit"
+        );
+    }
+
+    #[test]
+    fn flatpak_tooling_checks_reject_path_and_offline_drift() {
+        for script in [
+            CARGO_SOURCES_SCRIPT.replace(" Cargo.lock ", " Wrong.lock "),
+            CARGO_SOURCES_SCRIPT.replace("-o cargo-sources.json", "-o wrong.json"),
+            CARGO_SOURCES_SCRIPT.replace(
+                "flatpak/flatpak-cargo-generator.py",
+                "flatpak/wrong-generator.py",
+            ),
+        ] {
+            assert!(
+                validate_flatpak_tooling(FLATPAK_MANIFEST, &script, JUSTFILE).is_err(),
+                "a vendoring script path drift unexpectedly passed"
+            );
+        }
+
+        let wrong_manifest_path = JUSTFILE.replace("'{{appid}}.json'", "'wrong.json'");
+        assert!(
+            validate_flatpak_tooling(FLATPAK_MANIFEST, CARGO_SOURCES_SCRIPT, &wrong_manifest_path,)
+                .is_err(),
+            "recipes that build a different manifest unexpectedly passed"
+        );
+        let no_offline_guard = JUSTFILE.replace(" --disable-download", "");
+        assert!(
+            validate_flatpak_tooling(FLATPAK_MANIFEST, CARGO_SOURCES_SCRIPT, &no_offline_guard,)
+                .is_err(),
+            "an offline recipe without --disable-download unexpectedly passed"
+        );
+        let unshared_build = JUSTFILE.replacen(
+            "{{flatpak-builder-cmd}} build-dir '{{appid}}.json'",
+            "flatpak-builder build-dir '{{appid}}.json'",
+            1,
+        );
+        assert!(
+            validate_flatpak_tooling(FLATPAK_MANIFEST, CARGO_SOURCES_SCRIPT, &unshared_build,)
+                .is_err(),
+            "a Flatpak recipe bypassing the shared builder command unexpectedly passed"
+        );
+    }
+
+    #[test]
+    fn cargo_sources_script_reports_a_missing_uv_with_an_install_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/usr/bin/dirname", dir.path().join("dirname")).unwrap();
+        let script =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("flatpak/generate-cargo-sources.sh");
+        let output = std::process::Command::new("/bin/sh")
+            .arg(script)
+            .env_clear()
+            .env("PATH", dir.path())
+            .output()
+            .expect("the vendoring wrapper must be executable through /bin/sh");
+        assert!(
+            !output.status.success(),
+            "missing uv unexpectedly succeeded"
+        );
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("'uv' not found"),
+            "unexpected error: {stderr}"
+        );
+        assert!(
+            stderr.contains("install it"),
+            "missing install hint: {stderr}"
         );
     }
 

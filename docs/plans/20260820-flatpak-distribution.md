@@ -261,18 +261,18 @@ Post-Completion; that warning is accepted.
 - Modify: `justfile`
 - Modify: `src/app.rs`
 
-- [ ] vendor the generator at a documented upstream commit and add the `uv` wrapper that turns
+- [x] vendor the generator at a documented upstream commit and add the `uv` wrapper that turns
       committed `Cargo.lock` into gitignored `cargo-sources.json`
-- [ ] add `flatpak-sources`, `flatpak-build`, `flatpak-install`, and `flatpak-uninstall` without
+- [x] add `flatpak-sources`, `flatpak-build`, `flatpak-install`, and `flatpak-uninstall` without
       changing native recipes, sharing one `flatpak-builder-cmd` variable so they cannot drift;
       also add a source-prefetch recipe and a `flatpak-build-offline` recipe that passes
       `--disable-download`
-- [ ] add success tests tying manifest source names, module/Cargo-home paths, the script's
+- [x] add success tests tying manifest source names, module/Cargo-home paths, the script's
       `Cargo.lock` input / `cargo-sources.json` output names, and just recipes together —
       **never reading `cargo-sources.json` itself**
-- [ ] test the missing-`uv` error, scripts or recipes whose paths drift from the manifest, and
+- [x] test the missing-`uv` error, scripts or recipes whose paths drift from the manifest, and
       an offline recipe lacking `--disable-download`
-- [ ] shell gate: generate `cargo-sources.json`, prove every registry/git source in `Cargo.lock`
+- [x] shell gate: generate `cargo-sources.json`, prove every registry/git source in `Cargo.lock`
       has a generated entry (including the single libcosmic id from Task 0), run the
       source-prefetch recipe, then a force-clean `flatpak-builder --disable-download` build
       using the retained download cache; all must pass before Task 4
