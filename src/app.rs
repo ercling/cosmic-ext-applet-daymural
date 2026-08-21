@@ -5609,6 +5609,8 @@ mod tests {
     const JUSTFILE: &str = include_str!("../justfile");
     const CARGO_SOURCES_SCRIPT: &str = include_str!("../flatpak/generate-cargo-sources.sh");
     const CARGO_GENERATOR: &str = include_str!("../flatpak/flatpak-cargo-generator.py");
+    const GIT_MANIFEST_SCAN: &str = include_str!("../flatpak/git_manifest_scan.py");
+    const GIT_MANIFEST_SCAN_TEST: &str = include_str!("../flatpak/test_git_manifest_scan.py");
     const CARGO_GENERATOR_LOCK: &str = include_str!("../flatpak/flatpak-cargo-generator.py.lock");
     const RUST_WORKFLOW: &str = include_str!("../.github/workflows/rust.yml");
     const FLATPAK_WORKFLOW: &str = include_str!("../.github/workflows/flatpak.yml");
@@ -6262,7 +6264,13 @@ mod tests {
                 && CARGO_GENERATOR
                     .contains("[\"git\", \"submodule\", \"status\", \"--recursive\"]")
                 && CARGO_GENERATOR.contains("if head != commit:")
-                && !CARGO_GENERATOR.contains("head[:COMMIT_LEN]"),
+                && !CARGO_GENERATOR.contains("head[:COMMIT_LEN]")
+                && CARGO_GENERATOR.contains("child_manifest_directories(root_dir)")
+                && GIT_MANIFEST_SCAN.contains("if child.name == \".git\":")
+                && GIT_MANIFEST_SCAN.contains("child.is_dir(follow_symlinks=False)")
+                && GIT_MANIFEST_SCAN_TEST
+                    .contains("test_excludes_git_metadata_and_directory_symlinks")
+                && GIT_MANIFEST_SCAN_TEST.contains("os.symlink"),
             "cached git metadata must be force-cleaned and fully verified before scanning"
         );
     }
@@ -6428,6 +6436,7 @@ mod tests {
         for required in [
             format!("manifest-path: {APP_ID}.json"),
             "flatpak/generate-cargo-sources.sh".to_owned(),
+            "python3 flatpak/test_git_manifest_scan.py".to_owned(),
             "Cargo.lock".to_owned(),
             CARGO_SOURCES_FILENAME.to_owned(),
             "astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b".to_owned(),
@@ -6537,6 +6546,10 @@ mod tests {
         }
 
         for disabled_flatpak in [
+            FLATPAK_WORKFLOW.replace(
+                "      - name: Test Git manifest traversal\n        run:",
+                "      - name: Test Git manifest traversal\n        if: false\n        run:",
+            ),
             FLATPAK_WORKFLOW.replace(
                 "      - name: Generate cargo-sources.json\n        run:",
                 "      - name: Generate cargo-sources.json\n        if: false\n        run:",

@@ -282,6 +282,8 @@ Post-Completion; that warning is accepted.
       lockfile commit, then comparing the full checked-out hash before reading `Cargo.toml`
 - [x] ➕ force-clean the parent checkout and every current submodule, force indexed submodule
       commits, and reject dirty or mismatched submodule state before recursively scanning manifests
+- [x] ➕ exclude `.git` metadata and directory symlinks from recursive manifest discovery,
+      with adversarial coverage for both paths
 
 ### Task 4: Add Rust and Flatpak CI
 

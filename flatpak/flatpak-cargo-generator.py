@@ -40,6 +40,8 @@ from urllib.parse import ParseResult, parse_qs, urlparse
 import aiohttp
 import tomlkit
 
+from git_manifest_scan import child_manifest_directories
+
 try:
     import yaml
 
@@ -293,10 +295,9 @@ async def get_git_repo_packages(git_url: str, commit: str) -> _GitPackagesType:
                         package=cargo_toml,
                         workspace=workspace,
                     )
-        for child in os.scandir(root_dir):
-            if child.is_dir():
-                # the workspace can be referenced by any subdirectory
-                get_cargo_toml_packages(child.path, workspace)
+        for child_dir in child_manifest_directories(root_dir):
+            # the workspace can be referenced by any real worktree subdirectory
+            get_cargo_toml_packages(child_dir, workspace)
 
     with workdir(git_repo_dir):
         get_cargo_toml_packages(".")
