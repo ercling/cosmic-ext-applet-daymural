@@ -115,9 +115,23 @@ just flatpak-uninstall
 ```
 
 `just flatpak-build` is also available when an online build is preferable.
-`appstreamcli validate data/io.github.ercling.CosmicBingWallpaper.metainfo.xml`
-validates the AppStream metadata (the developer metadata currently has no
-screenshot, so that warning is expected).
+`appstreamcli validate --no-net
+data/io.github.ercling.CosmicBingWallpaper.metainfo.xml` validates the
+AppStream metadata without probing the not-yet-published project homepage.
+Run the network-enabled form before Store submission, once that homepage is
+public. The developer metadata currently has no screenshot; adding and hosting
+one remains part of the external publication work.
+
+Repository acceptance on 2026-08-21 passed all 374 native checks, regenerated
+Cargo sources covering all 713 sourced `Cargo.lock` packages, prefetched every
+manifest input, and completed a force-clean Flatpak build with downloads
+disabled. The resulting build contains the desktop entry, AppStream metadata,
+symbolic icon, executable `/app/bin/cosmic-bing-wallpaper`, and the documented
+scoped permissions. `flatpak build-export` preserves the desktop entry's bare
+`Exec=cosmic-bing-wallpaper`; that name matches both the manifest command and
+the `/app/bin` executable. Interactive COSMIC-session checks were not performed
+by this automated acceptance pass and remain release checks before external
+Store publication.
 
 The sandbox permissions are deliberately narrow:
 

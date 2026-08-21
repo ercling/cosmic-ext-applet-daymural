@@ -28,8 +28,9 @@
   declarative files and pin hand-written identity values. The source desktop entry currently
   names `/usr/bin/cosmic-bing-wallpaper`; the manifest installs that file verbatim into
   `/app/share/applications`, where that path does not exist (the binary is `/app/bin/…`), so it
-  must become the bare command. (`flatpak build-export` derives `--command=` from the
-  basename, so export itself is not the reason.) Native `just install` keeps rewriting its
+  must become the bare command. `flatpak build-export` preserves that bare command in its export
+  tree; the manifest command and `/app/bin` destination provide the matching launch target.
+  Native `just install` keeps rewriting its
   installed copy with `sed 's|^Exec=.*|Exec={{bin-dst}}|'`, which matches either form; no
   existing test asserts an absolute source `Exec`.
 - **Reference:** `~/workspace/cosmic-applet-awake` provides the local manifest, vendoring,
@@ -123,10 +124,10 @@ The root manifest `io.github.ercling.CosmicBingWallpaper.json` will use:
 - a local directory source excluding `.git`, `target`, `examples`, `.flatpak-builder`, and
   `build-dir`, plus generated `cargo-sources.json`.
 
-The source desktop entry will use `Exec=cosmic-bing-wallpaper` (see Context for why). Flatpak
-export rewrites it to `flatpak run --command=cosmic-bing-wallpaper ...`, resolving the
-manifest's `/app/bin/cosmic-bing-wallpaper`; native `just install` retains its existing `sed`
-rewrite to the selected native installation path. Tests pin all four names together.
+The source desktop entry will use `Exec=cosmic-bing-wallpaper` (see Context for why). The
+Flatpak build export preserves that bare command; it matches the manifest command and resolves
+to `/app/bin/cosmic-bing-wallpaper` in the sandbox. Native `just install` retains its existing
+`sed` rewrite to the selected native installation path. Tests pin all four names together.
 
 The exact sandbox contract is:
 
@@ -359,15 +360,28 @@ Post-Completion; that warning is accepted.
 - Move after Tasks 0-6 and all repository acceptance checks are complete:
   `docs/plans/20260820-flatpak-distribution.md` to `docs/plans/completed/`
 
-- [ ] run `just check`, `appstreamcli validate`, regenerate `cargo-sources.json`, the
+- [x] run `just check`, `appstreamcli validate`, regenerate `cargo-sources.json`, the
       `Cargo.lock` coverage check, source prefetch, and a force-clean `--disable-download` build
-- [ ] inspect exported desktop, metainfo, icon, command, and permissions; confirm the rewritten
-      desktop entry runs the manifest command installed under `/app/bin`
-- [ ] verify every Overview requirement; record verified compatibility requirements, intentional
-      channel differences, and any deviation in this plan and README
-- [ ] confirm the native installation instructions and behavior remain accurate
-- [ ] move the plan to `docs/plans/completed/`; external publication remains explicitly tracked
+- [x] inspect exported desktop, metainfo, icon, command, and permissions; confirm the exported
+      desktop entry's bare command matches the manifest command installed under `/app/bin`
+- [x] verify every Overview requirement; record verified compatibility requirements, intentional
+      channel differences, and any deviation in this plan and README (live COSMIC parity skipped -
+      not automatable; not observed by this acceptance pass)
+- [x] confirm the native installation instructions and behavior remain accurate
+- [x] move the plan to `docs/plans/completed/`; external publication remains explicitly tracked
       below and does not make repository implementation status ambiguous
+
+Task 7 repository acceptance (2026-08-21): `just check` passed 374 tests; AppStream structural
+validation passed with `--no-net` (the network-enabled homepage probe returns
+`url-not-reachable` until the external repository is public); regenerated Flatpak sources covered
+all 713 sourced lockfile packages; source prefetch and a force-clean `--disable-download` build
+passed. The built `/app` tree and export contain the executable, desktop entry, AppStream metadata,
+symbolic icon, and exact scoped permissions. Contrary to the earlier design note, measured
+`flatpak build-export` output preserves `Exec=cosmic-bing-wallpaper` instead of rewriting it; the
+name is nevertheless identical to the manifest command and `/app/bin` executable. A staged native
+install under `/tmp` confirmed the documented binary, desktop, icon, and absolute installed `Exec`
+rewrite. Native and Flatpak state-layout differences remain intentional and documented. Task 6's
+live COSMIC checks remain explicitly skipped and were not treated as observed acceptance.
 
 ## Post-Completion
 
