@@ -285,16 +285,16 @@ Post-Completion; that warning is accepted.
 - Create: `.github/workflows/flatpak.yml`
 - Modify: `src/app.rs`
 
-- [ ] add Rust formatting, Clippy-with-warnings-denied, and hermetic test jobs with required
+- [x] add Rust formatting, Clippy-with-warnings-denied, and hermetic test jobs with required
       Wayland/xkbcommon and D-Bus packages (no `uv`, no generated sources — `cargo test` must
       not need them)
-- [ ] add a Freedesktop 25.08 Flatpak job that installs `uv`, generates Cargo sources, runs the
+- [x] add a Freedesktop 25.08 Flatpak job that installs `uv`, generates Cargo sources, runs the
       `Cargo.lock` coverage check, builds the manifest, and emits a
       `cosmic-bing-wallpaper.flatpak` artifact
-- [ ] add success tests (comment-stripped text scan) pinning workflow manifest, generator,
+- [x] add success tests (comment-stripped text scan) pinning workflow manifest, generator,
       runtime image, bundle name, and equivalent Rust check commands
-- [ ] add negative assertions against runtime-version drift and omitted source generation
-- [ ] scan both workflows and run `just check`; both must pass before Task 5
+- [x] add negative assertions against runtime-version drift and omitted source generation
+- [x] scan both workflows and run `just check`; both must pass before Task 5
 
 ### Task 5: Document the distribution and compatibility contract
 

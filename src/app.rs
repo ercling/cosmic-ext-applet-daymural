@@ -5609,6 +5609,8 @@ mod tests {
     const JUSTFILE: &str = include_str!("../justfile");
     const CARGO_SOURCES_SCRIPT: &str = include_str!("../flatpak/generate-cargo-sources.sh");
     const CARGO_GENERATOR: &str = include_str!("../flatpak/flatpak-cargo-generator.py");
+    const RUST_WORKFLOW: &str = include_str!("../.github/workflows/rust.yml");
+    const FLATPAK_WORKFLOW: &str = include_str!("../.github/workflows/flatpak.yml");
 
     fn keyed_value<'a>(text: &'a str, key: &str, separator: &str) -> Option<&'a str> {
         text.lines()
@@ -6240,6 +6242,109 @@ mod tests {
         assert!(
             stderr.contains("install it"),
             "missing install hint: {stderr}"
+        );
+    }
+
+    fn validate_ci_workflows(
+        rust_workflow: &str,
+        flatpak_workflow: &str,
+        manifest_text: &str,
+        justfile: &str,
+    ) -> Result<(), String> {
+        let rust = sans_comments(rust_workflow);
+        let flatpak = sans_comments(flatpak_workflow);
+        let manifest: serde_json::Value =
+            serde_json::from_str(manifest_text).map_err(|error| error.to_string())?;
+        let require = |condition: bool, message: &str| {
+            condition.then_some(()).ok_or_else(|| message.to_owned())
+        };
+
+        for command in just_recipe(justfile, "check")
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            require(
+                rust.contains(command),
+                &format!("rust.yml must run the `just check` command `{command}`"),
+            )?;
+        }
+        for package in ["dbus", "libwayland-dev", "libxkbcommon-dev", "pkg-config"] {
+            require(
+                rust.contains(package),
+                &format!("rust.yml missing build/test package `{package}`"),
+            )?;
+        }
+        require(
+            rust.contains("dbus-run-session -- cargo test"),
+            "rust.yml tests must use a hermetic session bus",
+        )?;
+        require(
+            !rust.contains("cargo-sources.json")
+                && !rust
+                    .lines()
+                    .any(|line| line.split_whitespace().any(|word| word == "uv")),
+            "Rust checks must not depend on Flatpak vendoring",
+        )?;
+
+        for (name, workflow) in [
+            ("rust.yml", rust.as_str()),
+            ("flatpak.yml", flatpak.as_str()),
+        ] {
+            for trigger in ["push:", "pull_request:"] {
+                require(
+                    workflow.contains(trigger),
+                    &format!("{name} missing `{trigger}` trigger"),
+                )?;
+            }
+        }
+
+        let runtime_version = manifest["runtime-version"]
+            .as_str()
+            .ok_or_else(|| "manifest runtime-version".to_owned())?;
+        for required in [
+            &format!(
+                "image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-{runtime_version}"
+            ),
+            &format!("manifest-path: {APP_ID}.json"),
+            "flatpak/generate-cargo-sources.sh",
+            "Cargo.lock",
+            "cargo-sources.json",
+            "Install uv",
+            "flatpak/flatpak-github-actions/flatpak-builder@v6",
+            &format!("bundle: {}.flatpak", env!("CARGO_PKG_NAME")),
+        ] {
+            require(
+                flatpak.contains(required),
+                &format!("flatpak.yml missing `{required}`"),
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ci_workflows_match_the_manifest_vendoring_and_rust_check_contracts() {
+        validate_ci_workflows(RUST_WORKFLOW, FLATPAK_WORKFLOW, FLATPAK_MANIFEST, JUSTFILE)
+            .expect("the CI workflows must stay aligned with checked-in packaging and checks");
+    }
+
+    #[test]
+    fn ci_workflow_checks_reject_runtime_and_source_generation_drift() {
+        let wrong_runtime = FLATPAK_WORKFLOW.replace("freedesktop-25.08", "freedesktop-24.08");
+        assert!(
+            validate_ci_workflows(RUST_WORKFLOW, &wrong_runtime, FLATPAK_MANIFEST, JUSTFILE)
+                .is_err(),
+            "a builder image on a different runtime unexpectedly passed"
+        );
+
+        let no_generation = FLATPAK_WORKFLOW.replace(
+            "run: flatpak/generate-cargo-sources.sh",
+            "# run: flatpak/generate-cargo-sources.sh",
+        );
+        assert!(
+            validate_ci_workflows(RUST_WORKFLOW, &no_generation, FLATPAK_MANIFEST, JUSTFILE)
+                .is_err(),
+            "a commented-out source generation step unexpectedly passed"
         );
     }
 

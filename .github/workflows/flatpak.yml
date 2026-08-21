@@ -1,0 +1,82 @@
+name: Flatpak
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  flatpak:
+    runs-on: ubuntu-latest
+    container:
+      # Keep this tag aligned with the manifest's Freedesktop runtime version.
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Generate cargo-sources.json
+        run: flatpak/generate-cargo-sources.sh
+
+      - name: Check Cargo.lock source coverage
+        run: |
+          python3 - <<'PY'
+          import json
+          import tomllib
+          from urllib.parse import urlsplit, urlunsplit
+
+          def canonical_git(url):
+              parsed = urlsplit(url)
+              scheme = "https" if parsed.netloc == "github.com" else parsed.scheme
+              path = parsed.path.rstrip("/")
+              if parsed.netloc == "github.com":
+                  path = path.lower()
+              if path.endswith(".git"):
+                  path = path[:-4]
+              return urlunsplit((scheme, parsed.netloc, path, "", ""))
+
+          with open("Cargo.lock", "rb") as handle:
+              packages = tomllib.load(handle)["package"]
+          with open("cargo-sources.json", encoding="utf-8") as handle:
+              generated = json.load(handle)
+
+          archives = {entry.get("url") for entry in generated if entry.get("type") == "archive"}
+          git_sources = {
+              (entry.get("url"), entry.get("commit"))
+              for entry in generated
+              if entry.get("type") == "git"
+          }
+          missing = []
+          for package in packages:
+              source = package.get("source", "")
+              if source.startswith("registry+"):
+                  name = package["name"]
+                  version = package["version"]
+                  expected = f"https://static.crates.io/crates/{name}/{name}-{version}.crate"
+                  if expected not in archives:
+                      missing.append(f"{name} {version} ({source})")
+              elif source.startswith("git+"):
+                  repository, commit = source.removeprefix("git+").rsplit("#", 1)
+                  repository = canonical_git(repository)
+                  if (repository, commit) not in git_sources:
+                      missing.append(source)
+
+          if missing:
+              raise SystemExit("cargo-sources.json misses Cargo.lock entries:\n" + "\n".join(missing))
+          print(f"covered {sum('source' in package for package in packages)} Cargo.lock packages")
+          PY
+
+      - name: Build and bundle the Flatpak
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          manifest-path: io.github.ercling.CosmicBingWallpaper.json
+          bundle: cosmic-bing-wallpaper.flatpak
