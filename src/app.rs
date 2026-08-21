@@ -6240,8 +6240,11 @@ mod tests {
         assert!(
             CARGO_GENERATOR.contains("aiohttp==3.12.15")
                 && CARGO_GENERATOR.contains("tomlkit==0.13.3")
-                && !CARGO_GENERATOR.contains("PyYAML"),
-            "required generator dependencies must be exact and omit unused YAML support"
+                && !CARGO_GENERATOR.contains("PyYAML")
+                && !CARGO_GENERATOR.contains("import yaml")
+                && !CARGO_GENERATOR.contains("--yaml")
+                && !CARGO_GENERATOR.contains("YAML_AVAIL"),
+            "the generator must remain JSON-only with exact required dependencies"
         );
         assert!(
             CARGO_GENERATOR_LOCK.contains("name = \"aiohttp\"")
