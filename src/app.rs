@@ -5605,6 +5605,7 @@ mod tests {
     const DESKTOP: &str = include_str!("../data/io.github.ercling.CosmicBingWallpaper.desktop");
     const METAINFO: &str =
         include_str!("../data/io.github.ercling.CosmicBingWallpaper.metainfo.xml");
+    const FLATPAK_MANIFEST: &str = include_str!("../io.github.ercling.CosmicBingWallpaper.json");
     const JUSTFILE: &str = include_str!("../justfile");
 
     fn desktop_value<'a>(desktop: &'a str, key: &str) -> Option<&'a str> {
@@ -5730,6 +5731,296 @@ mod tests {
             metainfo.contains("<content_rating type=\"oars-1.1\"/>"),
             "metainfo must carry an OARS 1.1 rating",
         )
+    }
+
+    fn validate_flatpak_manifest(manifest_text: &str, desktop: &str) -> Result<(), String> {
+        let manifest: serde_json::Value =
+            serde_json::from_str(manifest_text).map_err(|error| error.to_string())?;
+        let binary = env!("CARGO_PKG_NAME");
+        let require = |condition: bool, message: &str| {
+            condition.then_some(()).ok_or_else(|| message.to_owned())
+        };
+
+        require(manifest["id"].as_str() == Some(APP_ID), "manifest id")?;
+        require(
+            manifest["runtime"].as_str() == Some("org.freedesktop.Platform")
+                && manifest["runtime-version"].as_str() == Some("25.08")
+                && manifest["sdk"].as_str() == Some("org.freedesktop.Sdk"),
+            "Freedesktop 25.08 runtime and SDK",
+        )?;
+        require(
+            manifest["sdk-extensions"]
+                .as_array()
+                .is_some_and(|extensions| {
+                    extensions.iter().any(|extension| {
+                        extension.as_str() == Some("org.freedesktop.Sdk.Extension.rust-stable")
+                    })
+                }),
+            "Rust SDK extension",
+        )?;
+        let command = manifest["command"]
+            .as_str()
+            .ok_or_else(|| "manifest command".to_owned())?;
+        require(command == binary, "manifest command")?;
+        require(
+            desktop_value(desktop, "Exec") == Some(command),
+            "desktop Exec must match the manifest command",
+        )?;
+
+        let modules = manifest["modules"]
+            .as_array()
+            .ok_or_else(|| "modules array".to_owned())?;
+        require(modules.len() == 1, "exactly one module")?;
+        let module = &modules[0];
+        require(module["name"].as_str() == Some(binary), "module name")?;
+        require(
+            module["buildsystem"].as_str() == Some("simple"),
+            "simple buildsystem",
+        )?;
+        require(
+            manifest["build-options"]["append-path"].as_str()
+                == Some("/usr/lib/sdk/rust-stable/bin"),
+            "Rust SDK path",
+        )?;
+        require(
+            manifest["build-options"]["env"]["CARGO_HOME"].as_str()
+                == Some(&format!("/run/build/{binary}/cargo")),
+            "CARGO_HOME must align with the module name",
+        )?;
+
+        let commands: Vec<&str> = module["build-commands"]
+            .as_array()
+            .ok_or_else(|| "build-commands array".to_owned())?
+            .iter()
+            .map(|command| {
+                command
+                    .as_str()
+                    .ok_or_else(|| "string build command".to_owned())
+            })
+            .collect::<Result<_, _>>()?;
+        for required in [
+            "cargo --offline fetch --manifest-path Cargo.toml",
+            "cargo --offline build --release",
+            &format!("target/release/{binary} /app/bin/{command}"),
+            &format!("data/{APP_ID}.desktop /app/share/applications/{APP_ID}.desktop"),
+            &format!("data/{APP_ID}.metainfo.xml /app/share/metainfo/{APP_ID}.metainfo.xml"),
+            &format!(
+                "data/icons/{APP_ID}-symbolic.svg /app/share/icons/hicolor/scalable/apps/{APP_ID}-symbolic.svg"
+            ),
+        ] {
+            require(
+                commands
+                    .iter()
+                    .any(|candidate| candidate.contains(required)),
+                &format!("missing build command fragment: {required}"),
+            )?;
+        }
+
+        let sources = module["sources"]
+            .as_array()
+            .ok_or_else(|| "sources array".to_owned())?;
+        require(
+            sources
+                .iter()
+                .any(|source| source.as_str() == Some("cargo-sources.json")),
+            "cargo-sources.json source",
+        )?;
+        let directory = sources
+            .iter()
+            .find(|source| source["type"].as_str() == Some("dir"))
+            .ok_or_else(|| "local directory source".to_owned())?;
+        require(
+            directory["path"].as_str() == Some("./"),
+            "local source path",
+        )?;
+        let skip: Vec<&str> = directory["skip"]
+            .as_array()
+            .ok_or_else(|| "directory skip list".to_owned())?
+            .iter()
+            .map(|entry| entry.as_str().ok_or_else(|| "string skip entry".to_owned()))
+            .collect::<Result<_, _>>()?;
+        for required in [
+            ".git",
+            "target",
+            "examples",
+            ".flatpak-builder",
+            "build-dir",
+        ] {
+            require(
+                skip.contains(&required),
+                &format!("skip list entry: {required}"),
+            )?;
+        }
+
+        let finish_args: Vec<&str> = manifest["finish-args"]
+            .as_array()
+            .ok_or_else(|| "finish-args array".to_owned())?
+            .iter()
+            .map(|arg| arg.as_str().ok_or_else(|| "string finish-arg".to_owned()))
+            .collect::<Result<_, _>>()?;
+        for required in [
+            "--socket=wayland",
+            "--device=dri",
+            "--share=network",
+            "--filesystem=~/Pictures/BingWallpaper:create",
+            "--filesystem=xdg-config/cosmic:rw",
+            "--filesystem=~/.local/state/cosmic:create",
+            "--talk-name=com.system76.CosmicSettingsDaemon",
+            "--talk-name=com.system76.CosmicSettingsDaemon.*",
+            "--system-talk-name=org.freedesktop.login1",
+        ] {
+            require(
+                finish_args.contains(&required),
+                &format!("missing finish-arg: {required}"),
+            )?;
+        }
+        require(
+            !finish_args.contains(&"--filesystem=~/.local/state/cosmic:rw"),
+            "COSMIC state directory must use :create, not :rw",
+        )?;
+        require(
+            !finish_args.iter().any(|arg| {
+                matches!(*arg, "--filesystem=home" | "--filesystem=host")
+                    || arg.starts_with("--filesystem=home:")
+                    || arg.starts_with("--filesystem=host:")
+            }),
+            "broad filesystem grant",
+        )?;
+        require(
+            !finish_args.iter().any(|arg| {
+                matches!(
+                    *arg,
+                    "--socket=x11"
+                        | "--socket=fallback-x11"
+                        | "--socket=session-bus"
+                        | "--socket=system-bus"
+                )
+            }),
+            "broad socket grant",
+        )?;
+        require(
+            !finish_args.iter().any(|arg| arg.starts_with("--persist")),
+            "persistence grant",
+        )
+    }
+
+    #[test]
+    fn flatpak_manifest_is_valid_and_resolves_every_exported_name() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert_eq!(
+            FLATPAK_MANIFEST,
+            std::fs::read_to_string(root.join(format!("{APP_ID}.json")))
+                .expect("the repository root ships a manifest named for APP_ID")
+        );
+        validate_flatpak_manifest(FLATPAK_MANIFEST, DESKTOP)
+            .expect("the developer manifest must preserve the Flatpak contract");
+
+        for shipped in [
+            format!("data/{APP_ID}.desktop"),
+            format!("data/{APP_ID}.metainfo.xml"),
+            format!("data/icons/{APP_ID}-symbolic.svg"),
+        ] {
+            assert!(
+                root.join(&shipped).is_file(),
+                "manifest install source `{shipped}` must exist"
+            );
+        }
+    }
+
+    #[test]
+    fn flatpak_manifest_rejects_missing_or_broadened_sandbox_permissions() {
+        let valid: serde_json::Value =
+            serde_json::from_str(FLATPAK_MANIFEST).expect("checked-in manifest is JSON");
+        let required = valid["finish-args"]
+            .as_array()
+            .expect("checked-in manifest has finish-args");
+        for omitted in required {
+            let mut changed = valid.clone();
+            changed["finish-args"] = serde_json::Value::Array(
+                required
+                    .iter()
+                    .filter(|arg| *arg != omitted)
+                    .cloned()
+                    .collect(),
+            );
+            assert!(
+                validate_flatpak_manifest(&changed.to_string(), DESKTOP).is_err(),
+                "missing functional permission `{omitted}` unexpectedly passed"
+            );
+        }
+
+        let state_create = "--filesystem=~/.local/state/cosmic:create";
+        let mut wrong_state_mode = valid.clone();
+        wrong_state_mode["finish-args"] = serde_json::Value::Array(
+            required
+                .iter()
+                .map(|arg| {
+                    if arg.as_str() == Some(state_create) {
+                        serde_json::Value::String(
+                            "--filesystem=~/.local/state/cosmic:rw".to_owned(),
+                        )
+                    } else {
+                        arg.clone()
+                    }
+                })
+                .collect(),
+        );
+        assert!(
+            validate_flatpak_manifest(&wrong_state_mode.to_string(), DESKTOP).is_err(),
+            "`:rw` must not replace the state directory's `:create` grant"
+        );
+
+        for forbidden in [
+            "--filesystem=home",
+            "--filesystem=host:ro",
+            "--socket=x11",
+            "--socket=fallback-x11",
+            "--socket=session-bus",
+            "--socket=system-bus",
+            "--persist=.",
+        ] {
+            let mut broadened = valid.clone();
+            broadened["finish-args"]
+                .as_array_mut()
+                .expect("checked-in manifest has finish-args")
+                .push(serde_json::Value::String(forbidden.to_owned()));
+            assert!(
+                validate_flatpak_manifest(&broadened.to_string(), DESKTOP).is_err(),
+                "forbidden finish-arg `{forbidden}` unexpectedly passed"
+            );
+        }
+    }
+
+    #[test]
+    fn flatpak_manifest_rejects_commands_that_cannot_resolve_in_app_bin() {
+        let mut wrong_install: serde_json::Value =
+            serde_json::from_str(FLATPAK_MANIFEST).expect("checked-in manifest is JSON");
+        let commands = wrong_install["modules"][0]["build-commands"]
+            .as_array_mut()
+            .expect("checked-in manifest has build commands");
+        for command in commands {
+            if let Some(text) = command.as_str()
+                && text.contains("/app/bin/cosmic-bing-wallpaper")
+            {
+                *command = serde_json::Value::String(
+                    text.replace("/app/bin/cosmic-bing-wallpaper", "/app/bin/wrong-binary"),
+                );
+            }
+        }
+        assert!(
+            validate_flatpak_manifest(&wrong_install.to_string(), DESKTOP).is_err(),
+            "a command without a matching /app/bin install unexpectedly passed"
+        );
+
+        let wrong_desktop = DESKTOP.replace("Exec=cosmic-bing-wallpaper", "Exec=another-binary");
+        assert!(
+            validate_flatpak_manifest(FLATPAK_MANIFEST, &wrong_desktop).is_err(),
+            "an exported desktop command that differs from the manifest unexpectedly passed"
+        );
+        assert!(
+            validate_flatpak_manifest("{not json", DESKTOP).is_err(),
+            "invalid JSON unexpectedly passed"
+        );
     }
 
     #[test]

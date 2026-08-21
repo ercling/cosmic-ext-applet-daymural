@@ -239,16 +239,16 @@ Post-Completion; that warning is accepted.
 - Create: `io.github.ercling.CosmicBingWallpaper.json`
 - Modify: `src/app.rs`
 
-- [ ] add the Freedesktop 25.08/Rust SDK manifest, offline build, explicit install commands,
+- [x] add the Freedesktop 25.08/Rust SDK manifest, offline build, explicit install commands,
       local directory source, skip list, and `cargo-sources.json` input
-- [ ] add the exact scoped permissions defined in Technical Details (state dir `:create`)
-- [ ] add success tests for valid JSON, runtime/module/Cargo-home alignment, source/install paths,
+- [x] add the exact scoped permissions defined in Technical Details (state dir `:create`)
+- [x] add success tests for valid JSON, runtime/module/Cargo-home alignment, source/install paths,
       exported names, and every required capability; tie desktop `Exec`, manifest `command`,
       module name, and `/app/bin` destination together
-- [ ] add negative tests (scoped to `finish-args`) rejecting missing functional permissions,
+- [x] add negative tests (scoped to `finish-args`) rejecting missing functional permissions,
       `:rw` on the state dir, broad filesystem, D-Bus, X11, persistence grants, or an exported
       desktop command that cannot resolve in `/app/bin`
-- [ ] run focused manifest tests, a Flatpak metadata parse, and inspect the exported desktop
+- [x] run focused manifest tests, a Flatpak metadata parse, and inspect the exported desktop
       command; all must pass before Task 3
 
 ### Task 3: Add reproducible vendoring and local Flatpak recipes
