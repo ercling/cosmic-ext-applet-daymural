@@ -2,9 +2,8 @@
 # /// script
 # requires-python = ">=3.9"
 # dependencies = [
-#    "aiohttp<4.0.0,>=3.9.5",
-#    "PyYAML<7.0.0,>=6.0.2",
-#    "tomlkit>=0.13.3,<1.0"
+#    "aiohttp==3.12.15",
+#    "tomlkit==0.13.3"
 # ]
 # ///
 
@@ -12,7 +11,7 @@
 #   repo:   https://github.com/flatpak/flatpak-builder-tools
 #   path:   cargo/flatpak-cargo-generator.py
 #   commit: f03a673abe6ce189cea1c2857e2b44af2dd79d1f
-# Run it via flatpak/generate-cargo-sources.sh (uv resolves the PEP-723 deps above).
+# Run it via flatpak/generate-cargo-sources.sh (uv uses the adjacent lockfile).
 
 __license__ = "MIT"
 import argparse

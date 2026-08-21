@@ -29,8 +29,8 @@
             "name": "cosmic-bing-wallpaper",
             "buildsystem": "simple",
             "build-commands": [
-                "cargo --offline fetch --manifest-path Cargo.toml --verbose",
-                "cargo --offline build --release --verbose",
+                "cargo --offline fetch --locked --manifest-path Cargo.toml --verbose",
+                "cargo --offline build --release --locked --verbose",
                 "install -Dm755 target/release/cosmic-bing-wallpaper /app/bin/cosmic-bing-wallpaper",
                 "install -Dm644 data/io.github.ercling.CosmicBingWallpaper.desktop /app/share/applications/io.github.ercling.CosmicBingWallpaper.desktop",
                 "install -Dm644 data/io.github.ercling.CosmicBingWallpaper.metainfo.xml /app/share/metainfo/io.github.ercling.CosmicBingWallpaper.metainfo.xml",

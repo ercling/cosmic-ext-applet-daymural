@@ -120,7 +120,7 @@ The root manifest `io.github.ercling.CosmicBingWallpaper.json` will use:
   `sdk: org.freedesktop.Sdk`, and `org.freedesktop.Sdk.Extension.rust-stable`;
 - `command` and module name `cosmic-bing-wallpaper`;
 - `CARGO_HOME=/run/build/cosmic-bing-wallpaper/cargo`;
-- offline Cargo fetch/build commands and explicit `/app` install destinations;
+- offline, lockfile-enforced Cargo fetch/build commands and explicit `/app` install destinations;
 - a local directory source excluding `.git`, `target`, `examples`, `.flatpak-builder`, and
   `build-dir`, plus generated `cargo-sources.json`.
 
@@ -257,13 +257,14 @@ Post-Completion; that warning is accepted.
 **Files:**
 
 - Create: `flatpak/flatpak-cargo-generator.py`
+- Create: `flatpak/flatpak-cargo-generator.py.lock`
 - Create: `flatpak/generate-cargo-sources.sh`
 - Modify: `.gitignore`
 - Modify: `justfile`
 - Modify: `src/app.rs`
 
-- [x] vendor the generator at a documented upstream commit and add the `uv` wrapper that turns
-      committed `Cargo.lock` into gitignored `cargo-sources.json`
+- [x] vendor the generator at a documented upstream commit and add the locked `uv` wrapper that
+      turns committed `Cargo.lock` into gitignored `cargo-sources.json`
 - [x] add `flatpak-sources`, `flatpak-build`, `flatpak-install`, and `flatpak-uninstall` without
       changing native recipes, sharing one `flatpak-builder-cmd` variable so they cannot drift;
       also add a source-prefetch recipe and a `flatpak-build-offline` recipe that passes
@@ -325,32 +326,32 @@ Post-Completion; that warning is accepted.
 - Modify as needed: `README.md`
 - Modify as needed: `docs/plans/20260820-flatpak-distribution.md`
 
-- [x] precondition: native copy uninstalled (`just uninstall`); Flatpak is the only install
-      (skipped - not automatable)
-- [x] install the built Flatpak intentionally in a live COSMIC session; confirm Panel discovers
+- [ ] precondition: native copy uninstalled (`just uninstall`); Flatpak is the only install
+      (not yet run; requires an intentional live COSMIC acceptance session)
+- [ ] install the built Flatpak intentionally in a live COSMIC session; confirm Panel discovers
       it and the exported desktop command starts `/app/bin/cosmic-bing-wallpaper`
-      (skipped - not automatable)
-- [x] confirm the panel button, prev/next/newest/refresh, and empty-catalogue placeholder icons
+      (not yet run)
+- [ ] confirm the panel button, prev/next/newest/refresh, and empty-catalogue placeholder icons
       all render (host passthrough); if not, apply the bundling contingency
-      (skipped - not automatable)
-- [x] verify Bing refresh, exact-directory downloads, thumbnails, browsing, shuffle, retention,
-      cosmic-bg application, and both `xdg-open` actions (skipped - not automatable)
-- [x] change system light/dark mode and accent while the popup is open; verify all popup controls,
-      dropdowns, and tooltips follow COSMIC colors without restart (skipped - not automatable)
-- [x] enable accent matching and verify both theme modes update; verify disable restores the
+      (not yet run)
+- [ ] verify Bing refresh, exact-directory downloads, thumbnails, browsing, shuffle, retention,
+      cosmic-bg application, and both `xdg-open` actions (not yet run)
+- [ ] change system light/dark mode and accent while the popup is open; verify all popup controls,
+      dropdowns, and tooltips follow COSMIC colors without restart (not yet run)
+- [ ] enable accent matching and verify both theme modes update; verify disable restores the
       snapshot and an external accent change disarms without being overwritten
-      (skipped - not automatable)
-- [x] with `RUST_LOG=cosmic_bing_wallpaper=debug`: confirm `resolved_via` is the
+      (not yet run)
+- [ ] with `RUST_LOG=cosmic_bing_wallpaper=debug`: confirm `resolved_via` is the
       `XDG_SESSION_ID` path, login1 lock and resume signals cross `xdg-dbus-proxy`, and the
       cosmic-bg state poke lands as a **changed value**; greeter healing is best-effort here
       (GDM is this machine's DM); treat a missing poke as release-blocking
-      (skipped - not automatable)
-- [x] audit `flatpak info --show-permissions`, `flatpak run --log-session-bus`, filesystem access,
+      (not yet run)
+- [ ] audit `flatpak info --show-permissions`, `flatpak run --log-session-bus`, filesystem access,
       and `flatpak run --log-system-bus`; reject denied required calls or unexpected services,
       reading flatpak's auto-added read-only filesystems as expected
-      (skipped - not automatable)
-- [x] record results and any verified channel differences; every live gate must pass before
-      Task 7 (skipped - not automatable)
+      (not yet run)
+- [ ] record results and any verified channel differences; every live gate must pass before
+      Task 7
 
 ### Task 7: Final acceptance and plan state
 
@@ -364,11 +365,11 @@ Post-Completion; that warning is accepted.
       `Cargo.lock` coverage check, source prefetch, and a force-clean `--disable-download` build
 - [x] inspect exported desktop, metainfo, icon, command, and permissions; confirm the exported
       desktop entry's bare command matches the manifest command installed under `/app/bin`
-- [x] verify every Overview requirement; record verified compatibility requirements, intentional
-      channel differences, and any deviation in this plan and README (live COSMIC parity skipped -
-      not automatable; not observed by this acceptance pass)
+- [ ] verify every Overview requirement; record verified compatibility requirements, intentional
+      channel differences, and any deviation in this plan and README (blocked on Task 6's live
+      COSMIC parity audit)
 - [x] confirm the native installation instructions and behavior remain accurate
-- [x] move the plan to `docs/plans/completed/`; external publication remains explicitly tracked
+- [ ] move the plan to `docs/plans/completed/`; external publication remains explicitly tracked
       below and does not make repository implementation status ambiguous
 
 Task 7 repository acceptance (2026-08-21): `just check` passed 374 tests; AppStream structural
@@ -380,8 +381,9 @@ symbolic icon, and exact scoped permissions. Contrary to the earlier design note
 `flatpak build-export` output preserves `Exec=cosmic-bing-wallpaper` instead of rewriting it; the
 name is nevertheless identical to the manifest command and `/app/bin` executable. A staged native
 install under `/tmp` confirmed the documented binary, desktop, icon, and absolute installed `Exec`
-rewrite. Native and Flatpak state-layout differences remain intentional and documented. Task 6's
-live COSMIC checks remain explicitly skipped and were not treated as observed acceptance.
+rewrite. Native and Flatpak state-layout differences remain intentional and documented. This is
+repository validation only: Task 6's live COSMIC checks remain unobserved release gates, so the
+plan stays active until they pass.
 
 ## Post-Completion
 

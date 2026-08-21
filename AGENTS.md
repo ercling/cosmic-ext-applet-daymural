@@ -77,8 +77,8 @@ needed.
 - `src/localize.rs`: Fluent loader, project `fl!` macro, locale selection, and
   translation guards.
 - `src/testutil.rs`: test-only HTTP/JPEG and popup-surface helpers.
-- `data/`: desktop entry, app-ID icon, and AppStream metainfo installed by
-  both packaging routes.
+- `data/`: desktop entry and app-ID icon installed by both packaging routes,
+  plus AppStream metainfo installed by Flatpak packaging.
 - `io.github.ercling.CosmicBingWallpaper.json`: developer Flatpak manifest and
   the authoritative scoped sandbox contract.
 - `flatpak/`: pinned Cargo source generator and its `uv` wrapper; generated

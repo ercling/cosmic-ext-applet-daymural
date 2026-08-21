@@ -183,8 +183,11 @@ Everything lives in the panel popup; there is no separate settings window.
 
 Settings persist via `cosmic-config` under the app ID
 `io.github.ercling.CosmicBingWallpaper`. Images live in
-`~/Pictures/BingWallpaper`; the catalogue and cached thumbnails in
-`~/.local/state/io.github.ercling.CosmicBingWallpaper/`.
+`~/Pictures/BingWallpaper`. With a native install, the catalogue and cached
+thumbnails live in `~/.local/state/io.github.ercling.CosmicBingWallpaper/`;
+with Flatpak they live under
+`$XDG_STATE_HOME/io.github.ercling.CosmicBingWallpaper/` (normally
+`~/.var/app/io.github.ercling.CosmicBingWallpaper/.local/state/io.github.ercling.CosmicBingWallpaper/`).
 
 ## Disk usage
 

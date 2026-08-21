@@ -20,9 +20,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install uv
-        run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.12.1"
 
       - name: Generate cargo-sources.json
         run: flatpak/generate-cargo-sources.sh
@@ -74,6 +74,9 @@ jobs:
               raise SystemExit("cargo-sources.json misses Cargo.lock entries:\n" + "\n".join(missing))
           print(f"covered {sum('source' in package for package in packages)} Cargo.lock packages")
           PY
+
+      - name: Validate AppStream metadata
+        run: appstreamcli validate --no-net data/io.github.ercling.CosmicBingWallpaper.metainfo.xml
 
       - name: Build and bundle the Flatpak
         uses: flatpak/flatpak-github-actions/flatpak-builder@v6

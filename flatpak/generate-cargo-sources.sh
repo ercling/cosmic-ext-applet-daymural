@@ -13,4 +13,4 @@ if ! command -v uv >/dev/null 2>&1; then
     exit 1
 fi
 
-exec uv run --script flatpak/flatpak-cargo-generator.py Cargo.lock -o cargo-sources.json
+exec uv run --locked --script flatpak/flatpak-cargo-generator.py Cargo.lock -o cargo-sources.json

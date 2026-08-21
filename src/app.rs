@@ -5609,17 +5609,16 @@ mod tests {
     const JUSTFILE: &str = include_str!("../justfile");
     const CARGO_SOURCES_SCRIPT: &str = include_str!("../flatpak/generate-cargo-sources.sh");
     const CARGO_GENERATOR: &str = include_str!("../flatpak/flatpak-cargo-generator.py");
+    const CARGO_GENERATOR_LOCK: &str = include_str!("../flatpak/flatpak-cargo-generator.py.lock");
     const RUST_WORKFLOW: &str = include_str!("../.github/workflows/rust.yml");
     const FLATPAK_WORKFLOW: &str = include_str!("../.github/workflows/flatpak.yml");
-
-    fn keyed_value<'a>(text: &'a str, key: &str, separator: &str) -> Option<&'a str> {
-        text.lines()
-            .filter(|line| !line.starts_with('#'))
-            .find_map(|line| line.strip_prefix(key)?.trim_start().strip_prefix(separator))
-    }
+    const CARGO_SOURCES_FILENAME: &str = "cargo-sources.json";
 
     fn just_var<'a>(justfile: &'a str, name: &str) -> Option<&'a str> {
-        keyed_value(justfile, name, ":=")?
+        justfile
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .find_map(|line| line.strip_prefix(name)?.trim_start().strip_prefix(":="))?
             .trim()
             .strip_prefix('\'')?
             .strip_suffix('\'')
@@ -5637,11 +5636,41 @@ mod tests {
             .join("\n")
     }
 
+    fn native_install_rewrites_exec(justfile: &str) -> bool {
+        sans_comments(&just_recipe(justfile, "install"))
+            .contains("sed -i 's|^Exec=.*|Exec={{bin-dst}}|' {{desktop-dst}}")
+    }
+
     fn sans_comments(text: &str) -> String {
         text.lines()
             .filter(|line| !line.trim_start().starts_with('#'))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn active_workflow_step_containing(workflow: &str, needle: &str) -> bool {
+        let workflow = sans_comments(workflow);
+        let lines: Vec<&str> = workflow.lines().collect();
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.starts_with("      - "))
+            .any(|(start, _)| {
+                let end = lines[start + 1..]
+                    .iter()
+                    .position(|line| line.starts_with("      - "))
+                    .map_or(lines.len(), |offset| start + 1 + offset);
+                let step = &lines[start..end];
+                let disabled = step.iter().any(|line| {
+                    line.trim().strip_prefix("if:").is_some_and(|condition| {
+                        matches!(
+                            condition.trim().trim_matches(['\'', '"']),
+                            "false" | "${{ false }}"
+                        )
+                    })
+                });
+                !disabled && step.iter().any(|line| line.contains(needle))
+            })
     }
 
     fn desktop_value<'a>(desktop: &'a str, key: &str) -> Option<&'a str> {
@@ -5769,7 +5798,10 @@ mod tests {
         )
     }
 
-    fn validate_flatpak_manifest(manifest_text: &str, desktop: &str) -> Result<(), String> {
+    fn validate_flatpak_manifest(
+        manifest_text: &str,
+        desktop: &str,
+    ) -> Result<serde_json::Value, String> {
         let manifest: serde_json::Value =
             serde_json::from_str(manifest_text).map_err(|error| error.to_string())?;
         let binary = env!("CARGO_PKG_NAME");
@@ -5834,23 +5866,28 @@ mod tests {
                     .ok_or_else(|| "string build command".to_owned())
             })
             .collect::<Result<_, _>>()?;
-        for required in [
-            "cargo --offline fetch --manifest-path Cargo.toml",
-            "cargo --offline build --release",
-            &format!("target/release/{binary} /app/bin/{command}"),
-            &format!("data/{APP_ID}.desktop /app/share/applications/{APP_ID}.desktop"),
-            &format!("data/{APP_ID}.metainfo.xml /app/share/metainfo/{APP_ID}.metainfo.xml"),
-            &format!(
-                "data/icons/{APP_ID}-symbolic.svg /app/share/icons/hicolor/scalable/apps/{APP_ID}-symbolic.svg"
+        let expected_commands = [
+            "cargo --offline fetch --locked --manifest-path Cargo.toml --verbose".to_owned(),
+            "cargo --offline build --release --locked --verbose".to_owned(),
+            format!("install -Dm755 target/release/{binary} /app/bin/{command}"),
+            format!(
+                "install -Dm644 data/{APP_ID}.desktop /app/share/applications/{APP_ID}.desktop"
             ),
-        ] {
-            require(
-                commands
+            format!(
+                "install -Dm644 data/{APP_ID}.metainfo.xml /app/share/metainfo/{APP_ID}.metainfo.xml"
+            ),
+            format!(
+                "install -Dm644 data/icons/{APP_ID}-symbolic.svg /app/share/icons/hicolor/scalable/apps/{APP_ID}-symbolic.svg"
+            ),
+        ];
+        require(
+            commands.len() == expected_commands.len()
+                && commands
                     .iter()
-                    .any(|candidate| candidate.contains(required)),
-                &format!("missing build command fragment: {required}"),
-            )?;
-        }
+                    .zip(&expected_commands)
+                    .all(|(actual, expected)| *actual == expected),
+            "build commands must exactly fetch/build the lockfile and install the required output tree",
+        )?;
 
         let sources = module["sources"]
             .as_array()
@@ -5858,8 +5895,8 @@ mod tests {
         require(
             sources
                 .iter()
-                .any(|source| source.as_str() == Some("cargo-sources.json")),
-            "cargo-sources.json source",
+                .any(|source| source.as_str() == Some(CARGO_SOURCES_FILENAME)),
+            "generated Cargo source",
         )?;
         let directory = sources
             .iter()
@@ -5937,7 +5974,8 @@ mod tests {
         require(
             !finish_args.iter().any(|arg| arg.starts_with("--persist")),
             "persistence grant",
-        )
+        )?;
+        Ok(manifest)
     }
 
     #[test]
@@ -6057,6 +6095,27 @@ mod tests {
             validate_flatpak_manifest("{not json", DESKTOP).is_err(),
             "invalid JSON unexpectedly passed"
         );
+
+        for (valid, replacement) in [
+            (
+                "cargo --offline fetch --locked --manifest-path Cargo.toml --verbose",
+                "echo cargo --offline fetch --locked --manifest-path Cargo.toml --verbose",
+            ),
+            (
+                "install -Dm644 data/io.github.ercling.CosmicBingWallpaper.metainfo.xml /app/share/metainfo/io.github.ercling.CosmicBingWallpaper.metainfo.xml",
+                "echo install -Dm644 data/io.github.ercling.CosmicBingWallpaper.metainfo.xml /app/share/metainfo/io.github.ercling.CosmicBingWallpaper.metainfo.xml",
+            ),
+            (
+                "cargo --offline build --release --locked --verbose",
+                "cargo --offline build --release --verbose",
+            ),
+        ] {
+            let non_operational = FLATPAK_MANIFEST.replacen(valid, replacement, 1);
+            assert!(
+                validate_flatpak_manifest(&non_operational, DESKTOP).is_err(),
+                "a non-operative or unlocked build command unexpectedly passed: {replacement}"
+            );
+        }
     }
 
     fn validate_flatpak_tooling(
@@ -6064,9 +6123,7 @@ mod tests {
         script_text: &str,
         justfile: &str,
     ) -> Result<(), String> {
-        validate_flatpak_manifest(manifest_text, DESKTOP)?;
-        let manifest: serde_json::Value =
-            serde_json::from_str(manifest_text).map_err(|error| error.to_string())?;
+        let manifest = validate_flatpak_manifest(manifest_text, DESKTOP)?;
         let require = |condition: bool, message: &str| {
             condition.then_some(()).ok_or_else(|| message.to_owned())
         };
@@ -6074,15 +6131,6 @@ mod tests {
         let module_name = module["name"]
             .as_str()
             .ok_or_else(|| "module name".to_owned())?;
-        require(
-            manifest["build-options"]["env"]["CARGO_HOME"].as_str()
-                == Some(&format!("/run/build/{module_name}/cargo")),
-            "CARGO_HOME must align with the module name",
-        )?;
-        let generated_source = module["sources"]
-            .as_array()
-            .and_then(|sources| sources.iter().filter_map(|source| source.as_str()).next())
-            .ok_or_else(|| "generated Cargo source".to_owned())?;
 
         let script = sans_comments(script_text);
         require(
@@ -6098,11 +6146,15 @@ mod tests {
             "vendoring script generator path",
         )?;
         require(
+            script.contains("uv run --locked --script"),
+            "vendoring script must enforce its script lockfile",
+        )?;
+        require(
             script.contains(" Cargo.lock "),
             "vendoring script Cargo.lock input",
         )?;
         require(
-            script.contains(&format!("-o {generated_source}")),
+            script.contains(&format!("-o {CARGO_SOURCES_FILENAME}")),
             "vendoring output must match the manifest source name",
         )?;
 
@@ -6176,6 +6228,18 @@ mod tests {
                 && CARGO_GENERATOR.contains("f03a673abe6ce189cea1c2857e2b44af2dd79d1f"),
             "the vendored generator must document its exact upstream commit"
         );
+        assert!(
+            CARGO_GENERATOR.contains("aiohttp==3.12.15")
+                && CARGO_GENERATOR.contains("tomlkit==0.13.3")
+                && !CARGO_GENERATOR.contains("PyYAML"),
+            "required generator dependencies must be exact and omit unused YAML support"
+        );
+        assert!(
+            CARGO_GENERATOR_LOCK.contains("name = \"aiohttp\"")
+                && CARGO_GENERATOR_LOCK.contains("name = \"tomlkit\"")
+                && !CARGO_GENERATOR_LOCK.contains("name = \"pyyaml\""),
+            "the checked-in uv lock must cover only required generator dependencies"
+        );
     }
 
     #[test]
@@ -6205,6 +6269,11 @@ mod tests {
             validate_flatpak_tooling(FLATPAK_MANIFEST, CARGO_SOURCES_SCRIPT, &no_offline_guard,)
                 .is_err(),
             "an offline recipe without --disable-download unexpectedly passed"
+        );
+        let unlocked_script = CARGO_SOURCES_SCRIPT.replace(" run --locked", " run");
+        assert!(
+            validate_flatpak_tooling(FLATPAK_MANIFEST, &unlocked_script, JUSTFILE).is_err(),
+            "a vendoring wrapper that ignores its lockfile unexpectedly passed"
         );
         let unshared_build = JUSTFILE.replacen(
             "{{flatpak-builder-cmd}} build-dir '{{appid}}.json'",
@@ -6265,18 +6334,18 @@ mod tests {
             .filter(|line| !line.is_empty())
         {
             require(
-                rust.contains(command),
+                active_workflow_step_containing(&rust, command),
                 &format!("rust.yml must run the `just check` command `{command}`"),
             )?;
         }
         for package in ["dbus", "libwayland-dev", "libxkbcommon-dev", "pkg-config"] {
             require(
-                rust.contains(package),
+                active_workflow_step_containing(&rust, package),
                 &format!("rust.yml missing build/test package `{package}`"),
             )?;
         }
         require(
-            rust.contains("dbus-run-session -- cargo test"),
+            active_workflow_step_containing(&rust, "dbus-run-session -- cargo test"),
             "rust.yml tests must use a hermetic session bus",
         )?;
         require(
@@ -6302,20 +6371,25 @@ mod tests {
         let runtime_version = manifest["runtime-version"]
             .as_str()
             .ok_or_else(|| "manifest runtime-version".to_owned())?;
-        for required in [
-            &format!(
+        require(
+            flatpak.contains(&format!(
                 "image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-{runtime_version}"
-            ),
-            &format!("manifest-path: {APP_ID}.json"),
-            "flatpak/generate-cargo-sources.sh",
-            "Cargo.lock",
-            "cargo-sources.json",
-            "Install uv",
-            "flatpak/flatpak-github-actions/flatpak-builder@v6",
-            &format!("bundle: {}.flatpak", env!("CARGO_PKG_NAME")),
+            )),
+            "flatpak.yml builder image must match the manifest runtime",
+        )?;
+        for required in [
+            format!("manifest-path: {APP_ID}.json"),
+            "flatpak/generate-cargo-sources.sh".to_owned(),
+            "Cargo.lock".to_owned(),
+            CARGO_SOURCES_FILENAME.to_owned(),
+            "astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b".to_owned(),
+            "version: \"0.12.1\"".to_owned(),
+            "appstreamcli validate --no-net data/io.github.ercling.CosmicBingWallpaper.metainfo.xml".to_owned(),
+            "flatpak/flatpak-github-actions/flatpak-builder@v6".to_owned(),
+            format!("bundle: {}.flatpak", env!("CARGO_PKG_NAME")),
         ] {
             require(
-                flatpak.contains(required),
+                active_workflow_step_containing(&flatpak, &required),
                 &format!("flatpak.yml missing `{required}`"),
             )?;
         }
@@ -6346,6 +6420,44 @@ mod tests {
                 .is_err(),
             "a commented-out source generation step unexpectedly passed"
         );
+
+        for disabled_rust in [
+            RUST_WORKFLOW.replace(
+                "      - name: Format\n        run: cargo fmt --check",
+                "      - name: Format\n        if: false\n        run: cargo fmt --check",
+            ),
+            RUST_WORKFLOW.replace(
+                "      - name: Test\n        run: dbus-run-session -- cargo test",
+                "      - name: Test\n        if: false\n        run: dbus-run-session -- cargo test",
+            ),
+        ] {
+            assert!(
+                validate_ci_workflows(&disabled_rust, FLATPAK_WORKFLOW, FLATPAK_MANIFEST, JUSTFILE)
+                    .is_err(),
+                "a disabled Rust verification step unexpectedly passed"
+            );
+        }
+
+        for disabled_flatpak in [
+            FLATPAK_WORKFLOW.replace(
+                "      - name: Generate cargo-sources.json\n        run:",
+                "      - name: Generate cargo-sources.json\n        if: false\n        run:",
+            ),
+            FLATPAK_WORKFLOW.replace(
+                "      - name: Validate AppStream metadata\n        run:",
+                "      - name: Validate AppStream metadata\n        if: false\n        run:",
+            ),
+            FLATPAK_WORKFLOW.replace(
+                "      - name: Build and bundle the Flatpak\n        uses:",
+                "      - name: Build and bundle the Flatpak\n        if: false\n        uses:",
+            ),
+        ] {
+            assert!(
+                validate_ci_workflows(RUST_WORKFLOW, &disabled_flatpak, FLATPAK_MANIFEST, JUSTFILE)
+                    .is_err(),
+                "a disabled Flatpak verification step unexpectedly passed"
+            );
+        }
     }
 
     #[test]
@@ -6406,8 +6518,16 @@ mod tests {
         flatpak_identity_is_consistent(DESKTOP, METAINFO, &format!("{APP_ID}.metainfo.xml"))
             .expect("the hand-written Flatpak identity fields must agree");
         assert!(
-            JUSTFILE.contains("sed -i 's|^Exec=.*|Exec={{bin-dst}}|' {{desktop-dst}}"),
+            native_install_rewrites_exec(JUSTFILE),
             "native install must rewrite the bare source Exec to its absolute binary path"
+        );
+        let commented_rewrite = JUSTFILE.replace(
+            "    sed -i 's|^Exec=.*|Exec={{bin-dst}}|' {{desktop-dst}}",
+            "    # sed -i 's|^Exec=.*|Exec={{bin-dst}}|' {{desktop-dst}}",
+        );
+        assert!(
+            !native_install_rewrites_exec(&commented_rewrite),
+            "a commented-out native Exec rewrite unexpectedly passed"
         );
     }
 
@@ -6482,9 +6602,35 @@ mod tests {
         );
     }
 
+    fn canonical_git_repo(source: &str) -> String {
+        let source = source.strip_prefix("git+").unwrap_or(source);
+        let without_fragment = source.split('#').next().unwrap_or(source);
+        let without_query = without_fragment
+            .split('?')
+            .next()
+            .unwrap_or(without_fragment)
+            .trim_end_matches('/');
+        let Some((scheme, authority_and_path)) = without_query.split_once("://") else {
+            return without_query.trim_end_matches(".git").to_owned();
+        };
+        let (authority, path) = authority_and_path
+            .split_once('/')
+            .unwrap_or((authority_and_path, ""));
+        let github = authority == "github.com";
+        let scheme = if github { "https" } else { scheme };
+        let path = if github {
+            path.to_ascii_lowercase()
+        } else {
+            path.to_owned()
+        };
+        format!("{scheme}://{authority}/{}", path.trim_end_matches(".git"))
+    }
+
     fn one_git_source_id_per_repo(lock: &str) -> Result<(), String> {
-        let mut ids_by_repo: std::collections::BTreeMap<&str, std::collections::BTreeSet<&str>> =
-            std::collections::BTreeMap::new();
+        let mut ids_by_repo: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeSet<String>,
+        > = std::collections::BTreeMap::new();
         for line in lock.lines() {
             let Some(source) = line
                 .strip_prefix("source = \"git+")
@@ -6495,8 +6641,8 @@ mod tests {
             // `url?query#locked-commit`: the source id is everything before
             // the fragment; the repository is everything before the query.
             let id = source.split('#').next().expect("split has a first part");
-            let repo = id.split('?').next().expect("split has a first part");
-            ids_by_repo.entry(repo).or_default().insert(id);
+            let repo = canonical_git_repo(source);
+            ids_by_repo.entry(repo).or_default().insert(id.to_owned());
         }
 
         if ids_by_repo.is_empty() {
@@ -6529,6 +6675,18 @@ source = "git+https://example.invalid/repo#abc""#;
         let error = one_git_source_id_per_repo(split_source_ids)
             .expect_err("bare and `?rev=` spellings for one repo must fail");
         assert!(error.contains("2 source ids"), "unexpected error: {error}");
+
+        for equivalent in [
+            "git+https://github.com/Example/Repo.git/#abc",
+            "git+git://github.com/example/repo#abc",
+        ] {
+            let lock = format!(
+                "source = \"git+https://github.com/example/repo?rev=abc#abc\"\nsource = \"{equivalent}\""
+            );
+            let error = one_git_source_id_per_repo(&lock)
+                .expect_err("equivalent GitHub spellings with split source ids must fail");
+            assert!(error.contains("2 source ids"), "unexpected error: {error}");
+        }
     }
 
     // -----------------------------------------------------------------
