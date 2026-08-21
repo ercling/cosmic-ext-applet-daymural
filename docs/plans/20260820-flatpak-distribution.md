@@ -280,6 +280,8 @@ Post-Completion; that warning is accepted.
       using the retained download cache; all must pass before Task 4
 - [x] ➕ harden cached git metadata extraction by fetching and checking out every requested
       lockfile commit, then comparing the full checked-out hash before reading `Cargo.toml`
+- [x] ➕ force-clean the parent checkout and every current submodule, force indexed submodule
+      commits, and reject dirty or mismatched submodule state before recursively scanning manifests
 
 ### Task 4: Add Rust and Flatpak CI
 
@@ -301,6 +303,8 @@ Post-Completion; that warning is accepted.
 - [x] scan both workflows and run `just check`; both must pass before Task 5
 - [x] ➕ pin the privileged Flatpak builder container by digest and all actions by full commit,
       restrict the workflow token to `contents: read`, and prevent checkout credential persistence
+- [x] ➕ apply the same full-action pinning, read-only token, and non-persisted checkout
+      credentials to native Rust CI
 
 ### Task 5: Document the distribution and compatibility contract
 

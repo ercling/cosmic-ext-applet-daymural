@@ -147,6 +147,10 @@ def fetch_git_repo(git_url: str, commit: str) -> str:
     subprocess.run(
         ["git", "checkout", "--detach", "--force", commit], cwd=clone_dir, check=True
     )
+    # A forced checkout updates tracked paths only. Remove ignored/untracked
+    # content too, including stale nested repositories from submodules that no
+    # longer exist at the locked commit, before recursively scanning manifests.
+    subprocess.run(["git", "clean", "-ffdx"], cwd=clone_dir, check=True)
     rev_parse_proc = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=clone_dir, check=True, stdout=subprocess.PIPE
     )
@@ -156,13 +160,55 @@ def fetch_git_repo(git_url: str, commit: str) -> str:
             f"Checked out {head} for {git_url}, expected locked commit {commit}"
         )
 
-    # Get the submodules as they might contain dependencies. This is a noop if
-    # there are no submodules in the repository
+    # Get the submodules as they might contain dependencies. Force their
+    # indexed commits, then remove ignored/untracked content within every
+    # current submodule. This is a noop if the repository has no submodules.
     subprocess.run(
-        ["git", "submodule", "update", "--init", "--recursive"],
+        ["git", "submodule", "sync", "--recursive"], cwd=clone_dir, check=True
+    )
+    subprocess.run(
+        ["git", "submodule", "update", "--init", "--recursive", "--force"],
         cwd=clone_dir,
         check=True,
     )
+    subprocess.run(
+        ["git", "submodule", "foreach", "--recursive", "git clean -ffdx"],
+        cwd=clone_dir,
+        check=True,
+    )
+
+    status_proc = subprocess.run(
+        [
+            "git",
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ],
+        cwd=clone_dir,
+        check=True,
+        stdout=subprocess.PIPE,
+    )
+    status = status_proc.stdout.decode().strip()
+    if status:
+        raise RuntimeError(f"Cached checkout for {git_url} is dirty:\n{status}")
+
+    submodule_proc = subprocess.run(
+        ["git", "submodule", "status", "--recursive"],
+        cwd=clone_dir,
+        check=True,
+        stdout=subprocess.PIPE,
+    )
+    unexpected_submodules = [
+        line
+        for line in submodule_proc.stdout.decode().splitlines()
+        if not line.startswith(" ")
+    ]
+    if unexpected_submodules:
+        raise RuntimeError(
+            f"Cached submodules for {git_url} are not at their indexed commits:\n"
+            + "\n".join(unexpected_submodules)
+        )
 
     return clone_dir
 

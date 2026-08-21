@@ -5614,6 +5614,9 @@ mod tests {
     const FLATPAK_WORKFLOW: &str = include_str!("../.github/workflows/flatpak.yml");
     const CARGO_SOURCES_FILENAME: &str = "cargo-sources.json";
     const CHECKOUT_ACTION: &str = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262";
+    const RUST_TOOLCHAIN_ACTION: &str =
+        "dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c";
+    const RUST_CACHE_ACTION: &str = "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6";
     const FLATPAK_BUILDER_ACTION: &str =
         "flatpak/flatpak-github-actions/flatpak-builder@401fe28a8384095fc1531b9d320b292f0ee45adb";
     const FLATPAK_BUILDER_IMAGE: &str = "ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08@sha256:6f3180c6765cb55e5dcd8ee4127b82aba25163c8c655a161422b7c447c14e4af";
@@ -6248,9 +6251,19 @@ mod tests {
             CARGO_GENERATOR.contains("[\"git\", \"fetch\", \"--depth=1\", \"origin\", commit]")
                 && CARGO_GENERATOR
                     .contains("[\"git\", \"checkout\", \"--detach\", \"--force\", commit]")
+                && CARGO_GENERATOR.contains("[\"git\", \"clean\", \"-ffdx\"]")
+                && CARGO_GENERATOR.contains(
+                    "[\"git\", \"submodule\", \"update\", \"--init\", \"--recursive\", \"--force\"]"
+                )
+                && CARGO_GENERATOR.contains(
+                    "[\"git\", \"submodule\", \"foreach\", \"--recursive\", \"git clean -ffdx\"]"
+                )
+                && CARGO_GENERATOR.contains("\"--ignore-submodules=none\"")
+                && CARGO_GENERATOR
+                    .contains("[\"git\", \"submodule\", \"status\", \"--recursive\"]")
                 && CARGO_GENERATOR.contains("if head != commit:")
                 && !CARGO_GENERATOR.contains("head[:COMMIT_LEN]"),
-            "cached git metadata must be checked out and verified against the full lockfile commit"
+            "cached git metadata must be force-cleaned and fully verified before scanning"
         );
     }
 
@@ -6361,6 +6374,21 @@ mod tests {
             "rust.yml tests must use a hermetic session bus",
         )?;
         require(
+            rust.contains("permissions:\n  contents: read"),
+            "rust.yml must grant only read access to repository contents",
+        )?;
+        require(
+            active_workflow_step_containing(&rust, CHECKOUT_ACTION)
+                && active_workflow_step_containing(&rust, "persist-credentials: false"),
+            "rust.yml checkout must be commit-pinned without persisted credentials",
+        )?;
+        for action in [RUST_TOOLCHAIN_ACTION, RUST_CACHE_ACTION] {
+            require(
+                active_workflow_step_containing(&rust, action),
+                &format!("rust.yml must pin `{action}`"),
+            )?;
+        }
+        require(
             !rust.contains("cargo-sources.json")
                 && !rust
                     .lines()
@@ -6466,6 +6494,28 @@ mod tests {
                 )
                 .is_err(),
                 "an unpinned or over-privileged Flatpak workflow unexpectedly passed"
+            );
+        }
+
+        for insecure_workflow in [
+            RUST_WORKFLOW.replace(CHECKOUT_ACTION, "actions/checkout@v4"),
+            RUST_WORKFLOW.replace(RUST_TOOLCHAIN_ACTION, "dtolnay/rust-toolchain@stable"),
+            RUST_WORKFLOW.replace(RUST_CACHE_ACTION, "Swatinem/rust-cache@v2"),
+            RUST_WORKFLOW.replace(
+                "permissions:\n  contents: read",
+                "permissions:\n  contents: write",
+            ),
+            RUST_WORKFLOW.replace("persist-credentials: false", "persist-credentials: true"),
+        ] {
+            assert!(
+                validate_ci_workflows(
+                    &insecure_workflow,
+                    FLATPAK_WORKFLOW,
+                    FLATPAK_MANIFEST,
+                    JUSTFILE
+                )
+                .is_err(),
+                "an unpinned or over-privileged Rust workflow unexpectedly passed"
             );
         }
 
