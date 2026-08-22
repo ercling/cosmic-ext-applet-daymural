@@ -310,17 +310,22 @@ There is no external API change. Internal interfaces change as follows:
 
 ### Task 4: Repair across takeover and followers
 
-- [ ] Carry restoration provenance through leadership takeover hydration and
+- [x] Carry restoration provenance through leadership takeover hydration and
       apply the same repair decision after readiness.
-- [ ] If a follower rebuilds a nonempty catalogue during initialization or
+- [x] If a follower rebuilds a nonempty catalogue during initialization or
       popup reload, request one leader refresh through the existing mailbox.
-- [ ] Suppress duplicate follower requests while persistence, refresh, or
+- [x] Suppress duplicate follower requests while persistence, refresh, or
       acknowledgement is pending; allow retry after the established timeout.
-- [ ] Update the CLAUDE.md leadership bullet for the new follower request
+- [x] Update the CLAUDE.md leadership bullet for the new follower request
       reason.
-- [ ] Two-instance tests: takeover with a rebuilt catalogue, follower proxy,
+- [x] Two-instance tests: takeover with a rebuilt catalogue, follower proxy,
       coalescing with an outstanding request, timeout retry.
-- [ ] Run focused coordination tests before Task 5.
+- [x] Run focused coordination tests before Task 5.
+      ➕ The duplicate suppression is `refresh_now`'s own (counter persist /
+      refresh / acknowledgement pending); the reload a *settled* request
+      triggers never re-asks (`non_leader_reload_repairs`), or an offline
+      leader would be re-asked on every acknowledgement. Popup-open and
+      timeout reloads may ask again.
 
 ### Task 5: Fluent cleanup, documentation, and packaging validation
 

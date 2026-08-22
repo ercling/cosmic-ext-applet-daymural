@@ -267,6 +267,12 @@ pub struct Window {
     /// Read-only reload request generation. Task 8 attaches the asynchronous
     /// catalogue/live-state load to this already-guarded request point.
     non_leader_reload_generation: u64,
+    /// Whether the follower reload in flight may ask the leader to repair a
+    /// rebuilt catalogue. Popup opens and acknowledgement timeouts may; the
+    /// reload a settled peer refresh triggers may not, or an offline leader
+    /// (whose every repair fetch fails and is acknowledged as such) would be
+    /// asked again on each acknowledgement, forever.
+    non_leader_reload_repairs: bool,
     /// Newest peer-apply notice observed by this process. The generation is
     /// also the staleness guard for the leader's blocking cosmic-bg read.
     peer_apply_notice_generation: u64,
@@ -295,11 +301,13 @@ pub struct Window {
     /// the download and a failed apply lets the startup prune delete it,
     /// and the next refresh simply re-downloads it.
     protected_fallback: Option<PathBuf>,
-    /// The startup restore rebuilt a nonempty catalogue from the folder scan
-    /// ([`Provenance::Rebuilt`]): its entries show filenames until a fetch
-    /// merge refills their metadata, so the first [`Window::arm_leader_duties`]
-    /// starts a repair refresh at once instead of waiting for the scheduled
-    /// one. Consumed by that arming.
+    /// The startup restore (or a takeover hydration) rebuilt a nonempty
+    /// catalogue from the folder scan ([`Provenance::Rebuilt`]): its entries
+    /// show filenames until a fetch merge refills their metadata, so the
+    /// next [`Window::arm_leader_duties`] starts a repair refresh at once
+    /// instead of waiting for the scheduled one, and a follower instead asks
+    /// the leader for one through the mailbox
+    /// ([`Window::request_follower_repair`]). Consumed by that arming.
     metadata_repair_due: bool,
     /// Generation counter for the one-shot refresh timer; `RefreshDue`
     /// messages carrying a stale generation are ignored.
@@ -468,6 +476,10 @@ pub(crate) struct LeadershipHydration {
     config: AppletConfig,
     coordination: CoordinationConfig,
     catalogue: Catalogue,
+    /// Whether the snapshot's catalogue was loaded or rebuilt from the folder
+    /// scan: a rebuilt one wants the same metadata repair a rebuilt startup
+    /// gets ([`Window::arm_leader_duties`]).
+    provenance: Provenance,
     live: wallpaper::CurrentWallpaper,
 }
 
@@ -484,6 +496,9 @@ struct TestSnapshotInputs {
 #[derive(Debug, Clone)]
 pub(crate) struct NonLeaderReload {
     catalogue: Catalogue,
+    /// A follower cannot repair a rebuilt catalogue itself; it asks the
+    /// leader to ([`Window::finish_non_leader_reload`]).
+    provenance: Provenance,
     live: wallpaper::CurrentWallpaper,
 }
 
@@ -541,8 +556,13 @@ fn read_non_leader_reload(
     images_dir: &Path,
     live: wallpaper::CurrentWallpaper,
 ) -> NonLeaderReload {
+    let CatalogueRestore {
+        catalogue,
+        provenance,
+    } = Catalogue::load_or_rebuild(catalogue_path, images_dir);
     NonLeaderReload {
-        catalogue: Catalogue::load_or_rebuild(catalogue_path, images_dir).catalogue,
+        catalogue,
+        provenance,
         live,
     }
 }
@@ -940,16 +960,15 @@ impl Window {
                     .map(Ok)
                     .unwrap_or_else(CoordinationConfig::context)
                     .map_err(|error| format!("cannot open coordination config: {error}"))?;
+                let restore =
+                    Catalogue::load_or_rebuild(&snapshot_catalogue_path, &snapshot_images_dir);
                 Ok::<_, String>(LeadershipHydration {
                     config: AppletConfig::load(&config_context),
                     coordination: CoordinationConfig::load(&coordination_context),
                     config_context: Some(config_context),
                     coordination_context: Some(coordination_context),
-                    catalogue: Catalogue::load_or_rebuild(
-                        &snapshot_catalogue_path,
-                        &snapshot_images_dir,
-                    )
-                    .catalogue,
+                    catalogue: restore.catalogue,
+                    provenance: restore.provenance,
                     live: {
                         #[cfg(test)]
                         if let Some(live) = test_live {
@@ -1008,6 +1027,10 @@ impl Window {
         self.config = hydration.config;
         self.coordination = hydration.coordination;
         self.catalogue = hydration.catalogue;
+        // The same repair decision a rebuilt startup gets: the follower
+        // period may have consumed its own request, but the snapshot just
+        // read is what this leader will serve from.
+        self.metadata_repair_due = hydration.provenance == Provenance::Rebuilt;
         self.peer_apply_notice_generation = self
             .coordination
             .apply_notice
@@ -1088,8 +1111,35 @@ impl Window {
         if self.is_active_leader() {
             self.arm_leader_duties(live)
         } else {
-            self.schedule_leadership_retry()
+            let retry = self.schedule_leadership_retry();
+            let repair = if std::mem::take(&mut self.metadata_repair_due) {
+                self.request_follower_repair()
+            } else {
+                Task::none()
+            };
+            Task::batch([retry, repair])
         }
+    }
+
+    /// A follower found a rebuilt, nonempty catalogue: it must not fetch
+    /// itself, so it asks the leader for one refresh through the mailbox —
+    /// the same request the popup button makes, with the same duplicate
+    /// suppression ([`Window::refresh_now`]: nothing while the counter
+    /// persist, the refresh, or the acknowledgement is pending) and the same
+    /// timeout retry ([`Window::timeout_peer_refresh`] reloads, and a still
+    /// rebuilt reload asks again).
+    fn request_follower_repair(&mut self) -> app::Task<Message> {
+        if self.is_active_leader() || self.catalogue.images.is_empty() {
+            return Task::none();
+        }
+        if self.refresh_pending || self.peer_refresh_write_pending {
+            tracing::debug!("rebuilt catalogue repair joins the pending peer refresh");
+            return Task::none();
+        }
+        tracing::info!(
+            "catalogue was rebuilt from the folder; asking the leader to repair metadata"
+        );
+        self.refresh_now()
     }
 
     /// Whether a dropdown menu is believed to be mapped — the ledger's one
@@ -1867,11 +1917,15 @@ impl Window {
     /// The generation is invalidated by every newer reload, successful local
     /// apply, and takeover, so an old disk snapshot cannot move navigation
     /// state backwards.
-    fn request_non_leader_reload(&mut self) -> app::Task<Message> {
+    ///
+    /// `may_repair` says whether a rebuilt reload may turn into a leader
+    /// repair request (see `non_leader_reload_repairs`).
+    fn request_non_leader_reload(&mut self, may_repair: bool) -> app::Task<Message> {
         if self.leadership.is_leader() {
             return Task::none();
         }
         self.non_leader_reload_generation = self.non_leader_reload_generation.wrapping_add(1);
+        self.non_leader_reload_repairs = may_repair;
         let generation = self.non_leader_reload_generation;
         #[cfg(test)]
         let (catalogue_path, images_dir, test_live) =
@@ -1912,16 +1966,23 @@ impl Window {
         &mut self,
         generation: u64,
         result: Result<NonLeaderReload, String>,
-    ) {
+    ) -> app::Task<Message> {
         if self.leadership.is_leader() || generation != self.non_leader_reload_generation {
-            return;
+            return Task::none();
         }
         match result {
             Ok(reload) => {
                 self.catalogue = reload.catalogue;
                 self.current = wallpaper::synced_current(&reload.live, self.current.take());
+                if self.non_leader_reload_repairs && reload.provenance == Provenance::Rebuilt {
+                    return self.request_follower_repair();
+                }
+                Task::none()
             }
-            Err(error) => tracing::warn!("failed to reload non-leader state: {error}"),
+            Err(error) => {
+                tracing::warn!("failed to reload non-leader state: {error}");
+                Task::none()
+            }
         }
     }
 
@@ -1948,7 +2009,9 @@ impl Window {
                 self.last_error = Some(RefreshError::Disk(String::new()));
             }
         }
-        self.request_non_leader_reload()
+        // Settled, whatever the outcome: a rebuilt reload here must not ask
+        // again, or an offline leader would be polled on every acknowledgement.
+        self.request_non_leader_reload(false)
     }
 
     fn timeout_peer_refresh(&mut self, generation: u64, request: u64) -> app::Task<Message> {
@@ -1961,7 +2024,9 @@ impl Window {
         self.requested_peer_refresh = None;
         self.refresh_pending = false;
         self.peer_refresh_timeout_generation = self.peer_refresh_timeout_generation.wrapping_add(1);
-        self.request_non_leader_reload()
+        // The established retry point: no leader covered the request, so a
+        // still rebuilt catalogue may ask once more.
+        self.request_non_leader_reload(true)
     }
 
     /// Persist evidence of a successful follower apply without trusting the
@@ -3823,6 +3888,7 @@ impl cosmic::Application for Window {
             peer_refresh_write_pending: false,
             peer_refresh_timeout_generation: 0,
             non_leader_reload_generation: 0,
+            non_leader_reload_repairs: false,
             peer_apply_notice_generation,
             catalogue,
             current,
@@ -3927,7 +3993,7 @@ impl cosmic::Application for Window {
                     && self.requested_peer_refresh.is_none()
                     && !self.refresh_pending
                 {
-                    return Task::batch([popup, self.request_non_leader_reload()]);
+                    return Task::batch([popup, self.request_non_leader_reload(true)]);
                 }
                 return popup;
             }
@@ -3980,7 +4046,7 @@ impl cosmic::Application for Window {
                 return self.finish_leadership_hydration(generation, state_generation, result);
             }
             Message::NonLeaderReloaded { generation, result } => {
-                self.finish_non_leader_reload(generation, result);
+                return self.finish_non_leader_reload(generation, result);
             }
             Message::AppletSettingWritten {
                 generation,
@@ -4400,6 +4466,134 @@ mod tests {
         assert_eq!(task.units(), 3, "exactly one refresh beside the pass");
     }
 
+    #[test]
+    fn a_takeover_over_a_rebuilt_catalogue_starts_the_repair_refresh() {
+        // Provenance is carried through the takeover snapshot: the follower
+        // period may have already asked for (and been refused) a repair,
+        // but the catalogue this leader serves from is the one just read.
+        let rebuilt = LeadershipHydration {
+            catalogue: Catalogue {
+                images: vec![entry_in_memory("20260820", "Rebuilt_ROW1")],
+            },
+            provenance: Provenance::Rebuilt,
+            ..hydration(
+                AppletConfig::default(),
+                CoordinationConfig::default(),
+                wallpaper::CurrentWallpaper::NoFile,
+            )
+        };
+        let mut window = Window {
+            leadership: Leadership::forced(true),
+            leader_readiness: LeaderReadiness::Hydrating,
+            ..Window::default()
+        };
+        let duties = window.finish_leadership_hydration(0, 0, Ok(rebuilt.clone()));
+        assert!(window.is_active_leader());
+        assert!(window.refresh_pending, "repair refresh starts at readiness");
+        assert!(
+            window.thumbnail_pass_pending,
+            "beside the pass, never instead"
+        );
+        assert!(!window.metadata_repair_due, "consumed by the arming");
+        assert_eq!(window.peer_refresh_request, None);
+        assert_eq!(
+            duties.units(),
+            3,
+            "timer, thumbnail pass and repair refresh"
+        );
+
+        // The same snapshot loaded from JSON needs no repair.
+        let loaded = LeadershipHydration {
+            provenance: Provenance::Loaded,
+            ..rebuilt.clone()
+        };
+        let mut window = Window {
+            leadership: Leadership::forced(true),
+            leader_readiness: LeaderReadiness::Hydrating,
+            ..Window::default()
+        };
+        let duties = window.finish_leadership_hydration(0, 0, Ok(loaded));
+        assert!(window.is_active_leader());
+        assert!(!window.refresh_pending);
+        assert_eq!(duties.units(), 2, "timer plus thumbnail pass");
+
+        // A follower's own repair request that was still waiting for a
+        // leader when it took over: the mailbox still shows it outstanding,
+        // and the one repair refresh covers it too.
+        let mut window = Window {
+            leadership: Leadership::forced(true),
+            leader_readiness: LeaderReadiness::Hydrating,
+            requested_peer_refresh: Some(2),
+            refresh_pending: true,
+            ..Window::default()
+        };
+        let hydration = LeadershipHydration {
+            coordination: CoordinationConfig {
+                refresh_request: 2,
+                ..Default::default()
+            },
+            ..rebuilt
+        };
+        let duties = window.finish_leadership_hydration(0, 0, Ok(hydration));
+        assert!(window.refresh_pending);
+        assert_eq!(window.requested_peer_refresh, None, "follower state shed");
+        assert_eq!(
+            window.peer_refresh_request,
+            Some(2),
+            "covered by the repair"
+        );
+        assert_eq!(duties.units(), 3, "exactly one refresh");
+    }
+
+    #[tokio::test]
+    async fn a_real_takeover_snapshot_reports_a_missing_catalogue_as_rebuilt() {
+        use cosmic::Application as _;
+        use cosmic_config::CosmicConfigEntry as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (config_context, coordination_context) = takeover_contexts(&dir.path().join("config"));
+        AppletConfig::default()
+            .write_entry(&config_context)
+            .unwrap();
+        CoordinationConfig::default()
+            .write_entry(&coordination_context)
+            .unwrap();
+        let images_dir = dir.path().join("images");
+        std::fs::create_dir_all(&images_dir).unwrap();
+        let entry = entry_on_disk(&images_dir, "20260820", "Pack_ROW1");
+        // No catalogue.json at all: the snapshot rebuilds from the folder.
+        let mut window = Window {
+            leadership: Leadership::forced(true),
+            leader_readiness: LeaderReadiness::Hydrating,
+            config_context: Some(config_context),
+            coordination_context: Some(coordination_context),
+            test_snapshot_inputs: Some(TestSnapshotInputs {
+                catalogue_path: dir.path().join("state/catalogue.json"),
+                images_dir,
+                live: wallpaper::CurrentWallpaper::NoFile,
+            }),
+            ..Window::default()
+        };
+
+        let hydration_task = window.start_leadership_hydration();
+        let mut messages = app_messages(hydration_task).await;
+        assert_eq!(messages.len(), 1);
+        let Message::LeadershipHydrated { result, .. } = &messages[0] else {
+            panic!("expected a hydration completion");
+        };
+        assert_eq!(
+            result.as_ref().unwrap().provenance,
+            Provenance::Rebuilt,
+            "provenance travels with the snapshot"
+        );
+        drop(window.update(messages.pop().unwrap()));
+        assert!(window.is_active_leader());
+        assert_eq!(window.catalogue.images.len(), 1);
+        assert_eq!(window.catalogue.images[0].filename, entry.filename);
+        assert!(window.refresh_pending, "rebuilt takeover repairs at once");
+        assert!(window.thumbnail_pass_pending);
+    }
+
     fn takeover_contexts(root: &Path) -> (cosmic_config::Config, cosmic_config::Config) {
         let config = cosmic_config::Config::with_custom_path(
             APP_ID,
@@ -4421,6 +4615,7 @@ mod tests {
             config,
             coordination,
             catalogue: Catalogue::default(),
+            provenance: Provenance::Loaded,
             live,
         }
     }
@@ -4511,6 +4706,10 @@ mod tests {
         assert_eq!(window.current, Some(live_path));
         assert_eq!(window.cold_start, ColdStart::Done);
         assert_eq!(window.timer_generation, 1);
+        assert!(
+            !window.refresh_pending,
+            "a catalogue loaded from JSON asks for no repair refresh"
+        );
     }
 
     #[tokio::test]
@@ -7421,7 +7620,221 @@ source = "git+https://example.invalid/repo#abc""#;
     }
 
     fn follower_reload(catalogue: Catalogue, live: wallpaper::CurrentWallpaper) -> NonLeaderReload {
-        NonLeaderReload { catalogue, live }
+        NonLeaderReload {
+            catalogue,
+            provenance: Provenance::Loaded,
+            live,
+        }
+    }
+
+    fn rebuilt_reload(live: wallpaper::CurrentWallpaper) -> NonLeaderReload {
+        NonLeaderReload {
+            catalogue: Catalogue {
+                images: vec![entry_in_memory("20260820", "Rebuilt_ROW1")],
+            },
+            provenance: Provenance::Rebuilt,
+            live,
+        }
+    }
+
+    fn follower_with_mailbox(dir: &Path) -> Window {
+        let context = cosmic_config::Config::with_custom_path(
+            APP_ID,
+            AppletConfig::VERSION,
+            dir.join("config"),
+        )
+        .unwrap();
+        Window {
+            leadership: Leadership::forced(false),
+            coordination_context: Some(context),
+            coordination_state_dir: dir.join("state"),
+            ..Window::default()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_follower_that_rebuilt_its_catalogue_asks_the_leader_to_repair_it() {
+        use cosmic::Application as _;
+        use cosmic_config::CosmicConfigEntry as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut follower = Window {
+            metadata_repair_due: true,
+            catalogue: Catalogue {
+                images: vec![entry_in_memory("20260820", "Rebuilt_ROW1")],
+            },
+            ..follower_with_mailbox(dir.path())
+        };
+        let context = follower.coordination_context.clone().unwrap();
+
+        let startup = follower.arm_initial_duties(wallpaper::CurrentWallpaper::NoFile);
+        assert!(!follower.metadata_repair_due, "consumed by the arming");
+        assert!(
+            follower.peer_refresh_write_pending,
+            "the mailbox request is persisting"
+        );
+        assert!(!follower.refresh_pending, "not until the persist lands");
+        assert!(
+            !follower.thumbnail_pass_pending,
+            "a follower produces nothing"
+        );
+        assert_eq!(
+            startup.units(),
+            2,
+            "takeover retry plus the mailbox request"
+        );
+
+        let mut messages = app_messages(startup).await;
+        let request = messages
+            .iter()
+            .position(|message| matches!(message, Message::PeerRefreshRequested(_)))
+            .expect("the counter persist completes");
+        let timeout = follower.update(messages.swap_remove(request));
+        assert_eq!(follower.requested_peer_refresh, Some(1));
+        assert!(follower.refresh_pending);
+        assert_eq!(
+            CoordinationConfig::get_entry(&context)
+                .unwrap()
+                .refresh_request,
+            1,
+            "the leader sees an ordinary outstanding request"
+        );
+
+        // The leader acknowledges: the reload it triggers never asks again,
+        // whatever it finds — an offline leader's repair fetch fails and is
+        // acknowledged as such, and polling it per acknowledgement would
+        // never end.
+        let reload = follower.settle_peer_refresh(PeerRefreshCompletion {
+            request: 1,
+            outcome: PeerRefreshOutcome::Network,
+        });
+        assert_eq!(reload.units(), 1);
+        assert!(!follower.non_leader_reload_repairs);
+        let again = follower.finish_non_leader_reload(
+            follower.non_leader_reload_generation,
+            Ok(rebuilt_reload(wallpaper::CurrentWallpaper::NoFile)),
+        );
+        assert_eq!(again.units(), 0, "settled: no second request");
+        assert!(!follower.peer_refresh_write_pending);
+        drop(timeout);
+    }
+
+    #[test]
+    fn a_follower_empty_rebuild_or_loaded_catalogue_asks_for_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        // An empty rebuild (empty folder) has nothing to repair.
+        let mut empty = Window {
+            metadata_repair_due: true,
+            ..follower_with_mailbox(dir.path())
+        };
+        let startup = empty.arm_initial_duties(wallpaper::CurrentWallpaper::NoFile);
+        assert!(!empty.peer_refresh_write_pending);
+        assert_eq!(startup.units(), 1, "takeover retry only");
+
+        // A loaded reload asks for nothing either.
+        let mut loaded = follower_with_mailbox(dir.path());
+        drop(loaded.request_non_leader_reload(true));
+        let task = loaded.finish_non_leader_reload(
+            loaded.non_leader_reload_generation,
+            Ok(follower_reload(
+                Catalogue {
+                    images: vec![entry_in_memory("20260820", "Loaded_ROW1")],
+                },
+                wallpaper::CurrentWallpaper::NoFile,
+            )),
+        );
+        assert_eq!(task.units(), 0);
+        assert!(!loaded.peer_refresh_write_pending);
+    }
+
+    #[test]
+    fn a_rebuilt_popup_reload_requests_a_repair_once_per_pending_request() {
+        use cosmic::Application as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut follower = follower_with_mailbox(dir.path());
+
+        // Popup open: the reload may repair, and a rebuilt result asks.
+        let open = follower.update(Message::TogglePopup);
+        assert_eq!(open.units(), 2, "popup plus the guarded reload");
+        assert!(follower.non_leader_reload_repairs);
+        let request = follower.finish_non_leader_reload(
+            follower.non_leader_reload_generation,
+            Ok(rebuilt_reload(wallpaper::CurrentWallpaper::NoFile)),
+        );
+        assert_eq!(request.units(), 1, "one mailbox request");
+        assert!(follower.peer_refresh_write_pending);
+        assert_eq!(
+            follower.catalogue.images.len(),
+            1,
+            "the reload is adopted too"
+        );
+
+        // Coalescing: while the persist is pending, another rebuilt reload
+        // asks nothing more ...
+        drop(follower.request_non_leader_reload(true));
+        let dup = follower.finish_non_leader_reload(
+            follower.non_leader_reload_generation,
+            Ok(rebuilt_reload(wallpaper::CurrentWallpaper::NoFile)),
+        );
+        assert_eq!(dup.units(), 0);
+
+        // ... nor while the request waits for its acknowledgement.
+        follower.peer_refresh_write_pending = false;
+        follower.requested_peer_refresh = Some(4);
+        follower.refresh_pending = true;
+        drop(follower.request_non_leader_reload(true));
+        let dup = follower.finish_non_leader_reload(
+            follower.non_leader_reload_generation,
+            Ok(rebuilt_reload(wallpaper::CurrentWallpaper::NoFile)),
+        );
+        assert_eq!(dup.units(), 0);
+        assert!(!follower.peer_refresh_write_pending);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_follower_repair_request_retries_after_the_acknowledgement_timeout() {
+        use cosmic::Application as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut follower = Window {
+            metadata_repair_due: true,
+            catalogue: Catalogue {
+                images: vec![entry_in_memory("20260820", "Rebuilt_ROW1")],
+            },
+            ..follower_with_mailbox(dir.path())
+        };
+
+        let startup = follower.arm_initial_duties(wallpaper::CurrentWallpaper::NoFile);
+        let mut messages = app_messages(startup).await;
+        let request = messages
+            .iter()
+            .position(|message| matches!(message, Message::PeerRefreshRequested(_)))
+            .unwrap();
+        let timeout = follower.update(messages.swap_remove(request));
+        assert_eq!(follower.requested_peer_refresh, Some(1));
+
+        // No leader covers it: the established timeout fires and reloads,
+        // with repair allowed — that reload is the retry point.
+        let mut timeout_messages = app_messages(timeout).await;
+        assert_eq!(timeout_messages.len(), 1);
+        let reload = follower.update(timeout_messages.pop().unwrap());
+        assert_eq!(reload.units(), 1);
+        assert!(!follower.refresh_pending);
+        assert_eq!(follower.requested_peer_refresh, None);
+        assert!(follower.non_leader_reload_repairs);
+
+        // Still rebuilt (the leader never wrote a catalogue): ask again.
+        let retry = follower.finish_non_leader_reload(
+            follower.non_leader_reload_generation,
+            Ok(rebuilt_reload(wallpaper::CurrentWallpaper::NoFile)),
+        );
+        assert_eq!(retry.units(), 1);
+        assert!(follower.peer_refresh_write_pending);
+        let mut messages = app_messages(retry).await;
+        drop(follower.update(messages.pop().unwrap()));
+        assert_eq!(follower.requested_peer_refresh, Some(2), "a newer counter");
+        assert!(follower.refresh_pending);
     }
 
     #[test]
@@ -7554,7 +7967,7 @@ source = "git+https://example.invalid/repo#abc""#;
             ..Window::default()
         };
 
-        follower.finish_non_leader_reload(
+        drop(follower.finish_non_leader_reload(
             3,
             Ok(follower_reload(
                 Catalogue {
@@ -7562,7 +7975,7 @@ source = "git+https://example.invalid/repo#abc""#;
                 },
                 wallpaper::CurrentWallpaper::File(live.clone()),
             )),
-        );
+        ));
 
         assert_eq!(follower.catalogue.images, vec![added]);
         assert_eq!(follower.current, Some(live));
@@ -7580,7 +7993,7 @@ source = "git+https://example.invalid/repo#abc""#;
         });
         assert_eq!(reload_task.units(), 1);
         assert_eq!(follower.non_leader_reload_generation, 1);
-        follower.finish_non_leader_reload(
+        drop(follower.finish_non_leader_reload(
             1,
             Ok(follower_reload(
                 Catalogue {
@@ -7588,7 +8001,7 @@ source = "git+https://example.invalid/repo#abc""#;
                 },
                 wallpaper::CurrentWallpaper::File(live.clone()),
             )),
-        );
+        ));
 
         assert_eq!(follower.catalogue.images, vec![added]);
         assert_eq!(follower.current, Some(live));
@@ -7609,7 +8022,7 @@ source = "git+https://example.invalid/repo#abc""#;
         };
         let applied = PathBuf::from("/images/applied.jpg");
         drop(after_apply.finish_manual_apply(applied.clone()));
-        after_apply.finish_non_leader_reload(
+        drop(after_apply.finish_non_leader_reload(
             1,
             Ok(follower_reload(
                 Catalogue {
@@ -7617,7 +8030,7 @@ source = "git+https://example.invalid/repo#abc""#;
                 },
                 wallpaper::CurrentWallpaper::NoFile,
             )),
-        );
+        ));
         assert_eq!(after_apply.catalogue.images, vec![authoritative.clone()]);
         assert_eq!(after_apply.current, Some(applied));
 
@@ -7631,7 +8044,7 @@ source = "git+https://example.invalid/repo#abc""#;
             current: Some(PathBuf::from("/images/leader.jpg")),
             ..Window::default()
         };
-        after_takeover.finish_non_leader_reload(
+        drop(after_takeover.finish_non_leader_reload(
             2,
             Ok(follower_reload(
                 Catalogue {
@@ -7639,7 +8052,7 @@ source = "git+https://example.invalid/repo#abc""#;
                 },
                 wallpaper::CurrentWallpaper::NoFile,
             )),
-        );
+        ));
         assert_eq!(after_takeover.catalogue.images, vec![authoritative]);
         assert_eq!(
             after_takeover.current,
@@ -7659,7 +8072,7 @@ source = "git+https://example.invalid/repo#abc""#;
             ..Window::default()
         };
         let before = follower.catalogue.clone();
-        follower.finish_non_leader_reload(1, Err("join failed".to_owned()));
+        drop(follower.finish_non_leader_reload(1, Err("join failed".to_owned())));
         assert_eq!(follower.catalogue, before);
         assert_eq!(follower.current, Some(PathBuf::from("/images/kept.jpg")));
 

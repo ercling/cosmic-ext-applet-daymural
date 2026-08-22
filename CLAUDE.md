@@ -182,14 +182,26 @@ do not duplicate `appstreamcli` or desktop-file syntax validation in Rust.
   lock-screen poke, accent compute/write, and leader-owned config transitions) is
   gated on it. A follower's manual refresh is a coordination-mailbox request,
   coalesced into the leader's current or next fetch and settled by a covering
-  completion counter. A follower may apply navigation choices directly, then
+  completion counter. The same request is made on a follower's behalf when
+  its init restore or a popup/timeout reload finds a **rebuilt, nonempty**
+  catalogue (`request_follower_repair` — a follower cannot fetch, so the
+  leader repairs the metadata): it rides `refresh_now`'s duplicate
+  suppression (nothing while the counter persist, the refresh, or the
+  acknowledgement is pending) and its timeout retry. Only the reload a
+  *settled* request triggers never re-asks (`non_leader_reload_repairs`):
+  an offline leader's repair fetch fails and is acknowledged as such, and
+  re-asking per acknowledgement would never end. A follower may apply
+  navigation choices directly, then
   posts an apply notice; the leader verifies cosmic-bg's live wallpaper before
   updating `current`, spending `ColdStart`, and recomputing the accent.
   Both roles persist ordinary settings through one asynchronous raw per-key
   queue: leaders adopt before enqueueing, followers only after success. Thus
   neither can rewrite unrelated leader-owned accent records from stale memory.
   On lock takeover, the winner remains inert while a blocking task reloads the
-  complete applet config, coordination entry, and live wallpaper; watcher
+  complete applet config, coordination entry, catalogue (with its
+  `Provenance` — a `Rebuilt` snapshot sets `metadata_repair_due`, so the
+  readiness arming starts the same repair refresh a rebuilt startup gets,
+  coalesced with any outstanding peer request), and live wallpaper; watcher
   events invalidate that snapshot. Follower popup opens and peer-refresh
   settlement similarly reload catalogue/live state asynchronously and adopt
   it only through generation and role guards. The logind subscription remains
