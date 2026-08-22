@@ -152,25 +152,29 @@ There is no external API change. Internal interfaces change as follows:
 
 ### Task 1a: Parse and enforce eligibility at the fetch boundary
 
-- [ ] Validate `startdate`, `fullstartdate`, and `urlbase` before an entry can
+- [x] Validate `startdate`, `fullstartdate`, and `urlbase` before an entry can
       influence downloads or scheduling. Note in `src/schedule.rs:36-39` that
       `next_refresh`'s malformed-`fullstartdate` branch is now reachable only
       from corrupt catalogue entries, not from the response path — it is not
       dead code.
-- [ ] Preserve response order while partitioning structurally valid entries
+- [x] Preserve response order while partitioning structurally valid entries
       into eligible (`Some(true)`), explicitly ineligible (`Some(false)`),
       and absent (`None`).
-- [ ] Never issue an image GET for an entry that is not `Some(true)`.
-- [ ] Keep an empty response or a response with no structurally valid entries
+- [x] Never issue an image GET for an entry that is not `Some(true)`.
+- [x] Keep an empty response or a response with no structurally valid entries
       as `FetchError::EmptyList`.
-- [ ] Update the `src/bing.rs` doc comment and **add** the eligibility rule to
+- [x] Update the `src/bing.rs` doc comment and **add** the eligibility rule to
       the CLAUDE.md `src/bing.rs` bullet.
-- [ ] Test true, false, missing, mixed, malformed, and empty responses with
+- [x] Test true, false, missing, mixed, malformed, and empty responses with
       hermetic parser tests; update the one `BingImage` literal at
-      `src/bing.rs:648`.
-- [ ] Assert via the loopback server that non-`Some(true)` entries produce
+      `src/bing.rs:648`. ⚠️ `src/bing.rs:648` was `fixture_image()`, a
+      clone out of the parsed fixture, not a struct literal — there is no
+      `BingImage { .. }` literal in the crate (`grep -rn "BingImage {"`);
+      it and every other `.images[0]` test access moved to
+      `.eligible[0].image`.
+- [x] Assert via the loopback server that non-`Some(true)` entries produce
       zero image GET requests.
-- [ ] Run focused Bing tests before Task 1b.
+- [x] Run focused Bing tests before Task 1b.
 
 ### Task 1b: Reconcile the catalogue and schedule on completion
 

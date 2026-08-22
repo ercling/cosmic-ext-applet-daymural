@@ -713,10 +713,11 @@ mod tests {
             &bing::parse_image_list(
                 r#"{"images":[{"urlbase":"/th?id=OHR.Foo_ROW1","startdate":"20260807",
                     "fullstartdate":"202608070700","copyrightlink":"https://example.com",
-                    "copyright":"Foo place (© Bar/Getty Images)"}]}"#,
+                    "copyright":"Foo place (© Bar/Getty Images)","wp":true}]}"#,
             )
             .unwrap()
-            .images[0],
+            .eligible[0]
+                .image,
             dir.path().join("20260807-Foo_ROW1_UHD.jpg"),
         );
         cat.merge(vec![fetched]);
@@ -954,10 +955,11 @@ mod tests {
         let image = &bing::parse_image_list(
             r#"{"images":[{"urlbase":"/th?id=OHR.Foo_ROW1","startdate":"20260807",
                 "fullstartdate":"202608070700","copyrightlink":"https://example.com",
-                "copyright":"Nyhavn Canal, Copenhagen (© emicristea/Getty Images)"}]}"#,
+                "copyright":"Nyhavn Canal, Copenhagen (© emicristea/Getty Images)","wp":true}]}"#,
         )
         .unwrap()
-        .images[0]
+        .eligible[0]
+            .image
             .clone();
 
         let entry = ImageEntry::from_bing(image, PathBuf::from("/x/f.jpg"));

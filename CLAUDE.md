@@ -159,6 +159,21 @@ do not duplicate `appstreamcli` or desktop-file syntax validation in Rust.
   (`split_copyright` — Bing's own `title` field is the literal `"Info"`), pure
   URL/filename builders and the inverse `parse_filename`, reqwest client +
   `fetch_image_list` + atomic `.part`-then-rename `download_image`.
+  **Eligibility rule**: `parse_image_list` validates `startdate` (8 digits),
+  `fullstartdate` (12 digits) and `urlbase` (the `/th?id=OHR.` prefix) and
+  partitions every structurally valid entry by Bing's per-image `wp` into an
+  `ImageArchive` — `eligible` (`Some(true)`, each `ArchiveImage` keeping its
+  response `position`), `ineligible` (`Some(false)` urlbases) and an
+  `absent_wp` count — plus `anchor`, the newest valid `fullstartdate`
+  regardless of eligibility (the scheduling anchor; scheduling off an older
+  eligible entry would hit `next_refresh`'s ~6-minute out-of-range reset).
+  **An image GET is only ever issued for `Some(true)`**; absent `wp` blocks
+  the download but never authorizes a removal — only an explicit `false`
+  does (see `catalogue.rs`). `EmptyList` means *no structurally valid entry*;
+  an all-ineligible response is a successful no-op, logged by
+  `fetch_and_download` with the `false`/absent counts separately so an
+  all-restricted day and a payload change that dropped the field stay
+  distinguishable.
 - `src/thumbs.rs` — 480×270 thumbnail cache in the state dir; the UI never
   decodes the full ~5 MB UHD file. Each cache slot has a `<thumb>.meta`
   sidecar holding the source's *identity* (mtime + size) and the outcome

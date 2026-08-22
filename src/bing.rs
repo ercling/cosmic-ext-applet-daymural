@@ -28,17 +28,24 @@ const URLBASE_PREFIX: &str = "/th?id=OHR.";
 /// Hardcoded resolution for downloads (v1 scope decision).
 pub const RESOLUTION: &str = "UHD";
 
-/// Top-level HPImageArchive response. Only `images` is used.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ImageArchive {
-    pub images: Vec<BingImage>,
+/// Raw top-level HPImageArchive response. Only `images` is read; it is
+/// partitioned into an [`ImageArchive`] by [`parse_image_list`].
+#[derive(Debug, Deserialize)]
+struct RawArchive {
+    images: Vec<BingImage>,
 }
 
 /// One image entry as Bing returns it.
 ///
 /// Deliberately omitted: `title` (the literal string `"Info"` — useless;
-/// the display title is derived from `copyright`) and `wp`/`url`/`hsh`/…
+/// the display title is derived from `copyright`) and `url`/`hsh`/…
 /// (unused; resolution is hardcoded to UHD).
+///
+/// `wp` is Bing's per-image wallpaper eligibility and is read three ways:
+/// `Some(true)` = downloadable, `Some(false)` = explicitly ineligible (the
+/// only value that authorizes removing an already-downloaded image),
+/// `None` (field absent, as a remote payload change could make it) = not
+/// downloadable, but nothing is ever removed on its account.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BingImage {
     pub urlbase: String,
@@ -46,10 +53,54 @@ pub struct BingImage {
     pub fullstartdate: String,
     pub copyright: String,
     pub copyrightlink: String,
+    #[serde(default)]
+    pub wp: Option<bool>,
 }
 
-/// Parse an HPImageArchive JSON response, dropping the images whose two
-/// path/URL-forming fields do not validate. Malformed *JSON* is an error,
+/// An eligible image together with its archive position (`0` = newest),
+/// so the download horizon can be applied against Bing's own ordering even
+/// after ineligible entries were partitioned out from between them.
+#[derive(Debug, Clone)]
+pub struct ArchiveImage {
+    pub position: usize,
+    pub image: BingImage,
+}
+
+/// The parsed and partitioned HPImageArchive response. Every structurally
+/// valid entry lands in exactly one of the three eligibility buckets;
+/// response order is preserved throughout.
+#[derive(Debug, Clone, Default)]
+pub struct ImageArchive {
+    /// Entries with `wp: true` — the only ones an image GET may be issued
+    /// for.
+    pub eligible: Vec<ArchiveImage>,
+    /// `urlbase`s of entries Bing explicitly marked `wp: false`: already
+    /// downloaded copies of these are to be removed (entry and file).
+    pub ineligible: Vec<String>,
+    /// How many structurally valid entries carried no `wp` at all. Logged so
+    /// an all-restricted day and a Bing payload change that dropped the
+    /// field stay distinguishable.
+    pub absent_wp: usize,
+    /// The newest structurally valid `fullstartdate` in the response,
+    /// regardless of eligibility: the scheduling anchor. Bing publishes on a
+    /// 24 h cadence whether or not today's image is eligible, so scheduling
+    /// off an older (eligible) entry would hit `next_refresh`'s out-of-range
+    /// reset and poll every ~6 min.
+    pub anchor: Option<String>,
+}
+
+impl ImageArchive {
+    /// Whether the response carried no structurally valid entry at all —
+    /// [`fetch_image_list`]'s [`FetchError::EmptyList`] condition. A valid
+    /// but all-ineligible response is *not* empty: it is a successful no-op.
+    pub fn has_no_valid_entries(&self) -> bool {
+        self.eligible.is_empty() && self.ineligible.is_empty() && self.absent_wp == 0
+    }
+}
+
+/// Parse an HPImageArchive JSON response, dropping the images whose three
+/// path/URL/schedule-forming fields do not validate and partitioning the
+/// rest by eligibility (see [`ImageArchive`]). Malformed *JSON* is an error,
 /// never a panic; a malformed *image* is skipped.
 ///
 /// Per-image rather than whole-batch rejection on purpose: one anomalous or
@@ -60,30 +111,58 @@ pub struct BingImage {
 /// * `startdate` must be exactly 8 ASCII digits — it is embedded verbatim in
 ///   the download filename, so a hostile value like `../../.config/x` must
 ///   never escape the download dir.
+/// * `fullstartdate` must be exactly 12 ASCII digits (`YYYYMMDDHHMM`) — it
+///   is the scheduling anchor, and one malformed entry must not be able to
+///   push the next refresh an hour out (`schedule::ERROR_RETRY_DELAY`).
 /// * `urlbase` must carry Bing's own `/th?id=OHR.` prefix — it is
 ///   concatenated straight onto the base URL, so `"@evil.example/x"` would
 ///   otherwise turn `https://www.bing.com` into userinfo and send the
 ///   download to another host entirely.
+///
+/// Eligibility is never a reason to *reject*: an ineligible entry still
+/// counts as structurally valid, still anchors the schedule, and is still
+/// reported — it just never produces a download.
 pub fn parse_image_list(json: &str) -> Result<ImageArchive, serde_json::Error> {
-    let mut archive: ImageArchive = serde_json::from_str(json)?;
-    archive
-        .images
-        .retain(|image| match rejection_reason(image) {
-            None => true,
-            Some(reason) => {
-                tracing::warn!("skipping Bing image: {reason}");
-                false
-            }
-        });
+    let raw: RawArchive = serde_json::from_str(json)?;
+    let mut archive = ImageArchive::default();
+    for (position, image) in raw.images.into_iter().enumerate() {
+        if let Some(reason) = rejection_reason(&image) {
+            tracing::warn!("skipping Bing image: {reason}");
+            continue;
+        }
+        if archive
+            .anchor
+            .as_deref()
+            .is_none_or(|newest| image.fullstartdate.as_str() > newest)
+        {
+            archive.anchor = Some(image.fullstartdate.clone());
+        }
+        match image.wp {
+            Some(true) => archive.eligible.push(ArchiveImage { position, image }),
+            Some(false) => archive.ineligible.push(image.urlbase),
+            None => archive.absent_wp += 1,
+        }
+    }
     Ok(archive)
+}
+
+/// Whether `value` is exactly `len` ASCII digits.
+fn is_ascii_digits(value: &str, len: usize) -> bool {
+    value.len() == len && value.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Why `image` must not be used, if so (see [`parse_image_list`]).
 fn rejection_reason(image: &BingImage) -> Option<String> {
-    if image.startdate.len() != 8 || !image.startdate.bytes().all(|b| b.is_ascii_digit()) {
+    if !is_ascii_digits(&image.startdate, 8) {
         return Some(format!(
             "invalid startdate {:?} (expected 8 ASCII digits)",
             image.startdate
+        ));
+    }
+    if !is_ascii_digits(&image.fullstartdate, 12) {
+        return Some(format!(
+            "invalid fullstartdate {:?} (expected 12 ASCII digits)",
+            image.fullstartdate
         ));
     }
     if !image.urlbase.starts_with(URLBASE_PREFIX) {
@@ -172,7 +251,9 @@ pub fn http_client() -> Result<reqwest::Client, FetchError> {
 /// Fetch and parse the image-of-the-day list for the latest `n` images
 /// from `base_url` ([`BING_BASE_URL`] in production). A successful but
 /// empty list is [`FetchError::EmptyList`] — including a batch whose images
-/// were all dropped by [`parse_image_list`]'s validation.
+/// were all dropped by [`parse_image_list`]'s validation. A batch whose
+/// images are all *ineligible* is not: it parses into an [`ImageArchive`]
+/// with nothing to download, which the caller treats as a successful no-op.
 pub async fn fetch_image_list(
     client: &reqwest::Client,
     base_url: &str,
@@ -195,7 +276,7 @@ pub async fn fetch_image_list(
     let body = read_capped(resp, MAX_LIST_BYTES).await?;
     let body = String::from_utf8_lossy(&body);
     let archive = parse_image_list(&body).map_err(FetchError::Parse)?;
-    if archive.images.is_empty() {
+    if archive.has_no_valid_entries() {
         return Err(FetchError::EmptyList);
     }
     Ok(archive)
@@ -458,16 +539,24 @@ mod tests {
     #[test]
     fn fixture_parses_with_real_fields() {
         let archive = parse_image_list(FIXTURE).expect("checked-in fixture must parse");
-        assert_eq!(archive.images.len(), 8);
+        assert_eq!(archive.eligible.len(), 8);
+        assert!(archive.ineligible.is_empty());
+        assert_eq!(archive.absent_wp, 0);
+        assert_eq!(archive.anchor.as_deref(), Some("202608070700"));
 
-        let first = &archive.images[0];
+        let first = &archive.eligible[0].image;
+        assert_eq!(archive.eligible[0].position, 0);
         assert_eq!(first.urlbase, "/th?id=OHR.ColorfulCop_ROW6097405388");
         assert_eq!(first.startdate, "20260807");
         assert_eq!(first.fullstartdate, "202608070700");
         assert!(first.copyrightlink.starts_with("https://"));
 
-        // Every entry has the fields the catalogue needs.
-        for img in &archive.images {
+        // Every entry has the fields the catalogue needs, and keeps its
+        // archive position.
+        for (i, slot) in archive.eligible.iter().enumerate() {
+            let img = &slot.image;
+            assert_eq!(slot.position, i);
+            assert_eq!(img.wp, Some(true));
             assert!(img.urlbase.starts_with("/th?id=OHR."), "{}", img.urlbase);
             assert_eq!(img.startdate.len(), 8);
             assert_eq!(img.fullstartdate.len(), 12);
@@ -478,7 +567,7 @@ mod tests {
     #[test]
     fn derived_title_is_a_real_title_not_info() {
         let archive = parse_image_list(FIXTURE).unwrap();
-        let (title, copyright) = split_copyright(&archive.images[0].copyright);
+        let (title, copyright) = split_copyright(&archive.eligible[0].image.copyright);
         assert_eq!(
             title,
             "Colourful homes line Nyhavn Canal, Copenhagen, Denmark"
@@ -486,8 +575,8 @@ mod tests {
         assert_eq!(copyright, "© emicristea/Getty Images");
         assert_ne!(title, "Info");
 
-        for img in &archive.images {
-            let (title, _) = split_copyright(&img.copyright);
+        for slot in &archive.eligible {
+            let (title, _) = split_copyright(&slot.image.copyright);
             assert!(!title.is_empty());
             assert_ne!(title, "Info");
             assert!(!title.contains('('), "paren leaked into title: {title}");
@@ -572,7 +661,8 @@ mod tests {
         );
 
         // Roundtrip across the whole fixture.
-        for img in parse_image_list(FIXTURE).unwrap().images {
+        for slot in parse_image_list(FIXTURE).unwrap().eligible {
+            let img = slot.image;
             let filename = image_filename(&img.startdate, &img.urlbase);
             assert_eq!(
                 parse_filename(&filename),
@@ -646,7 +736,7 @@ mod tests {
     }
 
     fn fixture_image() -> BingImage {
-        parse_image_list(FIXTURE).unwrap().images[0].clone()
+        parse_image_list(FIXTURE).unwrap().eligible[0].image.clone()
     }
 
     /// A base URL nothing listens on: any accidental network attempt fails
@@ -740,9 +830,9 @@ mod tests {
         let archive = fetch_image_list(&http_client().unwrap(), &base, 8)
             .await
             .unwrap();
-        assert_eq!(archive.images.len(), 8);
+        assert_eq!(archive.eligible.len(), 8);
         assert_eq!(
-            archive.images[0].urlbase,
+            archive.eligible[0].image.urlbase,
             "/th?id=OHR.ColorfulCop_ROW6097405388"
         );
     }
@@ -905,14 +995,26 @@ mod tests {
         assert!(parse_image_list("{\"images\": [").is_err()); // truncated
     }
 
-    /// One image object with the given `startdate`/`urlbase`; every other
-    /// field valid.
+    /// One eligible (`wp: true`) image object with the given
+    /// `startdate`/`urlbase`; every other field valid.
     fn image_json(urlbase: &str, startdate: &str) -> String {
+        image_json_wp(urlbase, startdate, "202608070700", "true")
+    }
+
+    /// One image object with every field chosen: `wp` is spliced in as raw
+    /// JSON (`"true"`, `"false"`, `"null"`) or omitted entirely for `""`.
+    fn image_json_wp(urlbase: &str, startdate: &str, fullstartdate: &str, wp: &str) -> String {
+        let wp = if wp.is_empty() {
+            String::new()
+        } else {
+            format!(",\"wp\":{wp}")
+        };
         format!(
-            r#"{{"urlbase":{},"startdate":{},"fullstartdate":"202608070700",
-                "copyright":"Foo (© Bar)","copyrightlink":"https://example.com"}}"#,
+            r#"{{"urlbase":{},"startdate":{},"fullstartdate":{},
+                "copyright":"Foo (© Bar)","copyrightlink":"https://example.com"{wp}}}"#,
             serde_json::to_string(urlbase).unwrap(),
-            serde_json::to_string(startdate).unwrap()
+            serde_json::to_string(startdate).unwrap(),
+            serde_json::to_string(fullstartdate).unwrap(),
         )
     }
 
@@ -937,15 +1039,14 @@ mod tests {
             assert!(
                 parse_image_list(&with_startdate(hostile))
                     .unwrap()
-                    .images
-                    .is_empty(),
+                    .has_no_valid_entries(),
                 "{hostile}"
             );
         }
         assert_eq!(
             parse_image_list(&with_startdate("20260807"))
                 .unwrap()
-                .images
+                .eligible
                 .len(),
             1
         );
@@ -968,15 +1069,14 @@ mod tests {
             assert!(
                 parse_image_list(&with_urlbase(hostile))
                     .unwrap()
-                    .images
-                    .is_empty(),
+                    .has_no_valid_entries(),
                 "{hostile}"
             );
         }
         assert_eq!(
             parse_image_list(&with_urlbase("/th?id=OHR.Foo_ROW1"))
                 .unwrap()
-                .images
+                .eligible
                 .len(),
             1
         );
@@ -998,9 +1098,11 @@ mod tests {
             image_json("@evil.example/x", "20260807"),
             image_json("/th?id=OHR.Good_ROW2", "../../x"),
         );
-        let kept = parse_image_list(&json).unwrap().images;
+        let kept = parse_image_list(&json).unwrap().eligible;
         assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].urlbase, "/th?id=OHR.Good_ROW1");
+        assert_eq!(kept[0].image.urlbase, "/th?id=OHR.Good_ROW1");
+        // Position is the *response* index, not the index among survivors.
+        assert_eq!(kept[0].position, 0);
     }
 
     #[tokio::test]
@@ -1111,6 +1213,222 @@ mod tests {
         let archive = fetch_image_list(&http_client().unwrap(), &base, 8)
             .await
             .expect("an unsized body under the budget must be read to EOF");
-        assert_eq!(archive.images.len(), 8);
+        assert_eq!(archive.eligible.len(), 8);
+    }
+
+    #[test]
+    fn parse_partitions_entries_by_eligibility_in_response_order() {
+        // Three-way `wp`: true → eligible, false → explicitly ineligible,
+        // absent → counted only. Each bucket keeps Bing's order, and an
+        // eligible entry remembers its *response* position.
+        let json = format!(
+            "{{\"images\":[{},{},{},{},{}]}}",
+            image_json_wp("/th?id=OHR.A_ROW1", "20260807", "202608070700", "true"),
+            image_json_wp("/th?id=OHR.B_ROW2", "20260806", "202608060700", "false"),
+            image_json_wp("/th?id=OHR.C_ROW3", "20260805", "202608050700", ""),
+            image_json_wp("/th?id=OHR.D_ROW4", "20260804", "202608040700", "true"),
+            image_json_wp("/th?id=OHR.E_ROW5", "20260803", "202608030700", "false"),
+        );
+        let archive = parse_image_list(&json).unwrap();
+
+        let eligible: Vec<(usize, &str)> = archive
+            .eligible
+            .iter()
+            .map(|slot| (slot.position, slot.image.urlbase.as_str()))
+            .collect();
+        assert_eq!(
+            eligible,
+            vec![(0, "/th?id=OHR.A_ROW1"), (3, "/th?id=OHR.D_ROW4")]
+        );
+        assert_eq!(
+            archive.ineligible,
+            vec![
+                "/th?id=OHR.B_ROW2".to_owned(),
+                "/th?id=OHR.E_ROW5".to_owned()
+            ]
+        );
+        assert_eq!(archive.absent_wp, 1);
+        assert_eq!(archive.anchor.as_deref(), Some("202608070700"));
+        assert!(!archive.has_no_valid_entries());
+    }
+
+    #[test]
+    fn parse_treats_absent_wp_as_not_downloadable_but_never_ineligible() {
+        // A remote payload change that drops the field must block downloads
+        // without ever authorizing a deletion: the entry lands in neither
+        // the eligible nor the ineligible bucket.
+        let json = format!(
+            "{{\"images\":[{}]}}",
+            image_json_wp("/th?id=OHR.A_ROW1", "20260807", "202608070700", "")
+        );
+        let archive = parse_image_list(&json).unwrap();
+        assert!(archive.eligible.is_empty());
+        assert!(archive.ineligible.is_empty());
+        assert_eq!(archive.absent_wp, 1);
+        // Still structurally valid: it anchors the schedule and is not an
+        // empty list.
+        assert_eq!(archive.anchor.as_deref(), Some("202608070700"));
+        assert!(!archive.has_no_valid_entries());
+
+        // JSON `null` is the same as absent (serde's `Option` default).
+        let json = format!(
+            "{{\"images\":[{}]}}",
+            image_json_wp("/th?id=OHR.A_ROW1", "20260807", "202608070700", "null")
+        );
+        let archive = parse_image_list(&json).unwrap();
+        assert!(archive.eligible.is_empty() && archive.ineligible.is_empty());
+        assert_eq!(archive.absent_wp, 1);
+    }
+
+    #[test]
+    fn parse_anchors_the_schedule_on_the_newest_valid_entry_regardless_of_eligibility() {
+        // Today's image is restricted; the schedule still has to run off
+        // *its* fullstartdate, or the next refresh lands in the ~6-minute
+        // out-of-range reset instead of tomorrow's publication.
+        let json = format!(
+            "{{\"images\":[{},{}]}}",
+            image_json_wp("/th?id=OHR.New_ROW1", "20260807", "202608070700", "false"),
+            image_json_wp("/th?id=OHR.Old_ROW2", "20260806", "202608060700", "true"),
+        );
+        let archive = parse_image_list(&json).unwrap();
+        assert_eq!(archive.anchor.as_deref(), Some("202608070700"));
+        assert_eq!(archive.eligible.len(), 1);
+        assert_eq!(archive.eligible[0].position, 1);
+
+        // Newest is newest by value, not by position (Bing orders newest
+        // first, but the anchor does not rely on it).
+        let json = format!(
+            "{{\"images\":[{},{}]}}",
+            image_json_wp("/th?id=OHR.Old_ROW2", "20260806", "202608060700", "true"),
+            image_json_wp("/th?id=OHR.New_ROW1", "20260807", "202608070700", "true"),
+        );
+        assert_eq!(
+            parse_image_list(&json).unwrap().anchor.as_deref(),
+            Some("202608070700")
+        );
+    }
+
+    #[test]
+    fn parse_drops_malformed_fullstartdates_before_they_can_anchor_the_schedule() {
+        // A structurally bad `fullstartdate` rejects the whole entry: it
+        // must neither download nor become the anchor (which would send
+        // `next_refresh` down its 1 h error branch).
+        for hostile in ["", "2026080707", "20260807070a", "２０２６０８０７０７００"] {
+            let json = format!(
+                "{{\"images\":[{},{}]}}",
+                image_json_wp("/th?id=OHR.Bad_ROW1", "20260807", hostile, "true"),
+                image_json_wp("/th?id=OHR.Good_ROW2", "20260806", "202608060700", "true"),
+            );
+            let archive = parse_image_list(&json).unwrap();
+            assert_eq!(archive.eligible.len(), 1, "{hostile:?}");
+            assert_eq!(archive.eligible[0].image.urlbase, "/th?id=OHR.Good_ROW2");
+            assert_eq!(
+                archive.anchor.as_deref(),
+                Some("202608060700"),
+                "{hostile:?}"
+            );
+        }
+        // A malformed entry that is also ineligible is dropped, not listed
+        // for removal — deletion is authorized by a *valid* `wp: false`.
+        let json = format!(
+            "{{\"images\":[{}]}}",
+            image_json_wp("/th?id=OHR.Bad_ROW1", "20260807", "nope", "false")
+        );
+        let archive = parse_image_list(&json).unwrap();
+        assert!(archive.ineligible.is_empty());
+        assert!(archive.has_no_valid_entries());
+    }
+
+    #[test]
+    fn parse_rejects_a_non_boolean_wp_as_malformed_json() {
+        // `wp` is typed: a string where a bool belongs is a parse error, the
+        // same as any other schema violation, rather than silently "absent".
+        let json = format!(
+            "{{\"images\":[{}]}}",
+            image_json_wp("/th?id=OHR.A_ROW1", "20260807", "202608070700", "\"yes\"")
+        );
+        assert!(parse_image_list(&json).is_err());
+    }
+
+    #[test]
+    fn parse_of_an_empty_or_all_invalid_list_has_no_valid_entries() {
+        let archive = parse_image_list(r#"{"images":[]}"#).unwrap();
+        assert!(archive.has_no_valid_entries());
+        assert_eq!(archive.anchor, None);
+
+        let json = format!(
+            "{{\"images\":[{}]}}",
+            image_json_wp("@evil.example/x", "20260807", "202608070700", "true")
+        );
+        let archive = parse_image_list(&json).unwrap();
+        assert!(archive.has_no_valid_entries());
+        assert_eq!(archive.anchor, None);
+    }
+
+    #[tokio::test]
+    async fn fetch_image_list_accepts_an_all_ineligible_batch_as_a_non_empty_success() {
+        // All valid, none downloadable: *not* `EmptyList` (which would back
+        // off for an hour and surface an error) — a successful no-op whose
+        // anchor schedules the next refresh normally.
+        let json = format!(
+            "{{\"images\":[{},{}]}}",
+            image_json_wp("/th?id=OHR.A_ROW1", "20260807", "202608070700", "false"),
+            image_json_wp("/th?id=OHR.B_ROW2", "20260806", "202608060700", ""),
+        );
+        let base = crate::testutil::spawn_mock(move |_| (200, json.clone().into_bytes()));
+        let archive = fetch_image_list(&http_client().unwrap(), &base, 8)
+            .await
+            .expect("an all-ineligible batch is a success with nothing to download");
+        assert!(archive.eligible.is_empty());
+        assert_eq!(archive.ineligible, vec!["/th?id=OHR.A_ROW1".to_owned()]);
+        assert_eq!(archive.absent_wp, 1);
+        assert_eq!(archive.anchor.as_deref(), Some("202608070700"));
+    }
+
+    #[tokio::test]
+    async fn only_eligible_entries_produce_image_requests() {
+        // The fetch boundary's contract, observed at the wire: downloading
+        // every eligible entry of a mixed batch issues exactly one image GET
+        // per `wp: true` entry and none for the `false` or absent ones.
+        let json = format!(
+            "{{\"images\":[{},{},{}]}}",
+            image_json_wp("/th?id=OHR.Yes_ROW1", "20260807", "202608070700", "true"),
+            image_json_wp("/th?id=OHR.No_ROW2", "20260806", "202608060700", "false"),
+            image_json_wp("/th?id=OHR.Unknown_ROW3", "20260805", "202608050700", ""),
+        );
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = std::sync::Arc::clone(&requests);
+        let jpeg = crate::testutil::tiny_jpeg(32, 18);
+        let base = crate::testutil::spawn_mock(move |path| {
+            seen.lock().unwrap().push(path.to_owned());
+            if path.starts_with("/HPImageArchive.aspx") {
+                (200, json.clone().into_bytes())
+            } else {
+                (200, jpeg.clone())
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let client = http_client().unwrap();
+        let archive = fetch_image_list(&client, &base, 8).await.unwrap();
+        for slot in &archive.eligible {
+            download_image(&client, &base, &slot.image, dir.path())
+                .await
+                .unwrap();
+        }
+
+        let image_gets: Vec<String> = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|path| path.starts_with("/th?id=OHR."))
+            .cloned()
+            .collect();
+        assert_eq!(image_gets, vec![image_url("", "/th?id=OHR.Yes_ROW1")]);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "exactly the eligible image lands on disk"
+        );
     }
 }

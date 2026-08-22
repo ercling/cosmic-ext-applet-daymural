@@ -30,6 +30,7 @@ use crate::config::{
 use crate::leader::Leadership;
 // No `fl!` here: every user-visible string this applet renders lives in the
 // popup (`view.rs`). The panel contributes an icon and nothing else.
+use crate::bing::ArchiveImage;
 use crate::{accent, bing, lockwatch, schedule, thumbs, tooltip, view, wallpaper};
 
 /// One name everywhere: cosmic-config app ID, state dir, desktop entry.
@@ -3175,9 +3176,22 @@ async fn fetch_and_download(
     bing::sweep_part_files(download_dir);
 
     let archive = bing::fetch_image_list(client, base_url, count).await?;
+    if archive.eligible.is_empty() {
+        // Distinguishable in logs without a new i18n string: an
+        // all-restricted day (explicit `false`) versus a Bing payload change
+        // that dropped the field (absent).
+        tracing::warn!(
+            "Bing returned no downloadable image: {} marked wp=false, {} without wp",
+            archive.ineligible.len(),
+            archive.absent_wp
+        );
+    }
 
-    let mut fetched = Vec::with_capacity(archive.images.len());
-    for image in &archive.images {
+    // Only `wp: true` entries reach this loop — an image GET is never
+    // issued for an explicitly ineligible or `wp`-less entry.
+    let mut fetched = Vec::with_capacity(archive.eligible.len());
+    for ArchiveImage { position, image } in &archive.eligible {
+        tracing::debug!("archive position {position}: {} is eligible", image.urlbase);
         // A rebuilt entry may already hold this image at a different
         // resolution suffix — that file stays authoritative (no
         // re-download); the merge refills its metadata.
@@ -4845,7 +4859,7 @@ mod tests {
     }
 
     /// One-image HPImageArchive response for the pipeline tests below.
-    const LIST_JSON: &str = r#"{"images":[{"urlbase":"/th?id=OHR.Foo_ROW1","startdate":"20260807","fullstartdate":"202608070700","copyright":"Foo place (© Bar)","copyrightlink":"https://example.com/foo"}]}"#;
+    const LIST_JSON: &str = r#"{"images":[{"urlbase":"/th?id=OHR.Foo_ROW1","startdate":"20260807","fullstartdate":"202608070700","copyright":"Foo place (© Bar)","copyrightlink":"https://example.com/foo","wp":true}]}"#;
 
     #[tokio::test]
     async fn pipeline_downloads_missing_images_and_thumbnails() {
@@ -5502,8 +5516,8 @@ mod tests {
         // the refresh (→ 1 h backoff), and whatever landed before it stays on
         // disk so the next run skips it instead of re-fetching.
         const TWO_IMAGES: &str = r#"{"images":[
-            {"urlbase":"/th?id=OHR.Foo_ROW1","startdate":"20260806","fullstartdate":"202608060700","copyright":"Foo (© Bar)","copyrightlink":"https://example.com/foo"},
-            {"urlbase":"/th?id=OHR.Bad_ROW2","startdate":"20260807","fullstartdate":"202608070700","copyright":"Bad (© Bar)","copyrightlink":"https://example.com/bad"}
+            {"urlbase":"/th?id=OHR.Foo_ROW1","startdate":"20260806","fullstartdate":"202608060700","copyright":"Foo (© Bar)","copyrightlink":"https://example.com/foo","wp":true},
+            {"urlbase":"/th?id=OHR.Bad_ROW2","startdate":"20260807","fullstartdate":"202608070700","copyright":"Bad (© Bar)","copyrightlink":"https://example.com/bad","wp":true}
         ]}"#;
         let dir = tempfile::tempdir().unwrap();
         let download_dir = dir.path().join("images");

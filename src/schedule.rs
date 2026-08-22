@@ -37,6 +37,12 @@ const FUDGE_SECS: i64 = 300;
 /// `fullstartdate` (`YYYYMMDDHHMM`, UTC): `diff = (fullstartdate + 86400s)
 /// - now; if diff < 60 || diff > 86400 { diff = 60 }; diff += 300`.
 /// A `fullstartdate` that does not parse → [`ERROR_RETRY_DELAY`].
+///
+/// That error branch is not dead code: `bing::parse_image_list` rejects any
+/// response entry whose `fullstartdate` is not 12 ASCII digits, so a
+/// *shape* failure is reachable only from a corrupt catalogue entry
+/// (hand-edited JSON), while 12 digits that are not a real date
+/// (`202613450000`) still arrive here from either source.
 pub fn next_refresh(newest_fullstartdate: Option<&str>, now: DateTime<Utc>) -> Duration {
     let Some(fullstartdate) = newest_fullstartdate else {
         return COLD_START_DELAY;
