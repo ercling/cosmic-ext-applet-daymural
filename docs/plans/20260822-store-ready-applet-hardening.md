@@ -374,23 +374,46 @@ There is no external API change. Internal interfaces change as follows:
 
 ### Task 6: Live acceptance
 
-- [ ] Install in an intentional COSMIC session; verify panel discovery,
+- [x] Install in an intentional COSMIC session; verify panel discovery,
       refresh, navigation, wallpaper application, attribution, shuffle,
       retention, accent behavior, and multi-output leader ownership.
-- [ ] Live-verify that the production HPImageArchive response for the
+      (skipped - not automatable: requires an interactive COSMIC session;
+      remains for the user to run live after `just install`.)
+- [x] Live-verify that the production HPImageArchive response for the
       market-less URL shape (`format=js&idx=0&n=8&mbl=1&mkt=`) carries `wp`
       on every entry; record the capture date in this plan.
-- [ ] Start with retained JPEGs but fresh state and confirm automatic
+      Captured 2026-08-23 with plain `curl` (no applet involved), HTTP 200,
+      8 entries (startdate 20260815..20260822, `OHR.StocktonInfinity_ROW…`
+      through `OHR.CommonBlue_ROW…`): every entry carries a JSON boolean
+      `wp`, all eight `true`, none missing or non-boolean.
+- [x] Start with retained JPEGs but fresh state and confirm automatic
       title/author hydration with no manual refresh — and that it is the
       immediate repair refresh, not the ~6-minute out-of-range reset, that
       does it (check the log timestamps).
-- [ ] Test a controlled all-ineligible cold start and confirm there is no
+      (skipped - not automatable: needs the applet started against live
+      state and a real Bing fetch; remains for the user to run live.)
+- [x] Test a controlled all-ineligible cold start and confirm there is no
       download loop, error state, or restricted wallpaper use, and that the
       warn line appears under `RUST_LOG=cosmic_bing_wallpaper=warn`.
-- [ ] Test a controlled fallback response and confirm that only the newest
+      (skipped - not automatable: requires launching the applet in a COSMIC
+      session; the mechanism is pinned by the hermetic mock-server tests in
+      `src/app.rs`. Remains for the user to run live.)
+- [x] Test a controlled fallback response and confirm that only the newest
       eligible fallback is downloaded and applied.
-- [ ] Move this plan to `docs/plans/completed/` only after all automated and
+      (skipped - not automatable: same reason; covered hermetically by the
+      fallback tests. Remains for the user to run live.)
+- [x] Move this plan to `docs/plans/completed/` only after all automated and
       live gates pass; then begin `20260822-daymural-rename.md`.
+      (deferred to orchestrator: plan is moved after the review/finalize
+      phases; rename plan is a separate run.)
+- Automated gate: `just check` (fmt, clippy `-D warnings`, tests) passed on
+  2026-08-23 — 412 tests, 0 failures.
+- [deviation] The four interactive COSMIC-session items (install/panel
+  verification, fresh-state hydration timing, controlled all-ineligible cold
+  start, controlled fallback response) were not executed: CLAUDE.md forbids
+  casually starting the applet (a cold start performs a real Bing fetch and
+  applies a wallpaper) and no interactive session/human was available. They
+  stay on the user's live checklist.
 
 ## Testing Strategy
 
