@@ -146,7 +146,27 @@ do not duplicate `appstreamcli` or desktop-file syntax validation in Rust.
   (`run_thumbnail_pass`, armed by `start_thumbnail_pass_over` from `init`):
   previews come from the cache, a non-empty catalogue is not a cold start, and
   the first refresh can be ~24 h out — or never, offline — so thumbnail
-  generation must never depend on a fetch. While either producer is running
+  generation must never depend on a fetch. The pass is therefore armed
+  **unconditionally** for an active leader (`arm_leader_duties`); a refresh
+  is started *in addition* — never instead — when a peer request is
+  outstanding or the restore was `Provenance::Rebuilt` and nonempty
+  (`Window::metadata_repair_due`, the **metadata repair**: a recovered image
+  pack shows filenames until a fetch merge refills title/credit/link, so the
+  leader refreshes at once rather than at the scheduled time; one refresh
+  settles the peer request and the repair alike). Offline that refresh dies
+  at the list fetch and the pass is the only producer — an earlier
+  either/or left a queued peer request with no thumbnails at all. The two
+  producers write `<thumb>.part`/`<thumb>.meta` at fixed names, so they
+  are interlocked on **writes** as well: a refresh started while
+  `thumbnail_pass_pending` is `Backfill::deferred` and writes no thumbnails
+  (neither `ensure_thumbnail_logged` per download nor the tail backfill);
+  the next refresh backfills what it downloaded. The repair itself is plain
+  `fetch_and_download`: every eligible entry in the eight-entry window whose
+  JPEG is already on disk is hydrated from the response (no GET, even beyond
+  the download horizon — nothing out of retention is downloaded for
+  metadata), images outside Bing's window keep the filename fallback, and a
+  failed refresh keeps every reconstructed entry on the ordinary retry path.
+  While either producer is running
   (`refresh_pending` / `thumbnail_pass_pending`, i.e. `may_sweep_thumbnails`)
   the prune's `thumbs::reconcile` sweep is deferred: fetched entries only join
   the catalogue at `RefreshFinished`, so an unconditional sweep deletes what
@@ -251,7 +271,10 @@ do not duplicate `appstreamcli` or desktop-file syntax validation in Rust.
   absent folder is not evidence that its files are gone — otherwise every entry
   looks vanished and the startup sweep *persists* that), and `load_or_rebuild`
   rescans the folder for an **empty** catalogue as well as an unusable one (a
-  valid-but-empty JSON would otherwise load fine forever).
+  valid-but-empty JSON would otherwise load fine forever). It returns a
+  `CatalogueRestore` whose `Provenance` is `Rebuilt` for every rescan
+  (missing, corrupt *and* empty JSON) and `Loaded` only for a nonempty load —
+  the signal `app.rs` turns into the startup metadata-repair refresh.
 - `src/config.rs` — `AppletConfig` (shuffle on/off, interval, retention, and
   the accent feature's `accent_enabled` / `accent_snapshot` /
   `accent_last_written` — colour types imported from `accent.rs`) via

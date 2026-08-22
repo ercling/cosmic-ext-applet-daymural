@@ -265,44 +265,48 @@ There is no external API change. Internal interfaces change as follows:
 
 ### Task 3: Catalogue provenance and leader-side metadata repair
 
-- [ ] Mark missing, corrupt, and valid-but-empty catalogue fallbacks as
+- [x] Mark missing, corrupt, and valid-but-empty catalogue fallbacks as
       `Rebuilt`; ordinary nonempty JSON loads remain `Loaded`. Update the
       CLAUDE.md `load_or_rebuild` bullet.
-- [ ] Restructure `Window::arm_leader_duties`: the thumbnail pass is armed
+- [x] Restructure `Window::arm_leader_duties`: the thumbnail pass is armed
       unconditionally for an active leader; a refresh is started *in
       addition* when there is an outstanding peer request **or** the restore
       was `Rebuilt` and nonempty. Never instead of the pass — offline, the
       refresh fails at the list fetch and the pass is the only producer.
-- [ ] Producer write interlock: while `thumbnail_pass_pending`, the refresh
+- [x] Producer write interlock: while `thumbnail_pass_pending`, the refresh
       skips `ensure_thumbnail_logged` per download and the tail
       `backfill_thumbnails`; the next refresh backfills. No change to
       `fsutil` (the "never hand-roll another temp-then-rename" rule stands;
       a unique-suffix variant is not needed once only one producer writes).
-- [ ] Hydrate every matching local eligible JPEG in the eight-entry window,
+- [x] Hydrate every matching local eligible JPEG in the eight-entry window,
       but do not download additional out-of-retention images solely for
       metadata repair.
-- [ ] Coalesce repair with any outstanding peer refresh so only one refresh
+- [x] Coalesce repair with any outstanding peer refresh so only one refresh
       is in flight.
-- [ ] Merge recovered title, credit, and information link into live state and
+- [x] Merge recovered title, credit, and information link into live state and
       save atomically. Historical images outside Bing's response keep the
       honest filename fallback.
-- [ ] On failure, retain reconstructed entries and use the existing retry path;
+- [x] On failure, retain reconstructed entries and use the existing retry path;
       never delete local JPEGs or persist an empty history.
-- [ ] Update the CLAUDE.md startup-thumbnail-pass paragraph: pass always
+- [x] Update the CLAUDE.md startup-thumbnail-pass paragraph: pass always
       armed, refresh additive, write interlock.
-- [ ] Test loaded/rebuilt provenance, missing/corrupt/empty JSON, leader
+- [x] Test loaded/rebuilt provenance, missing/corrupt/empty JSON, leader
       startup, network failure, and persistence.
-- [ ] Test: rebuilt catalogue + unreachable loopback server ⇒ thumbnails are
+- [x] Test: rebuilt catalogue + unreachable loopback server ⇒ thumbnails are
       still cached after the startup pass.
-- [ ] Test: offline leader start with an outstanding peer request ⇒
+- [x] Test: offline leader start with an outstanding peer request ⇒
       thumbnails still produced (the pre-existing hole).
-- [ ] Test: pass and refresh running over the same rebuilt catalogue yield
+- [x] Test: pass and refresh running over the same rebuilt catalogue yield
       exactly one intact thumbnail + `cached` sidecar per entry, no stray
       `.part`.
-- [ ] Add the reported regression: a rebuilt pack initially has filename
+- [x] Add the reported regression: a rebuilt pack initially has filename
       fallbacks, then automatic hydration restores every available title and
       author without a manual refresh.
-- [ ] Run focused catalogue and refresh tests before Task 4.
+- [x] Run focused catalogue and refresh tests before Task 4.
+      ➕ The hydration of on-disk eligible entries beyond the horizon runs
+      on *every* refresh, not only the repair one (same `fetch_and_download`
+      path; no GET is ever involved, so it is harmless on a loaded
+      catalogue and keeps one pipeline).
 
 ### Task 4: Repair across takeover and followers
 

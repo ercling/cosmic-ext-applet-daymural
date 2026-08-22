@@ -22,7 +22,7 @@ use cosmic::{
     widget,
 };
 
-use crate::catalogue::{self, Catalogue, ImageEntry};
+use crate::catalogue::{self, Catalogue, CatalogueRestore, ImageEntry, Provenance};
 use crate::config::{
     AppletConfig, CoordinationConfig, PeerApplyNotice, PeerRefreshCompletion, PeerRefreshOutcome,
     increment_refresh_request, record_refresh_completion, write_apply_notice,
@@ -295,6 +295,12 @@ pub struct Window {
     /// the download and a failed apply lets the startup prune delete it,
     /// and the next refresh simply re-downloads it.
     protected_fallback: Option<PathBuf>,
+    /// The startup restore rebuilt a nonempty catalogue from the folder scan
+    /// ([`Provenance::Rebuilt`]): its entries show filenames until a fetch
+    /// merge refills their metadata, so the first [`Window::arm_leader_duties`]
+    /// starts a repair refresh at once instead of waiting for the scheduled
+    /// one. Consumed by that arming.
+    metadata_repair_due: bool,
     /// Generation counter for the one-shot refresh timer; `RefreshDue`
     /// messages carrying a stale generation are ignored.
     timer_generation: u64,
@@ -536,7 +542,7 @@ fn read_non_leader_reload(
     live: wallpaper::CurrentWallpaper,
 ) -> NonLeaderReload {
     NonLeaderReload {
-        catalogue: Catalogue::load_or_rebuild(catalogue_path, images_dir),
+        catalogue: Catalogue::load_or_rebuild(catalogue_path, images_dir).catalogue,
         live,
     }
 }
@@ -942,7 +948,8 @@ impl Window {
                     catalogue: Catalogue::load_or_rebuild(
                         &snapshot_catalogue_path,
                         &snapshot_images_dir,
-                    ),
+                    )
+                    .catalogue,
                     live: {
                         #[cfg(test)]
                         if let Some(live) = test_live {
@@ -1032,10 +1039,15 @@ impl Window {
         self.arm_leader_duties(hydration.live)
     }
 
-    /// Arm ordinary leader startup work. An outstanding peer refresh starts
-    /// immediately and replaces the startup thumbnail producer for this
-    /// cycle: the refresh backfill fills the same cache, and running both
-    /// would violate the one-producer/sweep invariant.
+    /// Arm ordinary leader startup work. The startup thumbnail pass is the
+    /// guaranteed preview producer and is armed unconditionally; a refresh
+    /// is started *in addition* — never instead — when a peer request is
+    /// outstanding or the restore rebuilt a nonempty catalogue whose
+    /// metadata wants repairing (one refresh covers both). Offline, that
+    /// refresh dies at the list fetch and the pass is the only thing that
+    /// ever fills the cache; and because the pass is armed first, the
+    /// refresh sees `thumbnail_pass_pending` and writes no thumbnails of
+    /// its own (the producer write interlock, [`Backfill::deferred`]).
     fn arm_leader_duties(&mut self, live: wallpaper::CurrentWallpaper) -> app::Task<Message> {
         if !self.is_active_leader() {
             return Task::none();
@@ -1052,14 +1064,24 @@ impl Window {
         let outstanding = (self.coordination.refresh_request
             > self.coordination.refresh_completion.request)
             .then_some(self.coordination.refresh_request);
-        let producer = if let Some(request) = outstanding {
-            self.peer_refresh_request = Some(request);
+        let repair =
+            std::mem::take(&mut self.metadata_repair_due) && !self.catalogue.images.is_empty();
+        let pass = self.start_thumbnail_pass_over(live.clone());
+        let refresh = if outstanding.is_some() || repair {
+            if repair {
+                tracing::info!(
+                    "catalogue was rebuilt from the folder; refreshing to repair metadata"
+                );
+            }
+            // Coalesced: the one refresh settles the peer request and
+            // repairs the rebuilt entries alike.
+            self.peer_refresh_request = outstanding;
             self.start_refresh_over(live)
         } else {
-            self.start_thumbnail_pass_over(live)
+            Task::none()
         };
         let accent = self.accent_compute_for_current();
-        Task::batch([timer, shuffle, producer, accent])
+        Task::batch([timer, shuffle, pass, refresh, accent])
     }
 
     fn arm_initial_duties(&mut self, live: wallpaper::CurrentWallpaper) -> app::Task<Message> {
@@ -2185,9 +2207,20 @@ impl Window {
                 current.as_deref(),
             ),
         };
+        // Producer write interlock: while the startup pass owns the cache
+        // the refresh writes no thumbnails (see [`Backfill::deferred`]).
+        let deferred = self.thumbnail_pass_pending;
         cosmic::task::future(async move {
             Message::RefreshFinished(
-                run_refresh(catalogue, retention_days, downloads, &live, current).await,
+                run_refresh(
+                    catalogue,
+                    retention_days,
+                    downloads,
+                    &live,
+                    current,
+                    deferred,
+                )
+                .await,
             )
         })
     }
@@ -3168,8 +3201,11 @@ async fn extract_accent_hue(source: &Path, state_dir: &Path) -> Option<Option<f3
 /// killed process or a prune-racing backfill wrote for entries the
 /// catalogue no longer holds, and everything a rebuild from the folder
 /// scan silently dropped.
-fn restore_catalogue(path: &Path, images_dir: &Path, state_dir: &Path) -> Catalogue {
-    let mut catalogue = Catalogue::load_or_rebuild(path, images_dir);
+fn restore_catalogue(path: &Path, images_dir: &Path, state_dir: &Path) -> CatalogueRestore {
+    let CatalogueRestore {
+        mut catalogue,
+        provenance,
+    } = Catalogue::load_or_rebuild(path, images_dir);
     let removed = catalogue.prune(images_dir, 0, None, Utc::now());
     if !removed.is_empty() {
         tracing::info!(
@@ -3186,7 +3222,10 @@ fn restore_catalogue(path: &Path, images_dir: &Path, state_dir: &Path) -> Catalo
         catalogue.images.iter().map(|e| e.filename.as_path()),
         state_dir,
     );
-    catalogue
+    CatalogueRestore {
+        catalogue,
+        provenance,
+    }
 }
 
 /// Restore startup state according to process ownership. A follower may scan
@@ -3197,7 +3236,7 @@ fn restore_catalogue_for_role(
     images_dir: &Path,
     state_dir: &Path,
     active_leader: bool,
-) -> Catalogue {
+) -> CatalogueRestore {
     if active_leader {
         restore_catalogue(path, images_dir, state_dir)
     } else {
@@ -3243,6 +3282,7 @@ async fn run_refresh(
     downloads: Downloads,
     live: &wallpaper::CurrentWallpaper,
     current: Option<PathBuf>,
+    thumbnails_deferred: bool,
 ) -> Result<RefreshBatch, RefreshError> {
     let client = bing::http_client()?;
     fetch_and_download(
@@ -3252,7 +3292,7 @@ async fn run_refresh(
         downloads,
         &wallpaper::download_dir(),
         state_dir(),
-        &Backfill::new(live, retention_days, current.as_deref()),
+        &Backfill::new(live, retention_days, current.as_deref()).deferred(thumbnails_deferred),
     )
     .await
     .map_err(RefreshError::from)
@@ -3369,7 +3409,9 @@ async fn fetch_and_download(
                 fresh
             }
         };
-        ensure_thumbnail_logged(&path, state_dir).await;
+        if !backfill.deferred {
+            ensure_thumbnail_logged(&path, state_dir).await;
+        }
         if selection
             .fallback
             .is_some_and(|f| f.image.urlbase == image.urlbase)
@@ -3384,6 +3426,25 @@ async fn fetch_and_download(
     // Files the fetch loop above just handled are skipped.
     let handled: HashSet<&Path> = fetched.iter().map(|e| e.filename.as_path()).collect();
     backfill_thumbnails(catalogue, &handled, download_dir, state_dir, backfill).await;
+
+    // Metadata repair: every eligible entry *beyond* the selection whose
+    // image is already on disk is hydrated from the response too — no GET,
+    // just the title/credit/link and real time the merge refills a rebuilt
+    // entry with. Nothing out of retention is downloaded for this; an image
+    // Bing no longer lists keeps its honest filename fallback.
+    let selected: HashSet<String> = fetched.iter().map(|e| e.urlbase.clone()).collect();
+    let hydrated: Vec<ImageEntry> = archive
+        .eligible
+        .iter()
+        .filter(|ArchiveImage { image, .. }| !selected.contains(&image.urlbase))
+        .filter_map(|ArchiveImage { image, .. }| {
+            catalogue
+                .existing_file(&image.urlbase, download_dir)
+                .filter(|existing| bing::is_jpeg_file(existing))
+                .map(|existing| ImageEntry::from_bing(image, existing))
+        })
+        .collect();
+    fetched.extend(hydrated);
 
     Ok(RefreshBatch {
         fetched,
@@ -3428,6 +3489,10 @@ async fn backfill_thumbnails(
     state_dir: &Path,
     backfill: &Backfill<'_>,
 ) {
+    if backfill.deferred {
+        tracing::debug!("thumbnail backfill deferred to the running startup pass");
+        return;
+    }
     let mut spent = 0;
     for entry in catalogue.images.iter().rev() {
         if spent >= backfill.budget {
@@ -3488,6 +3553,15 @@ struct Backfill<'a> {
     current: Option<&'a Path>,
     /// Reference time for the retention cutoff (injected for tests).
     now: DateTime<Utc>,
+    /// Producer write interlock: the startup thumbnail pass was still
+    /// running when this refresh started, so the refresh writes **no**
+    /// thumbnails — neither per download nor in the tail backfill. Both
+    /// producers write `<thumb>.part`/`<thumb>.meta` at fixed names
+    /// (`fsutil::temp_sibling`), so two of them over the same rebuilt
+    /// catalogue would race on the same files; the pass ends in its own
+    /// sweep and `ThumbnailsReady` recompute, and the next refresh backfills
+    /// whatever this one downloaded.
+    deferred: bool,
 }
 
 impl<'a> Backfill<'a> {
@@ -3504,7 +3578,14 @@ impl<'a> Backfill<'a> {
             retention_days: wallpaper::prune_retention(live, configured_days),
             current,
             now: Utc::now(),
+            deferred: false,
         }
+    }
+
+    /// Mark the policy as deferred to the running startup pass (see the
+    /// `deferred` field): `true` means this refresh writes no thumbnails.
+    fn deferred(self, deferred: bool) -> Self {
+        Self { deferred, ..self }
     }
 
     /// Whether `entry` will still exist after the prune that follows this
@@ -3696,7 +3777,10 @@ impl cosmic::Application for Window {
         // missing catalogue rebuilds from the download folder scan; entries
         // whose file vanished while we weren't running are dropped so a
         // hollow catalogue still counts as a cold start.
-        let catalogue = restore_catalogue_for_role(
+        let CatalogueRestore {
+            catalogue,
+            provenance,
+        } = restore_catalogue_for_role(
             &catalogue_path(),
             &wallpaper::download_dir(),
             state_dir(),
@@ -3746,6 +3830,10 @@ impl cosmic::Application for Window {
             thumbnail_pass_pending: false,
             cold_start,
             protected_fallback: None,
+            // A rebuilt pack shows filenames until a fetch merge refills its
+            // metadata; the leader repairs that immediately rather than at
+            // the next scheduled refresh (`arm_leader_duties`).
+            metadata_repair_due: provenance == Provenance::Rebuilt,
             timer_generation: 0,
             shuffle_generation: 0,
             shuffle_armed: false,
@@ -4222,7 +4310,7 @@ mod tests {
     }
 
     #[test]
-    fn initial_leader_consumes_outstanding_peer_refresh_without_a_second_producer() {
+    fn initial_leader_consumes_outstanding_peer_refresh_beside_the_thumbnail_pass() {
         let mut window = Window {
             coordination: CoordinationConfig {
                 refresh_request: 7,
@@ -4239,15 +4327,77 @@ mod tests {
 
         assert_eq!(window.peer_refresh_request, Some(7));
         assert!(window.refresh_pending, "peer request starts the fetch now");
+        // The pre-existing hole: offline, that fetch dies at the list
+        // request, so the pass must be armed *as well* — it is the only
+        // guaranteed thumbnail producer. Armed first, so the refresh defers
+        // its own thumbnail writes to it.
         assert!(
-            !window.thumbnail_pass_pending,
-            "only one thumbnail producer"
+            window.thumbnail_pass_pending,
+            "the startup pass is never replaced by a refresh"
         );
         assert_eq!(
             window.timer_generation, 1,
             "ordinary timer also remains armed"
         );
-        assert_eq!(task.units(), 2, "timer plus immediate refresh");
+        assert_eq!(
+            task.units(),
+            3,
+            "timer, thumbnail pass and immediate refresh"
+        );
+    }
+
+    #[test]
+    fn a_rebuilt_restore_starts_a_repair_refresh_beside_the_pass() {
+        let mut window = Window {
+            metadata_repair_due: true,
+            ..window_with_images(1)
+        };
+
+        let task = window.arm_initial_duties(wallpaper::CurrentWallpaper::NoFile);
+
+        assert!(window.refresh_pending, "repair refresh starts immediately");
+        assert!(window.thumbnail_pass_pending, "pass armed regardless");
+        assert_eq!(window.peer_refresh_request, None, "no peer to settle");
+        assert!(!window.metadata_repair_due, "consumed by the arming");
+        assert_eq!(task.units(), 3, "timer, thumbnail pass and repair refresh");
+
+        // An empty rebuild (an empty folder) has nothing to repair: cold
+        // start semantics stand and no refresh is started out of turn.
+        let mut empty = Window {
+            metadata_repair_due: true,
+            ..Window::default()
+        };
+        let task = empty.arm_initial_duties(wallpaper::CurrentWallpaper::NoFile);
+        assert!(!empty.refresh_pending);
+        assert!(empty.thumbnail_pass_pending);
+        assert_eq!(task.units(), 2, "timer plus thumbnail pass");
+
+        // A loaded catalogue needs no repair either.
+        let mut loaded = window_with_images(1);
+        let task = loaded.arm_initial_duties(wallpaper::CurrentWallpaper::NoFile);
+        assert!(!loaded.refresh_pending);
+        assert_eq!(task.units(), 2);
+    }
+
+    #[test]
+    fn a_repair_refresh_coalesces_with_an_outstanding_peer_request() {
+        // One refresh in flight, settling the peer request and repairing
+        // the rebuilt entries alike.
+        let mut window = Window {
+            metadata_repair_due: true,
+            coordination: CoordinationConfig {
+                refresh_request: 3,
+                ..Default::default()
+            },
+            ..window_with_images(2)
+        };
+
+        let task = window.arm_initial_duties(wallpaper::CurrentWallpaper::NoFile);
+
+        assert!(window.refresh_pending);
+        assert_eq!(window.peer_refresh_request, Some(3));
+        assert!(window.thumbnail_pass_pending);
+        assert_eq!(task.units(), 3, "exactly one refresh beside the pass");
     }
 
     fn takeover_contexts(root: &Path) -> (cosmic_config::Config, cosmic_config::Config) {
@@ -4499,10 +4649,13 @@ mod tests {
             window.refresh_pending,
             "the outstanding request is serviced"
         );
-        assert!(!window.thumbnail_pass_pending, "there is only one producer");
+        assert!(
+            window.thumbnail_pass_pending,
+            "the pass is armed beside the refresh"
+        );
         assert_eq!(window.timer_generation, 1, "refresh duty armed once");
         assert_eq!(window.shuffle_generation, 1, "shuffle duty considered once");
-        assert_eq!(duties.units(), 2, "timer plus peer refresh producer");
+        assert_eq!(duties.units(), 3, "timer, thumbnail pass and peer refresh");
 
         let duplicate = window.finish_leadership_hydration(
             3,
@@ -4858,7 +5011,8 @@ mod tests {
             std::fs::write(cache.join("orphan.jpg"), b"keep").unwrap();
             let before = file_snapshot(dir.path());
 
-            let restored = restore_catalogue_for_role(&catalogue_path, &images, &state, false);
+            let restored =
+                restore_catalogue_for_role(&catalogue_path, &images, &state, false).catalogue;
 
             assert!(
                 restored
@@ -4895,7 +5049,7 @@ mod tests {
         std::fs::write(&orphan_thumb, b"thumb").unwrap();
         std::fs::remove_file(&gone.filename).unwrap();
 
-        let restored = restore_catalogue(&cat_path, &images, &state);
+        let restored = restore_catalogue(&cat_path, &images, &state).catalogue;
 
         // Old-but-vanished entry dropped without deleting anything else —
         // no age-based pruning happens at startup (retention 0).
@@ -4942,7 +5096,7 @@ mod tests {
             std::fs::write(thumbs_dir.join(orphan), b"leftover").unwrap();
         }
 
-        let restored = restore_catalogue(&cat_path, &images, &state);
+        let restored = restore_catalogue(&cat_path, &images, &state).catalogue;
 
         assert_eq!(restored.images, vec![kept]);
         let survivors: Vec<_> = std::fs::read_dir(&thumbs_dir)
@@ -4976,7 +5130,7 @@ mod tests {
         .unwrap();
         std::fs::remove_file(&gone.filename).unwrap();
 
-        let restored = restore_catalogue(&cat_path, &images, &state);
+        let restored = restore_catalogue(&cat_path, &images, &state).catalogue;
 
         assert!(restored.images.is_empty());
     }
@@ -5005,7 +5159,7 @@ mod tests {
         std::fs::write(&thumb, b"thumb").unwrap();
 
         std::fs::rename(&images, dir.path().join("moved")).unwrap();
-        let restored = restore_catalogue(&cat_path, &images, &state);
+        let restored = restore_catalogue(&cat_path, &images, &state).catalogue;
 
         assert_eq!(restored, stored, "an absent folder is not a hollow one");
         assert_eq!(
@@ -5020,7 +5174,7 @@ mod tests {
         std::fs::rename(dir.path().join("moved"), &images).unwrap();
         Catalogue::default().save(&cat_path).unwrap();
 
-        let restored = restore_catalogue(&cat_path, &images, &state);
+        let restored = restore_catalogue(&cat_path, &images, &state).catalogue;
 
         assert_eq!(restored.images.len(), 2, "the folder is rescanned");
     }
@@ -5048,7 +5202,7 @@ mod tests {
         .save(&cat_path)
         .unwrap();
 
-        let restored = restore_catalogue(&cat_path, &images, &state);
+        let restored = restore_catalogue(&cat_path, &images, &state).catalogue;
 
         assert!(victim.is_file(), "tampered entry must not delete the file");
         assert_eq!(restored.images, vec![kept]);
@@ -5368,6 +5522,7 @@ mod tests {
             retention_days: 0,
             current: None,
             now: Utc::now(),
+            deferred: false,
         }
     }
 
@@ -5637,6 +5792,7 @@ mod tests {
             retention_days: 8,
             current: Some(&applied),
             now,
+            deferred: false,
         };
         fetch_and_download(
             &client,
@@ -8415,7 +8571,7 @@ source = "git+https://example.invalid/repo#abc""#;
         // Restart with the catalogue lost: the rebuild scans the folder and
         // must not find the restricted image.
         std::fs::remove_file(&roots.catalogue).unwrap();
-        let rebuilt = Catalogue::load_or_rebuild(&roots.catalogue, &roots.images);
+        let rebuilt = Catalogue::load_or_rebuild(&roots.catalogue, &roots.images).catalogue;
         assert_eq!(
             rebuilt
                 .images
@@ -9059,6 +9215,376 @@ source = "git+https://example.invalid/repo#abc""#;
         assert_eq!(window.catalogue.images, vec![fallback.clone()]);
         assert!(fallback.filename.is_file(), "kept as the live wallpaper");
         assert_eq!(window.current.as_deref(), Some(fallback.filename.as_path()));
+    }
+
+    // -----------------------------------------------------------------
+    // Catalogue provenance, the leader's metadata repair and the producer
+    // write interlock (Task 3).
+    // -----------------------------------------------------------------
+
+    /// A "recovered image pack": `positions` of the eight-entry window
+    /// already on disk as decodable UHD JPEGs, plus one historical image
+    /// Bing no longer lists, with no `catalogue.json` — exactly what
+    /// `load_or_rebuild` rescans into blank-metadata entries.
+    fn rebuilt_pack(roots: &RefreshRoots, positions: &[usize]) -> CatalogueRestore {
+        let jpeg = crate::testutil::tiny_jpeg(32, 18);
+        for i in positions {
+            let day = 7 - i;
+            std::fs::write(
+                roots
+                    .images
+                    .join(format!("202608{day:02}-Pos{i}_ROW{i}_UHD.jpg")),
+                &jpeg,
+            )
+            .unwrap();
+        }
+        std::fs::write(roots.images.join("20260701-Historical_ROW9_UHD.jpg"), &jpeg).unwrap();
+        let restore = Catalogue::load_or_rebuild(&roots.catalogue, &roots.images);
+        assert_eq!(restore.provenance, Provenance::Rebuilt);
+        assert_eq!(restore.catalogue.images.len(), positions.len() + 1);
+        assert!(
+            restore.catalogue.images.iter().all(|e| e.title.is_empty()),
+            "a rebuilt entry has no metadata"
+        );
+        restore
+    }
+
+    /// Every cache artefact under `state/thumbs`: `(name, bytes)`.
+    fn thumb_dir_listing(state: &Path) -> BTreeMap<String, Vec<u8>> {
+        std::fs::read_dir(state.join("thumbs"))
+            .map(|read| {
+                read.flatten()
+                    .map(|e| {
+                        (
+                            e.file_name().to_string_lossy().into_owned(),
+                            std::fs::read(e.path()).unwrap(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn a_rebuilt_pack_is_hydrated_by_the_repair_refresh_without_downloads() {
+        // The reported regression: a recovered pack shows filenames until
+        // the user presses "Check for new images now". With the leader's
+        // repair refresh every title and author Bing still serves comes
+        // back automatically — including entries beyond the download
+        // horizon, which are hydrated from the response without a GET —
+        // and the result is persisted. Only the historical image outside
+        // Bing's window keeps the honest filename fallback.
+        let roots = refresh_roots();
+        let restore = rebuilt_pack(&roots, &[0, 5]);
+        let mut window = Window {
+            metadata_repair_due: true,
+            catalogue: restore.catalogue,
+            ..Window::default()
+        };
+        window.config.retention_days = 0; // keep the historical image
+        for entry in &window.catalogue.images {
+            assert_eq!(
+                view::display_title(entry),
+                entry.filename.file_stem().unwrap().to_string_lossy(),
+                "before the repair the popup shows the filename"
+            );
+        }
+
+        let (base, requests) = window_server(window_json(&[0, 1, 2, 5]));
+        let client = bing::http_client().unwrap();
+        // Retention-2 horizon: position 0 is in-window and on disk,
+        // position 1 is in-window and missing (the one real download),
+        // position 2 is eligible beyond the horizon and *not* on disk (no
+        // download solely for repair), position 5 is eligible beyond the
+        // horizon and on disk — hydrate, never fetch.
+        let batch = fetch_and_download(
+            &client,
+            &base,
+            &window.catalogue,
+            within(schedule::download_horizon(2)),
+            &roots.images,
+            &roots.state,
+            &test_backfill(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![bing::image_url("", "/th?id=OHR.Pos1_ROW1")],
+            "only the missing in-window image is downloaded"
+        );
+        let mut urlbases: Vec<_> = batch.fetched.iter().map(|e| e.urlbase.clone()).collect();
+        urlbases.sort();
+        assert_eq!(
+            urlbases,
+            [
+                "/th?id=OHR.Pos0_ROW0",
+                "/th?id=OHR.Pos1_ROW1",
+                "/th?id=OHR.Pos5_ROW5",
+            ]
+        );
+
+        finish_over(
+            &mut window,
+            &roots,
+            wallpaper::CurrentWallpaper::File(PathBuf::from("/elsewhere/foreign.jpg")),
+            Ok(batch),
+        );
+
+        let titled: Vec<_> = window
+            .catalogue
+            .images
+            .iter()
+            .filter(|e| !e.title.is_empty())
+            .map(|e| e.urlbase.as_str())
+            .collect();
+        assert_eq!(titled.len(), 3, "every image Bing still lists is repaired");
+        let historical = window
+            .catalogue
+            .images
+            .iter()
+            .find(|e| e.urlbase == "/th?id=OHR.Historical_ROW9")
+            .expect("the historical image is retained");
+        assert_eq!(
+            view::display_title(historical),
+            "20260701-Historical_ROW9_UHD",
+            "outside Bing's response the filename fallback stays"
+        );
+        let pos5 = window
+            .catalogue
+            .images
+            .iter()
+            .find(|e| e.urlbase == "/th?id=OHR.Pos5_ROW5")
+            .unwrap();
+        assert_eq!(view::display_title(pos5), "x");
+        assert_eq!(pos5.copyright, "© y");
+        assert_eq!(pos5.copyrightlink, "https://example.com");
+        assert_eq!(
+            pos5.fullstartdate, "202608020700",
+            "real time replaces …0000"
+        );
+        assert_eq!(
+            pos5.filename,
+            roots.images.join("20260802-Pos5_ROW5_UHD.jpg")
+        );
+
+        // Persisted atomically: a restart loads it with provenance `Loaded`
+        // and every title intact.
+        let reloaded = Catalogue::load_or_rebuild(&roots.catalogue, &roots.images);
+        assert_eq!(reloaded.provenance, Provenance::Loaded);
+        assert_eq!(reloaded.catalogue, window.catalogue);
+    }
+
+    #[tokio::test]
+    async fn an_offline_rebuilt_start_still_gets_thumbnails_from_the_pass() {
+        // Rebuilt catalogue, unreachable server: the repair refresh fails at
+        // the list fetch and the startup pass — armed regardless — is what
+        // fills the cache. The failure keeps every reconstructed entry and
+        // JPEG, persists no empty history, and takes the ordinary retry.
+        let roots = refresh_roots();
+        let restore = rebuilt_pack(&roots, &[0, 3]);
+        let catalogue = restore.catalogue;
+        let live = wallpaper::CurrentWallpaper::NoFile;
+
+        let dead = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            format!("http://127.0.0.1:{port}")
+        };
+        let client = bing::http_client().unwrap();
+        let refresh = fetch_and_download(
+            &client,
+            &dead,
+            &catalogue,
+            within(8),
+            &roots.images,
+            &roots.state,
+            &test_backfill().deferred(true),
+        )
+        .await;
+        assert!(matches!(refresh, Err(bing::FetchError::Http(_))));
+
+        run_thumbnail_pass(
+            catalogue.clone(),
+            0,
+            &live,
+            None,
+            &roots.images,
+            &roots.state,
+        )
+        .await;
+        for entry in &catalogue.images {
+            assert!(
+                thumbs::is_cached(&entry.filename, &roots.state),
+                "{} cached by the pass alone",
+                entry.filename.display()
+            );
+        }
+
+        let mut window = Window {
+            catalogue: catalogue.clone(),
+            ..Window::default()
+        };
+        let before = file_snapshot(&roots.images);
+        finish_over(
+            &mut window,
+            &roots,
+            live,
+            Err(RefreshError::Network("connection refused".to_owned())),
+        );
+        assert_eq!(
+            window.catalogue, catalogue,
+            "reconstructed entries retained"
+        );
+        assert_eq!(file_snapshot(&roots.images), before, "no JPEG deleted");
+        assert!(
+            !roots.catalogue.exists(),
+            "a failed repair persists nothing, least of all an empty history"
+        );
+        assert!(window.last_error.is_some(), "the ordinary 1 h retry path");
+    }
+
+    #[tokio::test]
+    async fn two_producers_over_one_rebuilt_catalogue_leave_one_intact_cache_slot_each() {
+        // The startup pass and the repair refresh run concurrently over the
+        // same rebuilt catalogue; the refresh defers its writes to the pass
+        // (`Backfill::deferred`), so the cache ends with exactly one
+        // thumbnail and one `cached` sidecar per entry and no stray
+        // `.part` — and the refresh still hydrates every entry.
+        let roots = refresh_roots();
+        let restore = rebuilt_pack(&roots, &[0, 1, 2, 3]);
+        let catalogue = restore.catalogue;
+        let (base, requests) = window_server(window_json(&[0, 1, 2, 3]));
+        let client = bing::http_client().unwrap();
+        let live = wallpaper::CurrentWallpaper::NoFile;
+
+        let pass = run_thumbnail_pass(
+            catalogue.clone(),
+            0,
+            &live,
+            None,
+            &roots.images,
+            &roots.state,
+        );
+        let deferred = test_backfill().deferred(true);
+        let refresh = fetch_and_download(
+            &client,
+            &base,
+            &catalogue,
+            within(8),
+            &roots.images,
+            &roots.state,
+            &deferred,
+        );
+        let ((), batch) = tokio::join!(pass, refresh);
+        let batch = batch.unwrap();
+
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "everything was on disk"
+        );
+        assert_eq!(batch.fetched.len(), 4, "every listed entry is hydrated");
+        let listing = thumb_dir_listing(&roots.state);
+        assert!(
+            listing.keys().all(|name| !name.ends_with(".part")),
+            "no stray .part: {listing:?}"
+        );
+        let mut expected = BTreeMap::new();
+        for entry in &catalogue.images {
+            if entry.urlbase.contains("Historical") {
+                continue;
+            }
+            assert!(thumbs::is_cached(&entry.filename, &roots.state));
+            let thumb = thumbs::thumbnail_path(&entry.filename, &roots.state).unwrap();
+            let name = thumb.file_name().unwrap().to_string_lossy().into_owned();
+            expected.insert(format!("{name}.meta"), ());
+            expected.insert(name, ());
+        }
+        // The historical image is cached too (retention 0 keeps it); its
+        // two artefacts complete the expected set.
+        let historical = catalogue
+            .images
+            .iter()
+            .find(|e| e.urlbase.contains("Historical"))
+            .unwrap();
+        let thumb = thumbs::thumbnail_path(&historical.filename, &roots.state).unwrap();
+        let name = thumb.file_name().unwrap().to_string_lossy().into_owned();
+        expected.insert(format!("{name}.meta"), ());
+        expected.insert(name, ());
+        let actual: BTreeMap<String, ()> = listing.keys().map(|k| (k.clone(), ())).collect();
+        assert_eq!(
+            actual, expected,
+            "exactly one thumbnail + sidecar per entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deferred_refresh_writes_no_thumbnails_and_an_undeferred_one_does() {
+        // The write interlock itself: with the pass pending the refresh
+        // touches the cache neither per download nor in its tail backfill;
+        // the next (undeferred) refresh backfills what it downloaded.
+        let roots = refresh_roots();
+        let (base, _requests) = window_server(window_json(&[0]));
+        let client = bing::http_client().unwrap();
+        let catalogue = Catalogue::default();
+
+        let batch = fetch_and_download(
+            &client,
+            &base,
+            &catalogue,
+            within(8),
+            &roots.images,
+            &roots.state,
+            &test_backfill().deferred(true),
+        )
+        .await
+        .unwrap();
+        let downloaded = batch.fetched[0].filename.clone();
+        assert!(downloaded.is_file());
+        assert!(!thumbs::is_cached(&downloaded, &roots.state));
+        assert!(
+            thumb_dir_listing(&roots.state).is_empty(),
+            "nothing written into the cache while deferred"
+        );
+
+        let mut merged = catalogue;
+        merged.merge(batch.fetched);
+        fetch_and_download(
+            &client,
+            &base,
+            &merged,
+            within(8),
+            &roots.images,
+            &roots.state,
+            &test_backfill(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            thumbs::is_cached(&downloaded, &roots.state),
+            "the next refresh backfills it"
+        );
+    }
+
+    #[test]
+    fn the_refresh_defers_its_thumbnail_writes_while_the_pass_is_pending() {
+        // `arm_leader_duties` arms the pass before the repair refresh, and
+        // a refresh started over a pending pass is the deferred kind; one
+        // started at rest is not. Pinned through the flag the task reads.
+        let mut window = window_with_images(1);
+        window.thumbnail_pass_pending = true;
+        drop(window.start_refresh_over(wallpaper::CurrentWallpaper::NoFile));
+        assert!(window.refresh_pending);
+        // The future captured `deferred = true`; the observable contract is
+        // exercised end to end above. Here the invariant the arming holds:
+        let mut armed = Window {
+            metadata_repair_due: true,
+            ..window_with_images(1)
+        };
+        drop(armed.arm_initial_duties(wallpaper::CurrentWallpaper::NoFile));
+        assert!(armed.thumbnail_pass_pending && armed.refresh_pending);
+        assert!(!armed.may_sweep_thumbnails(), "both producers in flight");
     }
 
     #[test]

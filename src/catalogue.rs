@@ -113,6 +113,25 @@ pub struct Catalogue {
     pub images: Vec<ImageEntry>,
 }
 
+/// Where a restored catalogue came from (see [`Catalogue::load_or_rebuild`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provenance {
+    /// Nonempty JSON loaded as-is: entries carry the metadata they were
+    /// saved with.
+    Loaded,
+    /// Reconstructed from the folder scan (the JSON was missing, corrupt or
+    /// empty): every entry has blank title/credit/link and a synthesized
+    /// `…0000` time until a fetch merge refills it.
+    Rebuilt,
+}
+
+/// A restored catalogue together with its [`Provenance`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogueRestore {
+    pub catalogue: Catalogue,
+    pub provenance: Provenance,
+}
+
 impl Catalogue {
     /// Load the catalogue JSON from `path`. Missing file and corrupt JSON
     /// are both errors — callers that want the rebuild fallback use
@@ -136,9 +155,20 @@ impl Catalogue {
     /// briefly unreachable — see [`Catalogue::prune`]) would be permanent:
     /// valid-but-empty JSON loads fine, so nothing would ever rescan again
     /// and every restored image would stay invisible and unpruned forever.
-    pub fn load_or_rebuild(path: &Path, images_dir: &Path) -> Self {
-        match Self::load(path) {
-            Ok(cat) if !cat.images.is_empty() => cat,
+    ///
+    /// The result carries its [`Provenance`]: every rescan — missing,
+    /// corrupt *and* valid-but-empty JSON — is `Rebuilt`, so the leader can
+    /// tell that the entries it holds have blank metadata and start the
+    /// repair refresh at once rather than displaying filenames until the
+    /// next scheduled fetch. Only a nonempty JSON load is `Loaded`.
+    pub fn load_or_rebuild(path: &Path, images_dir: &Path) -> CatalogueRestore {
+        let catalogue = match Self::load(path) {
+            Ok(cat) if !cat.images.is_empty() => {
+                return CatalogueRestore {
+                    catalogue: cat,
+                    provenance: Provenance::Loaded,
+                };
+            }
             Ok(_) => {
                 tracing::info!(
                     "catalogue at {} is empty; rescanning {}",
@@ -155,6 +185,10 @@ impl Catalogue {
                 );
                 Self::rebuild_from_folder(images_dir)
             }
+        };
+        CatalogueRestore {
+            catalogue,
+            provenance: Provenance::Rebuilt,
         }
     }
 
@@ -656,7 +690,9 @@ mod tests {
         let path = dir.path().join(CATALOGUE_FILENAME);
         fs::write(&path, "corrupt").unwrap();
 
-        let cat = Catalogue::load_or_rebuild(&path, &images);
+        let restore = Catalogue::load_or_rebuild(&path, &images);
+        assert_eq!(restore.provenance, Provenance::Rebuilt);
+        let cat = restore.catalogue;
 
         assert_eq!(cat.images.len(), 1);
         assert_eq!(cat.images[0].urlbase, urlbase("Foo_ROW1"));
@@ -678,16 +714,54 @@ mod tests {
         Catalogue::default().save(&path).unwrap();
         assert!(Catalogue::load(&path).unwrap().images.is_empty());
 
-        let cat = Catalogue::load_or_rebuild(&path, &images);
+        let restore = Catalogue::load_or_rebuild(&path, &images);
+        assert_eq!(restore.provenance, Provenance::Rebuilt);
+        let cat = restore.catalogue;
 
         assert_eq!(cat.images.len(), 1);
         assert_eq!(cat.images[0].urlbase, urlbase("Foo_ROW1"));
 
         // A genuinely empty folder still yields an empty catalogue (the
-        // cold start must stay armed).
+        // cold start must stay armed) — rebuilt, for what it is worth.
         let empty = dir.path().join("Empty");
         fs::create_dir_all(&empty).unwrap();
-        assert!(Catalogue::load_or_rebuild(&path, &empty).images.is_empty());
+        let restore = Catalogue::load_or_rebuild(&path, &empty);
+        assert!(restore.catalogue.images.is_empty());
+        assert_eq!(restore.provenance, Provenance::Rebuilt);
+    }
+
+    #[test]
+    fn provenance_tells_a_loaded_catalogue_from_every_rebuild() {
+        // The repair refresh keys off `Rebuilt`: a nonempty JSON load is the
+        // only `Loaded` outcome; missing, corrupt and valid-but-empty JSON
+        // all rescan the folder and say so.
+        let dir = tempfile::tempdir().unwrap();
+        let images = dir.path().join("BingWallpaper");
+        fs::create_dir_all(&images).unwrap();
+        fs::write(images.join("20260806-Foo_ROW1_UHD.jpg"), b"x").unwrap();
+        let path = dir.path().join(CATALOGUE_FILENAME);
+
+        // Missing.
+        let restore = Catalogue::load_or_rebuild(&path, &images);
+        assert_eq!(restore.provenance, Provenance::Rebuilt);
+        assert_eq!(restore.catalogue.images.len(), 1);
+        assert!(restore.catalogue.images[0].is_rebuilt());
+
+        // Saved with metadata, then loaded: `Loaded`, metadata intact.
+        let mut saved = restore.catalogue.clone();
+        saved.images[0].title = "Foo".to_owned();
+        saved.save(&path).unwrap();
+        let restore = Catalogue::load_or_rebuild(&path, &images);
+        assert_eq!(restore.provenance, Provenance::Loaded);
+        assert_eq!(restore.catalogue, saved);
+
+        // Corrupt and empty are covered by the two tests above; a
+        // truncated file counts as corrupt.
+        fs::write(&path, "{\"images\": [").unwrap();
+        assert_eq!(
+            Catalogue::load_or_rebuild(&path, &images).provenance,
+            Provenance::Rebuilt
+        );
     }
 
     #[test]
