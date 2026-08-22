@@ -720,7 +720,7 @@ pub enum Message {
     RefreshDue(u64),
     /// The fetch pipeline finished (payload: the freshly fetched entries,
     /// merged into the live catalogue on the UI thread).
-    RefreshFinished(Result<Vec<ImageEntry>, RefreshError>),
+    RefreshFinished(Result<RefreshBatch, RefreshError>),
     /// A non-leader's blocking mailbox counter allocation completed.
     PeerRefreshRequested(Result<u64, String>),
     /// The leader's blocking acknowledgement persist completed.
@@ -1671,6 +1671,35 @@ impl Window {
         )
     }
 
+    /// Remove the images Bing explicitly marked `wp: false`, entry and file
+    /// ([`Catalogue::remove_ineligible`]), gated on the same evidence the
+    /// prune uses: while the displayed file is unknowable
+    /// ([`wallpaper::CurrentWallpaper::Unknown`] — per-output mode or an
+    /// unreadable cosmic-bg config) nothing is deleted this refresh; the
+    /// live wallpaper's own entry is exempt either way. Absent `wp` never
+    /// reaches here: it blocks downloads only.
+    fn remove_ineligible_over(
+        &mut self,
+        ineligible: &[String],
+        live: &wallpaper::CurrentWallpaper,
+        download_dir: &Path,
+    ) {
+        if ineligible.is_empty() || !self.is_active_leader() {
+            return;
+        }
+        if matches!(live, wallpaper::CurrentWallpaper::Unknown) {
+            tracing::warn!(
+                "skipping removal of {} ineligible image(s): the displayed wallpaper is unknowable",
+                ineligible.len()
+            );
+            return;
+        }
+        let current = wallpaper::synced_current(live, self.current.take());
+        self.current = current.clone();
+        self.catalogue
+            .remove_ineligible(ineligible, download_dir, current.as_deref());
+    }
+
     /// [`Window::prune_and_persist`] against an already-read cosmic-bg state
     /// and explicit roots (injected so tests never touch the real folder,
     /// state dir or catalogue — same idiom as
@@ -2197,9 +2226,26 @@ impl Window {
     /// React to the fetch pipeline finishing: merge the fetched entries
     /// into the live catalogue, prune + persist, auto-apply per the plan,
     /// and reschedule the next refresh.
-    fn finish_refresh(
+    fn finish_refresh(&mut self, result: Result<RefreshBatch, RefreshError>) -> app::Task<Message> {
+        self.finish_refresh_over(
+            result,
+            wallpaper::current_wallpaper(),
+            &wallpaper::download_dir(),
+            state_dir(),
+            &catalogue_path(),
+        )
+    }
+
+    /// [`Window::finish_refresh`] against an already-read cosmic-bg state
+    /// and explicit roots (injected so tests never touch the real folder,
+    /// state dir or catalogue — same idiom as [`Window::prune_over`]).
+    fn finish_refresh_over(
         &mut self,
-        result: Result<Vec<ImageEntry>, RefreshError>,
+        result: Result<RefreshBatch, RefreshError>,
+        live: wallpaper::CurrentWallpaper,
+        download_dir: &Path,
+        state_dir: &Path,
+        catalogue_path: &Path,
     ) -> app::Task<Message> {
         self.refresh_pending = false;
         if !self.is_active_leader() {
@@ -2215,8 +2261,8 @@ impl Window {
             Err(RefreshError::Network(_)) => PeerRefreshOutcome::Network,
             Err(RefreshError::Disk(_)) => PeerRefreshOutcome::Disk,
         };
-        let fetched = match result {
-            Ok(fetched) => fetched,
+        let batch = match result {
+            Ok(batch) => batch,
             Err(error) => {
                 tracing::warn!("refresh failed: {error}");
                 self.last_error = Some(error);
@@ -2234,21 +2280,31 @@ impl Window {
         // against what is applied *right now* and the *current* retention
         // — the pipeline's start-of-fetch snapshot may be stale on both
         // counts, and the currently applied file must never be deleted.
-        self.catalogue.merge(fetched);
-        let live = self.prune_and_persist();
+        self.catalogue.merge(batch.fetched);
+        // Eligibility reconciliation, *before* the prune so its thumbnail
+        // sweep collects what this removes. It reuses the prune's evidence:
+        // in `CurrentWallpaper::Unknown` the displayed file is unknowable,
+        // `self.current` protects nothing, and nothing is deleted — the
+        // URL bases come back with the next response, so it simply retries.
+        // A valid response with zero eligible images lands here too and is
+        // a successful no-op: history and the current wallpaper stay, the
+        // error clears, cold start stays armed (nothing applied), the peer
+        // request is acknowledged as a success below.
+        self.remove_ineligible_over(&batch.ineligible, &live, download_dir);
+        let live = self.prune_over(live, download_dir, state_dir, catalogue_path);
 
         self.last_updated = Some(Utc::now());
         self.last_error = None;
 
-        // Bound once: the newest entry answers all three questions below —
-        // whether the fetch delivered anything at all, when the next refresh
-        // is due, and what to auto-apply. Cloned because the apply arm
-        // mutates `self`.
+        // The live catalogue's newest entry answers "is there anything to
+        // apply?"; the *response* answers "when is the next refresh due?".
+        // Cloned because the apply arm mutates `self`.
         let newest = self.catalogue.newest().cloned();
         let plan = refresh_success_plan(
             self.cold_start.applies_over(live.as_deref()),
             live.as_deref(),
-            newest.as_ref().map(|e| e.fullstartdate.as_str()),
+            newest.is_some(),
+            batch.anchor.as_deref(),
             Utc::now(),
         );
         let mut apply_failed = false;
@@ -3143,7 +3199,7 @@ async fn run_refresh(
     retention_days: u16,
     live: &wallpaper::CurrentWallpaper,
     current: Option<PathBuf>,
-) -> Result<Vec<ImageEntry>, RefreshError> {
+) -> Result<RefreshBatch, RefreshError> {
     let client = bing::http_client()?;
     fetch_and_download(
         &client,
@@ -3171,7 +3227,7 @@ async fn fetch_and_download(
     download_dir: &Path,
     state_dir: &Path,
     backfill: &Backfill<'_>,
-) -> Result<Vec<ImageEntry>, bing::FetchError> {
+) -> Result<RefreshBatch, bing::FetchError> {
     // A crash mid-download leaves an orphaned `.part` behind; sweep first.
     bing::sweep_part_files(download_dir);
 
@@ -3226,7 +3282,26 @@ async fn fetch_and_download(
     let handled: HashSet<&Path> = fetched.iter().map(|e| e.filename.as_path()).collect();
     backfill_thumbnails(catalogue, &handled, download_dir, state_dir, backfill).await;
 
-    Ok(fetched)
+    Ok(RefreshBatch {
+        fetched,
+        ineligible: archive.ineligible,
+        anchor: archive.anchor,
+    })
+}
+
+/// What one successful fetch hands back to the UI thread
+/// ([`Message::RefreshFinished`]): the entries it hydrated or downloaded,
+/// the URL bases Bing explicitly marked `wp: false` (to be removed, entry
+/// and file, by [`Window::finish_refresh`] — never here, off the live
+/// state), and the response's scheduling anchor — the newest structurally
+/// valid `fullstartdate` regardless of eligibility, so an all-ineligible day
+/// still schedules the normal daily delay instead of falling into
+/// `next_refresh`'s out-of-range reset off a stale catalogue entry.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefreshBatch {
+    pub fetched: Vec<ImageEntry>,
+    pub ineligible: Vec<String>,
+    pub anchor: Option<String>,
 }
 
 /// Give catalogue entries that still lack a usable preview one, newest first,
@@ -3422,19 +3497,28 @@ struct RefreshSuccessPlan {
     delay: Duration,
 }
 
+/// `has_images` comes from the *live catalogue* after the merge (is there
+/// anything to apply?); `anchor` comes from the *response* (the newest
+/// structurally valid `fullstartdate`, eligible or not — when is Bing's next
+/// image due?). The two were once one `newest_fullstartdate` read off the
+/// catalogue, which scheduled an all-ineligible response on a warm
+/// catalogue off a stale entry and hit `next_refresh`'s ~6-minute
+/// out-of-range reset every time.
 fn refresh_success_plan(
     cold_start_pending: bool,
     live_current: Option<&Path>,
-    newest_fullstartdate: Option<&str>,
+    has_images: bool,
+    anchor: Option<&str>,
     now: DateTime<Utc>,
 ) -> RefreshSuccessPlan {
-    let has_images = newest_fullstartdate.is_some();
     RefreshSuccessPlan {
         auto_apply: has_images && wallpaper::should_auto_apply(cold_start_pending, live_current),
-        delay: match newest_fullstartdate {
+        delay: match anchor {
             Some(date) => schedule::next_refresh(Some(date), now),
-            // A success that leaves the catalogue empty must not reuse the
-            // 5 s cold-start delay — that would tight-loop against Bing.
+            // A success with no anchor cannot happen (a response without a
+            // structurally valid entry is `FetchError::EmptyList`), but it
+            // must never reuse the 5 s cold-start delay — that would
+            // tight-loop against Bing.
             None => schedule::ERROR_RETRY_DELAY,
         },
     }
@@ -4481,6 +4565,7 @@ mod tests {
         let plan = refresh_success_plan(
             true,
             Some(std::path::Path::new("/usr/share/backgrounds/x.jpg")),
+            true,
             Some("202608070700"),
             now,
         );
@@ -4494,6 +4579,7 @@ mod tests {
         let plan = refresh_success_plan(
             false,
             Some(std::path::Path::new("/usr/share/backgrounds/x.jpg")),
+            true,
             Some("202608070700"),
             now,
         );
@@ -4507,7 +4593,7 @@ mod tests {
         // auto-apply. `finish_refresh` also keeps the cold-start flag armed
         // for the fetch that finally delivers (it only spends the flag on a
         // successful apply — see `any_successful_apply_spends_the_cold_start_flag`).
-        let plan = refresh_success_plan(true, None, None, Utc::now());
+        let plan = refresh_success_plan(true, None, false, None, Utc::now());
         assert!(!plan.auto_apply);
         assert_eq!(plan.delay, schedule::ERROR_RETRY_DELAY);
     }
@@ -4539,6 +4625,7 @@ mod tests {
         let plan = refresh_success_plan(
             window.cold_start.applies_over(Some(user_choice)),
             Some(user_choice),
+            true,
             Some("202608070700"),
             Utc::now(),
         );
@@ -4607,6 +4694,7 @@ mod tests {
         let plan = refresh_success_plan(
             retry.applies_over(Some(user_choice)),
             Some(user_choice),
+            true,
             Some("202608070700"),
             Utc::now(),
         );
@@ -4894,7 +4982,8 @@ mod tests {
             &test_backfill(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .fetched;
 
         assert_eq!(fetched.len(), 1);
         let path = &fetched[0].filename;
@@ -4939,7 +5028,8 @@ mod tests {
             &test_backfill(),
         )
         .await
-        .expect("existing file must be reused, not re-downloaded");
+        .expect("existing file must be reused, not re-downloaded")
+        .fetched;
 
         assert_eq!(fetched.len(), 1);
         assert_eq!(fetched[0].filename, existing);
@@ -4977,7 +5067,8 @@ mod tests {
             &test_backfill(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .fetched;
 
         let fresh = download_dir.join("20260807-Foo_ROW1_UHD.jpg");
         assert_eq!(fetched[0].filename, fresh);
@@ -5036,7 +5127,8 @@ mod tests {
             &test_backfill(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .fetched;
 
         // The fetch window holds only the new image…
         assert_eq!(fetched.len(), 1);
@@ -5589,7 +5681,8 @@ mod tests {
             &test_backfill(),
         )
         .await
-        .expect("an undecodable file must not fail the pipeline");
+        .expect("an undecodable file must not fail the pipeline")
+        .fetched;
 
         assert_eq!(fetched.len(), 1);
         assert!(
@@ -7014,7 +7107,11 @@ source = "git+https://example.invalid/repo#abc""#;
         use cosmic::Application as _;
 
         for result in [
-            Ok(vec![entry_in_memory("20260808", "Fresh_ROW1")]),
+            Ok(RefreshBatch {
+                fetched: vec![entry_in_memory("20260808", "Fresh_ROW1")],
+                ineligible: Vec::new(),
+                anchor: Some("202608080700".to_owned()),
+            }),
             Err(RefreshError::Network("offline".to_owned())),
         ] {
             let existing = entry_in_memory("20260807", "Existing_ROW1");
@@ -8094,6 +8191,351 @@ source = "git+https://example.invalid/repo#abc""#;
         window.thumbnail_pass_pending = false;
         prune(&mut window);
         assert!(!fresh_thumb.exists(), "the orphan is still collected");
+    }
+
+    // -----------------------------------------------------------------
+    // Eligibility reconciliation at `RefreshFinished` (Task 1b).
+    // -----------------------------------------------------------------
+
+    /// Tempdir roots for a `finish_refresh_over` run: the images folder,
+    /// the state dir and the catalogue path inside it.
+    struct RefreshRoots {
+        _dir: tempfile::TempDir,
+        images: PathBuf,
+        state: PathBuf,
+        catalogue: PathBuf,
+    }
+
+    fn refresh_roots() -> RefreshRoots {
+        let dir = tempfile::tempdir().unwrap();
+        let images = dir.path().join("images");
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&images).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let catalogue = state.join(catalogue::CATALOGUE_FILENAME);
+        RefreshRoots {
+            _dir: dir,
+            images,
+            state,
+            catalogue,
+        }
+    }
+
+    /// A successful fetch that downloaded nothing and marks `urlbases`
+    /// explicitly ineligible — the shape of a refresh on a day Bing
+    /// restricts an image the applet already holds.
+    fn batch_marking_ineligible(urlbases: &[&str]) -> Result<RefreshBatch, RefreshError> {
+        Ok(RefreshBatch {
+            fetched: Vec::new(),
+            ineligible: urlbases.iter().map(|u| (*u).to_owned()).collect(),
+            anchor: Some("202608080700".to_owned()),
+        })
+    }
+
+    fn finish_over(
+        window: &mut Window,
+        roots: &RefreshRoots,
+        live: wallpaper::CurrentWallpaper,
+        result: Result<RefreshBatch, RefreshError>,
+    ) {
+        window.refresh_pending = true;
+        drop(window.finish_refresh_over(
+            result,
+            live,
+            &roots.images,
+            &roots.state,
+            &roots.catalogue,
+        ));
+    }
+
+    #[test]
+    fn an_explicitly_ineligible_image_is_removed_durably_entry_and_file() {
+        // `wp: false` on an image already on disk: the entry *and* the JPEG
+        // go, and because the file is gone a later rebuild from the folder
+        // (missing `catalogue.json`) cannot bring the image back.
+        let roots = refresh_roots();
+        let kept = entry_on_disk(&roots.images, "20260807", "Kept_ROW1");
+        let restricted = entry_on_disk(&roots.images, "20260806", "Restricted_ROW2");
+        let mut window = Window::default();
+        window.config.retention_days = 0;
+        window.catalogue.images = vec![restricted.clone(), kept.clone()];
+        window.last_error = Some(RefreshError::Network("old".to_owned()));
+
+        // The ineligible list is what the parser produces for an explicit
+        // `false`, so the chain parser → batch → removal is the one pinned.
+        let archive = bing::parse_image_list(&format!(
+            r#"{{"images":[{{"startdate":"20260806","fullstartdate":"202608060700","urlbase":"{}","copyright":"x (© y)","copyrightlink":"https://example.com","title":"Info","wp":false}}]}}"#,
+            restricted.urlbase
+        ))
+        .unwrap();
+        assert_eq!(archive.ineligible, vec![restricted.urlbase.clone()]);
+        let batch = Ok(RefreshBatch {
+            fetched: Vec::new(),
+            ineligible: archive.ineligible,
+            anchor: archive.anchor,
+        });
+        finish_over(
+            &mut window,
+            &roots,
+            wallpaper::CurrentWallpaper::File(kept.filename.clone()),
+            batch,
+        );
+
+        assert_eq!(window.catalogue.images, vec![kept.clone()]);
+        assert!(!restricted.filename.exists(), "the JPEG is unlinked");
+        assert!(kept.filename.is_file());
+        assert!(
+            window.last_error.is_none(),
+            "a no-download refresh is a success"
+        );
+        assert!(window.last_updated.is_some());
+        assert!(!window.refresh_pending);
+
+        // Restart with the catalogue lost: the rebuild scans the folder and
+        // must not find the restricted image.
+        std::fs::remove_file(&roots.catalogue).unwrap();
+        let rebuilt = Catalogue::load_or_rebuild(&roots.catalogue, &roots.images);
+        assert_eq!(
+            rebuilt
+                .images
+                .iter()
+                .map(|e| &e.filename)
+                .collect::<Vec<_>>(),
+            vec![&kept.filename],
+            "a removed image must not resurrect through a rebuild"
+        );
+    }
+
+    #[test]
+    fn an_image_whose_wp_is_absent_keeps_its_entry_and_file() {
+        // Absent `wp` blocks downloads only (Task 1a) — it is never a reason
+        // to delete: the parser lists nothing as ineligible, so the refresh
+        // completion removes nothing.
+        let roots = refresh_roots();
+        let held = entry_on_disk(&roots.images, "20260807", "Held_ROW1");
+        let mut window = Window::default();
+        window.config.retention_days = 0;
+        window.catalogue.images = vec![held.clone()];
+
+        let archive = bing::parse_image_list(&format!(
+            r#"{{"images":[{{"startdate":"20260807","fullstartdate":"202608070700","urlbase":"{}","copyright":"x (© y)","copyrightlink":"https://example.com","title":"Info"}}]}}"#,
+            held.urlbase
+        ))
+        .unwrap();
+        assert!(archive.ineligible.is_empty());
+        assert_eq!(archive.absent_wp, 1);
+        let batch = Ok(RefreshBatch {
+            fetched: Vec::new(),
+            ineligible: archive.ineligible,
+            anchor: archive.anchor,
+        });
+        finish_over(
+            &mut window,
+            &roots,
+            wallpaper::CurrentWallpaper::NoFile,
+            batch,
+        );
+
+        assert_eq!(window.catalogue.images, vec![held.clone()]);
+        assert!(held.filename.is_file());
+        assert!(window.last_error.is_none());
+    }
+
+    #[test]
+    fn an_ineligible_image_whose_unlink_fails_keeps_its_entry_until_a_retry_succeeds() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // A read-only folder: the unlink fails, so the entry must stay —
+        // dropping it while the JPEG remains would open the resurrection
+        // window the file-level guarantee exists to close. The next refresh
+        // (folder writable again) retries and removes both.
+        let roots = refresh_roots();
+        let restricted = entry_on_disk(&roots.images, "20260806", "Restricted_ROW2");
+        let mut window = Window::default();
+        window.config.retention_days = 0;
+        window.catalogue.images = vec![restricted.clone()];
+
+        std::fs::set_permissions(&roots.images, std::fs::Permissions::from_mode(0o555)).unwrap();
+        finish_over(
+            &mut window,
+            &roots,
+            wallpaper::CurrentWallpaper::NoFile,
+            batch_marking_ineligible(&[&restricted.urlbase]),
+        );
+        std::fs::set_permissions(&roots.images, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            window.catalogue.images,
+            vec![restricted.clone()],
+            "the entry is retained while its file cannot be removed"
+        );
+        assert!(restricted.filename.is_file());
+        assert!(window.last_error.is_none(), "still a successful refresh");
+
+        finish_over(
+            &mut window,
+            &roots,
+            wallpaper::CurrentWallpaper::NoFile,
+            batch_marking_ineligible(&[&restricted.urlbase]),
+        );
+        assert!(window.catalogue.images.is_empty(), "the retry removes it");
+        assert!(!restricted.filename.exists());
+    }
+
+    #[test]
+    fn an_unknowable_wallpaper_blocks_ineligibility_removal_like_it_blocks_the_prune() {
+        // Mirror of `classify_maps_the_three_cosmic_bg_states`: only
+        // `Unknown` (per-output mode, unreadable config) withholds the
+        // evidence; `File` and `NoFile` are both knowable.
+        for (live, deleted) in [
+            (wallpaper::CurrentWallpaper::Unknown, false),
+            (wallpaper::CurrentWallpaper::NoFile, true),
+            (
+                wallpaper::CurrentWallpaper::File(PathBuf::from("/usr/share/backgrounds/x.jpg")),
+                true,
+            ),
+        ] {
+            let roots = refresh_roots();
+            let restricted = entry_on_disk(&roots.images, "20260806", "Restricted_ROW2");
+            let mut window = Window::default();
+            window.config.retention_days = 0;
+            window.catalogue.images = vec![restricted.clone()];
+            // What a stale `self.current` would "protect" in `Unknown`:
+            // nothing relevant, which is exactly why nothing may be deleted.
+            window.current = None;
+
+            finish_over(
+                &mut window,
+                &roots,
+                live.clone(),
+                batch_marking_ineligible(&[&restricted.urlbase]),
+            );
+
+            assert_eq!(restricted.filename.exists(), !deleted, "{live:?}");
+            assert_eq!(window.catalogue.images.is_empty(), deleted, "{live:?}");
+            assert!(window.last_error.is_none(), "{live:?}");
+        }
+    }
+
+    #[test]
+    fn the_live_wallpaper_survives_its_own_ineligibility_until_replaced() {
+        // The image on screen is exempt, entry and file, so the popup keeps
+        // attributing what is actually displayed (`view::displayed` would
+        // otherwise fall back to the newest entry). Once another image is
+        // applied, the next refresh removes it.
+        let roots = refresh_roots();
+        let shown = entry_on_disk(&roots.images, "20260806", "Shown_ROW2");
+        let newer = entry_on_disk(&roots.images, "20260807", "Newer_ROW1");
+        let mut window = Window::default();
+        window.config.retention_days = 0;
+        window.catalogue.images = vec![shown.clone(), newer.clone()];
+
+        finish_over(
+            &mut window,
+            &roots,
+            wallpaper::CurrentWallpaper::File(shown.filename.clone()),
+            batch_marking_ineligible(&[&shown.urlbase]),
+        );
+
+        assert_eq!(window.catalogue.images, vec![shown.clone(), newer.clone()]);
+        assert!(shown.filename.is_file());
+        assert_eq!(window.current.as_deref(), Some(shown.filename.as_path()));
+        assert_eq!(
+            view::displayed(&window.catalogue, window.current.as_deref()),
+            Some(&shown),
+            "the popup still attributes the image on screen"
+        );
+
+        // Another image is applied: the first refresh after that removes it.
+        finish_over(
+            &mut window,
+            &roots,
+            wallpaper::CurrentWallpaper::File(newer.filename.clone()),
+            batch_marking_ineligible(&[&shown.urlbase]),
+        );
+        assert_eq!(window.catalogue.images, vec![newer.clone()]);
+        assert!(!shown.filename.exists());
+        assert!(newer.filename.is_file());
+    }
+
+    #[test]
+    fn an_all_ineligible_response_on_a_warm_catalogue_is_a_daily_no_op() {
+        // Nothing downloadable today: history and the current wallpaper
+        // stay, the error clears, cold start stays armed, and the next
+        // refresh is scheduled off the *response* anchor — the normal daily
+        // delay, not the ~6-minute out-of-range reset a stale catalogue
+        // entry would produce.
+        let now = Utc::now();
+        let stale = entry_in_memory("20200101", "Ancient_ROW0");
+        let today = now.format("%Y%m%d0700").to_string();
+
+        let plan = refresh_success_plan(true, None, true, Some(&today), now);
+        assert!(
+            plan.auto_apply,
+            "the live catalogue still has an image to apply"
+        );
+        assert_eq!(plan.delay, schedule::next_refresh(Some(&today), now));
+        assert_ne!(
+            plan.delay,
+            schedule::next_refresh(Some(&stale.fullstartdate), now),
+            "the stale entry would have hit the out-of-range reset"
+        );
+        assert!(plan.delay > Duration::from_secs(3_600));
+
+        // Through the completion handler, warm: an image we hold, nothing
+        // fetched, the ineligible image is one we never downloaded. A
+        // foreign live wallpaper keeps `wallpaper::apply` (real cosmic-bg
+        // config) out of the test.
+        let roots = refresh_roots();
+        let held = entry_on_disk(&roots.images, "20200101", "Ancient_ROW0");
+        let mut window = Window::default();
+        window.config.retention_days = 0;
+        window.catalogue.images = vec![held.clone()];
+        window.last_error = Some(RefreshError::Network("old".to_owned()));
+        let generation = window.timer_generation;
+        let foreign = PathBuf::from("/usr/share/backgrounds/x.jpg");
+
+        finish_over(
+            &mut window,
+            &roots,
+            wallpaper::CurrentWallpaper::File(foreign.clone()),
+            Ok(RefreshBatch {
+                fetched: Vec::new(),
+                ineligible: vec!["/th?id=OHR.Other_ROW3".to_owned()],
+                anchor: Some(today.clone()),
+            }),
+        );
+        assert_eq!(window.catalogue.images, vec![held.clone()]);
+        assert!(held.filename.is_file());
+        assert_eq!(window.current.as_deref(), Some(foreign.as_path()));
+        assert!(window.last_error.is_none());
+        assert!(window.timer_generation > generation, "rescheduled");
+
+        // And cold: nothing held, nothing downloadable. Nothing is applied,
+        // so the cold-start flag stays armed for the fetch that finally
+        // delivers, and the reschedule still comes from the anchor (the
+        // plan's `None` branch — the 1 h back-off — is not taken).
+        let roots = refresh_roots();
+        let mut window = Window {
+            cold_start: ColdStart::Pending,
+            ..Window::default()
+        };
+        window.last_error = Some(RefreshError::Network("old".to_owned()));
+        let generation = window.timer_generation;
+        finish_over(
+            &mut window,
+            &roots,
+            wallpaper::CurrentWallpaper::NoFile,
+            Ok(RefreshBatch {
+                fetched: Vec::new(),
+                ineligible: vec!["/th?id=OHR.Other_ROW3".to_owned()],
+                anchor: Some(today),
+            }),
+        );
+        assert!(window.catalogue.images.is_empty());
+        assert_eq!(window.cold_start, ColdStart::Pending, "still armed");
+        assert!(window.last_error.is_none());
+        assert!(window.timer_generation > generation, "rescheduled");
     }
 
     #[test]

@@ -375,6 +375,80 @@ impl Catalogue {
         removed
     }
 
+    /// Remove the entries Bing has *explicitly* marked ineligible
+    /// (`wp: false`) — entry **and** file, so a later
+    /// [`Catalogue::rebuild_from_folder`] cannot resurrect the image.
+    /// Returns the removed paths, for the thumbnail sweep.
+    ///
+    /// Mirrors [`Catalogue::prune`] rule for rule: only a file the entry
+    /// legitimately names inside `images_dir` is unlinked (a foreign path is
+    /// never deleted — but its entry is dropped, as prune does); an entry is
+    /// dropped only once its file is confirmed gone (the unlink succeeded or
+    /// the file was already absent) — on unlink failure it is kept and the
+    /// next refresh retries, so there is never a window where an entry is
+    /// gone while a rebuildable JPEG remains; and the currently applied
+    /// file is exempt, entry and file, so the popup keeps attributing the
+    /// image that is actually on screen (`view::displayed` would otherwise
+    /// fall back to the newest entry). It goes on the first refresh after
+    /// another image is applied. Callers hold the `CurrentWallpaper::Unknown`
+    /// guard (see `app.rs`): when the displayed file is unknowable,
+    /// `currently_applied` protects nothing and nothing may be deleted.
+    pub fn remove_ineligible(
+        &mut self,
+        urlbases: &[String],
+        images_dir: &Path,
+        currently_applied: Option<&Path>,
+    ) -> Vec<PathBuf> {
+        let mut removed = Vec::new();
+        if urlbases.is_empty() {
+            return removed;
+        }
+        self.images.retain(|entry| {
+            if !urlbases.contains(&entry.urlbase)
+                || currently_applied == Some(entry.filename.as_path())
+            {
+                return true;
+            }
+            let ours = entry.filename.parent() == Some(images_dir) && entry.names_own_file();
+            if !ours {
+                tracing::warn!(
+                    "dropping ineligible catalogue entry with foreign path {} (file left untouched)",
+                    entry.filename.display()
+                );
+                removed.push(entry.filename.clone());
+                return false;
+            }
+            match fs::remove_file(&entry.filename) {
+                Ok(()) => {
+                    tracing::info!(
+                        "removed {}: Bing marks it ineligible as a wallpaper",
+                        entry.filename.display()
+                    );
+                    removed.push(entry.filename.clone());
+                    false
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    removed.push(entry.filename.clone());
+                    false
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "failed to remove ineligible {}: {error}",
+                        entry.filename.display()
+                    );
+                    true // keep the entry — retry on the next refresh
+                }
+            }
+        });
+        removed.retain(|path| {
+            !self
+                .images
+                .iter()
+                .any(|e| e.filename.file_name() == path.file_name())
+        });
+        removed
+    }
+
     /// Newest image (last in ascending order).
     pub fn newest(&self) -> Option<&ImageEntry> {
         self.images.last()
@@ -1105,6 +1179,57 @@ mod tests {
         cat.prune(dir.path(), 3, None, now());
 
         assert_eq!(cat.images, vec![odd]); // never delete on a guess
+    }
+
+    #[test]
+    fn remove_ineligible_mirrors_prune_rule_for_rule() {
+        // Only the named URL bases go; the applied file is exempt; an
+        // already-vanished file still lets its entry go (the file-level
+        // guarantee is met); a tampered entry pointing at a foreign file is
+        // scrubbed with the file left untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let images = dir.path().join("BingWallpaper");
+        fs::create_dir_all(&images).unwrap();
+        let victim = dir.path().join("important.pdf");
+        fs::write(&victim, b"precious").unwrap();
+        let mut hostile = entry_with_file(&images, "20200101", "Evil_ROW1");
+        fs::remove_file(&hostile.filename).unwrap();
+        hostile.filename = victim.clone();
+        let vanished = entry_with_file(&images, "20200102", "Vanished_ROW2");
+        fs::remove_file(&vanished.filename).unwrap();
+        let shown = entry_with_file(&images, "20200103", "Shown_ROW3");
+        let restricted = entry_with_file(&images, "20200104", "Restricted_ROW4");
+        let kept = entry_with_file(&images, "20260807", "Kept_ROW5");
+        let mut cat = Catalogue {
+            images: vec![
+                hostile,
+                vanished.clone(),
+                shown.clone(),
+                restricted.clone(),
+                kept.clone(),
+            ],
+        };
+        let ineligible = [
+            urlbase("Evil_ROW1"),
+            urlbase("Vanished_ROW2"),
+            urlbase("Shown_ROW3"),
+            urlbase("Restricted_ROW4"),
+        ];
+
+        let removed = cat.remove_ineligible(&ineligible, &images, Some(&shown.filename));
+
+        assert!(victim.is_file(), "foreign file must never be deleted");
+        assert!(shown.filename.is_file(), "the applied file is exempt");
+        assert!(!restricted.filename.exists());
+        assert!(kept.filename.is_file());
+        assert_eq!(cat.images, vec![shown, kept]);
+        assert_eq!(
+            removed,
+            vec![victim, vanished.filename, restricted.filename]
+        );
+
+        // An empty list is a no-op even against an unreadable folder.
+        assert!(cat.remove_ineligible(&[], &images, None).is_empty());
     }
 
     #[test]

@@ -178,7 +178,7 @@ There is no external API change. Internal interfaces change as follows:
 
 ### Task 1b: Reconcile the catalogue and schedule on completion
 
-- [ ] Carry explicitly ineligible URL bases to refresh completion. Deletion
+- [x] Carry explicitly ineligible URL bases to refresh completion. Deletion
       is gated on the same evidence prune uses: if the live state is
       `CurrentWallpaper::Unknown`, delete nothing this refresh and retry next
       time; otherwise, for each matching entry **other than the live
@@ -188,38 +188,40 @@ There is no external API change. Internal interfaces change as follows:
       refresh. The next `thumbs::reconcile` sweep collects the orphaned
       thumbnail (it is a directory sweep, deferred while
       `may_sweep_thumbnails` is false as today).
-- [ ] Exempt the live wallpaper's entry from eligibility removal, mirroring
+- [x] Exempt the live wallpaper's entry from eligibility removal, mirroring
       prune's `currently_applied` protection; it and its file go on the first
       refresh after another image is applied. Document the exemption and the
       `Unknown` guard in the CLAUDE.md `catalogue.rs` bullet.
-- [ ] Treat a valid response with zero eligible images as a successful no-op:
+- [x] Treat a valid response with zero eligible images as a successful no-op:
       retain other eligible history and the current wallpaper, clear prior
       refresh errors, keep cold-start auto-apply armed, acknowledge peer
       refreshes successfully, and schedule from the response's anchor.
       Emit one `tracing::warn!` that names the explicit-`false` count and the
       absent-`wp` count separately, so an all-restricted day and a Bing
       payload change that dropped the field are distinguishable in logs
-      without a new i18n string.
-- [ ] Split `refresh_success_plan`: `auto_apply` from the live catalogue's
+      without a new i18n string. (The warn was already placed in
+      `fetch_and_download` by Task 1a; it is kept there, where both counts
+      are at hand.)
+- [x] Split `refresh_success_plan`: `auto_apply` from the live catalogue's
       `has_images`, `delay` from the response anchor. Update
       `refresh_success_plan_without_images_backs_off` (`src/app.rs:4490`)
       and any sibling tests to the new signature.
-- [ ] Update the CLAUDE.md `src/app.rs` refresh-pipeline bullet
+- [x] Update the CLAUDE.md `src/app.rs` refresh-pipeline bullet
       (`RefreshFinished` now also reconciles eligibility).
-- [ ] Test: an already-downloaded image marked `Some(false)` is removed from
+- [x] Test: an already-downloaded image marked `Some(false)` is removed from
       the catalogue **and** its JPEG is gone; then delete `catalogue.json`,
       restart via `load_or_rebuild`, and assert it does not return.
-- [ ] Test: an already-downloaded image whose `wp` is absent keeps its entry
+- [x] Test: an already-downloaded image whose `wp` is absent keeps its entry
       and file.
-- [ ] Test: unlink failure (read-only dir) ⇒ entry retained, no resurrection
+- [x] Test: unlink failure (read-only dir) ⇒ entry retained, no resurrection
       window; next refresh retries.
-- [ ] Test: `CurrentWallpaper::Unknown` ⇒ nothing deleted (mirror
+- [x] Test: `CurrentWallpaper::Unknown` ⇒ nothing deleted (mirror
       `classify_maps_the_three_cosmic_bg_states`).
-- [ ] Test: the live wallpaper's entry marked `Some(false)` stays in the
+- [x] Test: the live wallpaper's entry marked `Some(false)` stays in the
       catalogue and on disk; `view::displayed` still resolves to it.
-- [ ] Test: all-ineligible response on a warm catalogue schedules the normal
+- [x] Test: all-ineligible response on a warm catalogue schedules the normal
       daily delay, not the out-of-range ~6-minute reset.
-- [ ] Run focused catalogue and refresh tests before Task 2.
+- [x] Run focused catalogue and refresh tests before Task 2.
 
 ### Task 2: Request the full window; bounded fallback download
 

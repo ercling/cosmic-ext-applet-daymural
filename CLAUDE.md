@@ -88,13 +88,28 @@ do not duplicate `appstreamcli` or desktop-file syntax validation in Rust.
   open/close, startup restore (catalogue + config, no network), the refresh
   pipeline split in two: `run_refresh`/`fetch_and_download` (async, off the UI
   thread, injectable dirs + base URL for tests: fetch list → download missing →
-  thumbnails) and the `RefreshFinished` handler (UI thread, against *live*
-  state: merge → prune protecting the live current wallpaper → save →
-  auto-apply per the "don't clobber" rule → reschedule — never merge/prune in
-  the async task, its snapshot goes stale during a long fetch), one-shot
-  generation-counter timers for refresh and shuffle (a stale tick is ignored, so
-  rescheduling atomically replaces the pending timer), `state_dir()`/`catalogue_path()`,
-  and the tested pure decision `refresh_success_plan`.
+  thumbnails; returns a `RefreshBatch` — fetched entries, the explicitly
+  ineligible `wp: false` URL bases, and the response's scheduling anchor)
+  and the `RefreshFinished` handler (UI thread, against *live* state: merge →
+  eligibility reconciliation (`remove_ineligible_over`: entry **and** file of
+  every `wp: false` image, the live wallpaper's exempt, nothing at all while
+  the live state is `CurrentWallpaper::Unknown` — the same evidence the
+  prune's `prune_retention` guard uses) → prune protecting the live current
+  wallpaper, whose thumbnail sweep also collects what the reconciliation
+  removed → save → auto-apply per the "don't clobber" rule → reschedule —
+  never merge/reconcile/prune in the async task, its snapshot goes stale
+  during a long fetch), one-shot generation-counter timers for refresh and
+  shuffle (a stale tick is ignored, so rescheduling atomically replaces the
+  pending timer), `state_dir()`/`catalogue_path()`, and the tested pure
+  decision `refresh_success_plan` — `auto_apply` from the live catalogue's
+  `has_images`, `delay` from the *response* anchor (the newest structurally
+  valid `fullstartdate`, eligible or not), so a valid response with zero
+  eligible images is a successful no-op: history and the current wallpaper
+  stay, the error clears, cold start stays armed, peers are acknowledged as a
+  success, and the next refresh is the normal daily one rather than
+  `next_refresh`'s ~6-minute reset off a stale catalogue entry. The one
+  `tracing::warn!` for that day (in `fetch_and_download`) names the explicit
+  `false` and absent-`wp` counts separately.
   The out-of-window thumbnail backfill at the end of `fetch_and_download` is
   governed by the `Backfill` policy struct (budget + retention + applied file,
   injected by tests). Its rule: **the budget buys decodes, and no entry is ever
@@ -194,7 +209,20 @@ do not duplicate `appstreamcli` or desktop-file syntax validation in Rust.
   merge-with-dedupe by `urlbase`, retention prune (never deletes the currently
   applied file), `rebuild_from_folder` (filename ↔ urlbase mapping is
   deterministic both ways, so rebuilds dedupe against the next fetch with no
-  re-downloads), navigation helpers. Two guards keep a transient from erasing
+  re-downloads), `remove_ineligible` (Bing's explicit `wp: false` verdicts,
+  carried by the `RefreshBatch`: removes entry **and** file so a rebuild
+  cannot resurrect the image; mirrors `prune` rule for rule — only a file the
+  entry legitimately names inside `images_dir` is unlinked, the entry is
+  dropped only once the file is confirmed gone (unlink succeeded or already
+  absent; on failure it is kept and the next refresh retries, so no window
+  ever has an entry gone with a rebuildable JPEG left), and the currently
+  applied file is exempt, entry and file, so `view::displayed` keeps
+  attributing the image on screen — it goes on the first refresh after
+  another image is applied. The caller in `app.rs` adds the
+  `CurrentWallpaper::Unknown` guard: when the displayed file is unknowable
+  `currently_applied` protects nothing, so nothing is deleted that refresh.
+  Absent `wp` never reaches it — it blocks downloads only), navigation
+  helpers. Two guards keep a transient from erasing
   the history: `prune` is a no-op while `images_dir` cannot be enumerated (an
   absent folder is not evidence that its files are gone — otherwise every entry
   looks vanished and the startup sweep *persists* that), and `load_or_rebuild`
