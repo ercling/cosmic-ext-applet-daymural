@@ -59,13 +59,16 @@ pub fn next_refresh(newest_fullstartdate: Option<&str>, now: DateTime<Utc>) -> D
     Duration::from_secs(diff as u64) // diff >= 360 by construction
 }
 
-/// How many images to request from Bing: retention-sized when retention is
-/// 1–8 days (no point downloading 8 × ~5 MB just to prune most of them),
-/// otherwise the API maximum of 8 (also for 0 = keep forever).
-pub fn fetch_count(retention_days: u16) -> u8 {
+/// How many of the newest archive positions a refresh considers for
+/// download. The list request itself is always the full supported window
+/// (`bing::ARCHIVE_WINDOW`, eight entries — a few KB of JSON); retention
+/// only decides which of those positions are worth ~5 MB each: 1–7 days
+/// → that many newest positions (no point downloading eight just to prune
+/// most of them), otherwise all eight (also for `0` = keep forever).
+pub fn download_horizon(retention_days: u16) -> u8 {
     match retention_days {
-        1..=8 => retention_days as u8,
-        _ => 8,
+        1..=7 => retention_days as u8,
+        _ => crate::bing::ARCHIVE_WINDOW,
     }
 }
 
@@ -181,12 +184,13 @@ mod tests {
     }
 
     #[test]
-    fn fetch_count_follows_retention() {
-        assert_eq!(fetch_count(1), 1);
-        assert_eq!(fetch_count(3), 3);
-        assert_eq!(fetch_count(8), 8);
-        assert_eq!(fetch_count(30), 8); // capped at the API max
-        assert_eq!(fetch_count(0), 8); // forever → full window
+    fn download_horizon_follows_retention() {
+        assert_eq!(download_horizon(1), 1);
+        assert_eq!(download_horizon(3), 3);
+        assert_eq!(download_horizon(7), 7);
+        assert_eq!(download_horizon(8), 8);
+        assert_eq!(download_horizon(30), 8); // capped at the archive window
+        assert_eq!(download_horizon(0), 8); // forever → full window
     }
 
     #[test]

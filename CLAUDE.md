@@ -89,7 +89,19 @@ do not duplicate `appstreamcli` or desktop-file syntax validation in Rust.
   pipeline split in two: `run_refresh`/`fetch_and_download` (async, off the UI
   thread, injectable dirs + base URL for tests: fetch list → download missing →
   thumbnails; returns a `RefreshBatch` — fetched entries, the explicitly
-  ineligible `wp: false` URL bases, and the response's scheduling anchor)
+  ineligible `wp: false` URL bases, the response's scheduling anchor, and
+  the optional `fallback` path). **The list request is always the full
+  `bing::ARCHIVE_WINDOW` (`idx=0&n=8`), never paginated**; retention only
+  picks which positions are downloaded (`Downloads { horizon:
+  schedule::download_horizon(retention), fallback:
+  wallpaper::should_auto_apply(..) }`, resolved at `start_refresh_over`,
+  applied by the pure tested `select_downloads`): every eligible entry
+  inside the horizon, or — when the horizon holds nothing eligible and
+  auto-apply is not suppressed — exactly the newest eligible image beyond
+  it, so the applet has *something* to apply (`retention=1` with a
+  restricted newest image would otherwise be a permanent daily no-op).
+  Never both, never any other out-of-retention image, and no fallback at
+  all over a foreign wallpaper — it would be pruned and re-fetched daily)
   and the `RefreshFinished` handler (UI thread, against *live* state: merge →
   eligibility reconciliation (`remove_ineligible_over`: entry **and** file of
   every `wp: false` image, the live wallpaper's exempt, nothing at all while
@@ -109,7 +121,17 @@ do not duplicate `appstreamcli` or desktop-file syntax validation in Rust.
   success, and the next refresh is the normal daily one rather than
   `next_refresh`'s ~6-minute reset off a stale catalogue entry. The one
   `tracing::warn!` for that day (in `fetch_and_download`) names the explicit
-  `false` and absent-`wp` counts separately.
+  `false` and absent-`wp` counts separately. A batch's `fallback` is the
+  apply target in place of the catalogue's newest (which may be an
+  ineligible image kept only because it is on screen) and is exempt from
+  the age prune via `Window::protected_fallback` →
+  `Catalogue::prune_protecting` until it is applied (the current-wallpaper
+  protection takes over) or the next refresh's selection replaces it — so a
+  failed apply keeps it through the interim prunes and the next refresh
+  re-selects it from disk without a GET. That protection is **in-memory
+  only**: a restart between the download and a failed apply lets
+  `prune_and_persist` delete the out-of-retention, non-applied fallback and
+  the next refresh simply re-downloads it — accepted.
   The out-of-window thumbnail backfill at the end of `fetch_and_download` is
   governed by the `Backfill` policy struct (budget + retention + applied file,
   injected by tests). Its rule: **the budget buys decodes, and no entry is ever
@@ -173,7 +195,9 @@ do not duplicate `appstreamcli` or desktop-file syntax validation in Rust.
   `tests/fixtures/hpimagearchive.json`), title/copyright derivation
   (`split_copyright` — Bing's own `title` field is the literal `"Info"`), pure
   URL/filename builders and the inverse `parse_filename`, reqwest client +
-  `fetch_image_list` + atomic `.part`-then-rename `download_image`.
+  `fetch_image_list` (always the full `ARCHIVE_WINDOW` of eight, `idx=0` —
+  no retention-sized request, no historical pagination) + atomic
+  `.part`-then-rename `download_image`.
   **Eligibility rule**: `parse_image_list` validates `startdate` (8 digits),
   `fullstartdate` (12 digits) and `urlbase` (the `/th?id=OHR.` prefix) and
   partitions every structurally valid entry by Bing's per-image `wp` into an
@@ -449,7 +473,9 @@ do not duplicate `appstreamcli` or desktop-file syntax validation in Rust.
 - `src/schedule.rs` — pure timing math: `next_refresh` (reference-exact,
   including the out-of-range reset to 60 s and the +300 s fudge),
   `shuffle_interval` (sanitizes hand-edited values — `0`/tiny must never
-  strobe), `fetch_count(retention_days)`, `retention_reduced`.
+  strobe), `download_horizon(retention_days)` (how many newest archive
+  positions a refresh *downloads* — 1–7 → that many, else all eight; the
+  list request itself is the constant full window), `retention_reduced`.
 - `src/testutil.rs` — test-only loopback HTTP mock server (`spawn_mock`) and
   in-memory JPEG factory; all network branches are tested hermetically, nothing
   ever reaches the real Bing. Its `surface` submodule holds the popup-ledger

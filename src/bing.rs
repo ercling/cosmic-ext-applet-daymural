@@ -229,12 +229,20 @@ impl From<io::Error> for FetchError {
     }
 }
 
-/// HPImageArchive endpoint URL for the latest `n` images. Empty `mkt`
-/// means "auto" — must stay in sync with the checked-in fixture's URL.
-/// `base_url` is [`BING_BASE_URL`] in production; injected so tests can
-/// point at a loopback mock server.
-pub fn api_url(base_url: &str, n: u8) -> String {
-    format!("{base_url}/HPImageArchive.aspx?format=js&idx=0&n={n}&mbl=1&mkt=")
+/// The archive window Bing supports: `idx=0&n=8` is the complete latest
+/// eight; larger `n` is silently capped and `idx > 0` is historical
+/// pagination the applet never attempts. The list request is always this
+/// constant (a few KB of JSON) — the configured retention governs which of
+/// these positions are *downloaded* (`schedule::download_horizon`), never
+/// how many are asked for.
+pub const ARCHIVE_WINDOW: u8 = 8;
+
+/// HPImageArchive endpoint URL for the full [`ARCHIVE_WINDOW`]. Empty
+/// `mkt` means "auto" — must stay in sync with the checked-in fixture's
+/// URL. `base_url` is [`BING_BASE_URL`] in production; injected so tests
+/// can point at a loopback mock server.
+pub fn api_url(base_url: &str) -> String {
+    format!("{base_url}/HPImageArchive.aspx?format=js&idx=0&n={ARCHIVE_WINDOW}&mbl=1&mkt=")
 }
 
 /// Shared HTTP client with our User-Agent and sane timeouts. Build once
@@ -248,8 +256,8 @@ pub fn http_client() -> Result<reqwest::Client, FetchError> {
         .map_err(FetchError::Http)
 }
 
-/// Fetch and parse the image-of-the-day list for the latest `n` images
-/// from `base_url` ([`BING_BASE_URL`] in production). A successful but
+/// Fetch and parse the image-of-the-day list for the full
+/// [`ARCHIVE_WINDOW`] from `base_url` ([`BING_BASE_URL`] in production). A successful but
 /// empty list is [`FetchError::EmptyList`] — including a batch whose images
 /// were all dropped by [`parse_image_list`]'s validation. A batch whose
 /// images are all *ineligible* is not: it parses into an [`ImageArchive`]
@@ -257,10 +265,9 @@ pub fn http_client() -> Result<reqwest::Client, FetchError> {
 pub async fn fetch_image_list(
     client: &reqwest::Client,
     base_url: &str,
-    n: u8,
 ) -> Result<ImageArchive, FetchError> {
     let resp = client
-        .get(api_url(base_url, n))
+        .get(api_url(base_url))
         .send()
         .await
         .map_err(FetchError::Http)?;
@@ -725,14 +732,13 @@ mod tests {
 
     #[test]
     fn api_url_matches_reference_query() {
+        // Always the full supported window — retention never shrinks the
+        // request, and `idx` never moves (no historical pagination).
         assert_eq!(
-            api_url(BING_BASE_URL, 8),
+            api_url(BING_BASE_URL),
             "https://www.bing.com/HPImageArchive.aspx?format=js&idx=0&n=8&mbl=1&mkt="
         );
-        assert_eq!(
-            api_url(BING_BASE_URL, 3),
-            "https://www.bing.com/HPImageArchive.aspx?format=js&idx=0&n=3&mbl=1&mkt="
-        );
+        assert_eq!(ARCHIVE_WINDOW, 8);
     }
 
     fn fixture_image() -> BingImage {
@@ -827,7 +833,7 @@ mod tests {
                 (404, Vec::new())
             }
         });
-        let archive = fetch_image_list(&http_client().unwrap(), &base, 8)
+        let archive = fetch_image_list(&http_client().unwrap(), &base)
             .await
             .unwrap();
         assert_eq!(archive.eligible.len(), 8);
@@ -840,13 +846,13 @@ mod tests {
     #[tokio::test]
     async fn fetch_image_list_maps_error_responses() {
         let base = crate::testutil::spawn_mock(|_| (500, b"oops".to_vec()));
-        let err = fetch_image_list(&http_client().unwrap(), &base, 8)
+        let err = fetch_image_list(&http_client().unwrap(), &base)
             .await
             .unwrap_err();
         assert!(matches!(err, FetchError::Status(s) if s.as_u16() == 500));
 
         let base = crate::testutil::spawn_mock(|_| (200, b"not json".to_vec()));
-        let err = fetch_image_list(&http_client().unwrap(), &base, 8)
+        let err = fetch_image_list(&http_client().unwrap(), &base)
             .await
             .unwrap_err();
         assert!(matches!(err, FetchError::Parse(_)));
@@ -858,7 +864,7 @@ mod tests {
         // caller would otherwise reschedule off an empty catalogue (5 s
         // cold-start delay → tight loop against Bing).
         let base = crate::testutil::spawn_mock(|_| (200, br#"{"images":[]}"#.to_vec()));
-        let err = fetch_image_list(&http_client().unwrap(), &base, 8)
+        let err = fetch_image_list(&http_client().unwrap(), &base)
             .await
             .unwrap_err();
         assert!(matches!(err, FetchError::EmptyList));
@@ -1111,7 +1117,7 @@ mod tests {
         // for an hour" path), not a parse error misreported as unreachable.
         let json = format!("{{\"images\":[{}]}}", image_json("@evil.example/x", "x"));
         let base = crate::testutil::spawn_mock(move |_| (200, json.clone().into_bytes()));
-        let err = fetch_image_list(&http_client().unwrap(), &base, 8)
+        let err = fetch_image_list(&http_client().unwrap(), &base)
             .await
             .expect_err("an all-rejected batch must not look like a success");
         assert!(matches!(err, FetchError::EmptyList));
@@ -1149,7 +1155,7 @@ mod tests {
         let oversized = (MAX_LIST_BYTES + 1) as usize;
         let base = crate::testutil::spawn_mock(move |_| (200, vec![b'{'; oversized]));
 
-        let err = fetch_image_list(&http_client().unwrap(), &base, 8)
+        let err = fetch_image_list(&http_client().unwrap(), &base)
             .await
             .expect_err("an oversized list body must not be buffered whole");
 
@@ -1193,7 +1199,7 @@ mod tests {
             crate::testutil::Framing::UntilEof,
         );
 
-        let err = fetch_image_list(&http_client().unwrap(), &base, 8)
+        let err = fetch_image_list(&http_client().unwrap(), &base)
             .await
             .expect_err("an unsized oversized list body must not be buffered whole");
 
@@ -1210,7 +1216,7 @@ mod tests {
             crate::testutil::Framing::UntilEof,
         );
 
-        let archive = fetch_image_list(&http_client().unwrap(), &base, 8)
+        let archive = fetch_image_list(&http_client().unwrap(), &base)
             .await
             .expect("an unsized body under the budget must be read to EOF");
         assert_eq!(archive.eligible.len(), 8);
@@ -1376,7 +1382,7 @@ mod tests {
             image_json_wp("/th?id=OHR.B_ROW2", "20260806", "202608060700", ""),
         );
         let base = crate::testutil::spawn_mock(move |_| (200, json.clone().into_bytes()));
-        let archive = fetch_image_list(&http_client().unwrap(), &base, 8)
+        let archive = fetch_image_list(&http_client().unwrap(), &base)
             .await
             .expect("an all-ineligible batch is a success with nothing to download");
         assert!(archive.eligible.is_empty());
@@ -1410,7 +1416,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let client = http_client().unwrap();
-        let archive = fetch_image_list(&client, &base, 8).await.unwrap();
+        let archive = fetch_image_list(&client, &base).await.unwrap();
         for slot in &archive.eligible {
             download_image(&client, &base, &slot.image, dir.path())
                 .await

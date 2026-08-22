@@ -225,11 +225,11 @@ There is no external API change. Internal interfaces change as follows:
 
 ### Task 2: Request the full window; bounded fallback download
 
-- [ ] Always request `idx=0&n=8`; drop the retention-sized list request.
+- [x] Always request `idx=0&n=8`; drop the retention-sized list request.
       Retention now governs download selection only: retention `0` or at
       least eight considers all eight positions; retention `1..=7` considers
       that many newest archive positions.
-- [ ] If the normal horizon contains no eligible entry **and auto-apply is not
+- [x] If the normal horizon contains no eligible entry **and auto-apply is not
       suppressed** (`wallpaper::should_auto_apply`), download only the newest
       eligible image from the remaining positions as the fallback. This
       applies on every refresh, not only cold start — it is what keeps
@@ -237,26 +237,31 @@ There is no external API change. Internal interfaces change as follows:
       daily no-op. When auto-apply is suppressed (foreign wallpaper) the
       fallback is skipped: it exists only to give the applet something to
       apply, and downloading it would be pruned and re-fetched daily.
-- [ ] Download no other out-of-retention images solely for fallback.
-- [ ] Protect the selected fallback through the current merge/prune cycle so
+- [x] Download no other out-of-retention images solely for fallback.
+- [x] Protect the selected fallback through the current merge/prune cycle so
       it cannot be removed before auto-apply. If apply fails, retain it until
       the next ordinary refresh. This protection is in-memory only: a restart
       between download and a failed apply lets `prune_and_persist` delete an
       out-of-retention, non-applied fallback, and the next refresh simply
       re-downloads it — accepted, and documented in the `Backfill` paragraph
       of CLAUDE.md's `src/app.rs` bullet.
-- [ ] Once applied, rely on the existing current-wallpaper protection.
-- [ ] If all eight entries are ineligible, complete as a successful no-op
+- [x] Once applied, rely on the existing current-wallpaper protection.
+- [x] If all eight entries are ineligible, complete as a successful no-op
       (Task 1b rule) and wait for the normal next daily refresh.
-- [ ] Do not increment `idx` or attempt unsupported historical pagination.
-- [ ] Rename `schedule::fetch_count` to `download_horizon`, update its tests,
+- [x] Do not increment `idx` or attempt unsupported historical pagination.
+- [x] Rename `schedule::fetch_count` to `download_horizon`, update its tests,
       and the CLAUDE.md `src/schedule.rs` bullet.
-- [ ] Test newest-eligible, fallback-eligible, multiple older eligible,
+- [x] Test newest-eligible, fallback-eligible, multiple older eligible,
       all-eight-ineligible, prune protection, failed apply, the warm
       `retention=1` + ineligible-newest case (fallback downloads the next
       eligible), and foreign-wallpaper + ineligible-newest (no fallback
-      download, no churn across two refreshes).
-- [ ] Run focused pipeline and scheduling tests before Task 3.
+      download, no churn across two refreshes). ⚠️ "failed apply" is
+      covered as "downloaded but not applied" (auto-apply suppressed):
+      `wallpaper::apply` writes the real cosmic-bg config and cannot be
+      driven hermetically — the retention path it exercises
+      (`protected_fallback` kept through interim prunes until the next
+      refresh) is the same one a failed apply takes.
+- [x] Run focused pipeline and scheduling tests before Task 3.
 
 ### Task 3: Catalogue provenance and leader-side metadata repair
 

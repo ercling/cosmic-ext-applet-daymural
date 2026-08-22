@@ -321,6 +321,27 @@ impl Catalogue {
         currently_applied: Option<&Path>,
         now: DateTime<Utc>,
     ) -> Vec<PathBuf> {
+        self.prune_protecting(
+            images_dir,
+            retention_days,
+            currently_applied.as_slice(),
+            now,
+        )
+    }
+
+    /// [`Catalogue::prune`] with any number of age-exempt files: the
+    /// currently applied wallpaper, plus a just-downloaded out-of-retention
+    /// fallback that the refresh still has to apply (see `app.rs`'s
+    /// `RefreshBatch::fallback`). Exemption is from the *age* rule only — a
+    /// protected path whose file vanished or that is foreign to
+    /// `images_dir` is dropped exactly like any other entry.
+    pub fn prune_protecting(
+        &mut self,
+        images_dir: &Path,
+        retention_days: u16,
+        protected: &[&Path],
+        now: DateTime<Utc>,
+    ) -> Vec<PathBuf> {
         if fs::read_dir(images_dir).is_err() {
             tracing::warn!(
                 "skipping prune: {} cannot be read right now",
@@ -344,7 +365,7 @@ impl Catalogue {
                 return false; // vanished externally — drop the entry
             }
             if entry.within_retention(retention_days, now)
-                || currently_applied == Some(entry.filename.as_path())
+                || protected.contains(&entry.filename.as_path())
             {
                 return true;
             }
@@ -457,6 +478,11 @@ impl Catalogue {
     /// Whether `path` is one of the catalogue's downloaded files.
     pub fn contains(&self, path: &Path) -> bool {
         self.position(path).is_some()
+    }
+
+    /// The entry whose file is `path`, if any.
+    pub fn entry_for(&self, path: &Path) -> Option<&ImageEntry> {
+        self.position(path).map(|index| &self.images[index])
     }
 
     /// The already-downloaded file for `urlbase`, if some entry holds one
@@ -1096,6 +1122,40 @@ mod tests {
         assert_eq!(deleted, vec![old_other.filename.clone()]);
         assert!(old_applied.filename.exists());
         assert_eq!(cat.images, vec![old_applied]);
+    }
+
+    #[test]
+    fn prune_protecting_exempts_every_named_file_from_the_age_rule_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let applied = entry_with_file(dir.path(), "20260701", "Applied_ROW1");
+        let fallback = entry_with_file(dir.path(), "20260702", "Fallback_ROW2");
+        let other = entry_with_file(dir.path(), "20260701", "Other_ROW3");
+        let vanished = entry_with_file(dir.path(), "20260701", "Vanished_ROW4");
+        std::fs::remove_file(&vanished.filename).unwrap();
+        let mut cat = Catalogue {
+            images: vec![
+                applied.clone(),
+                fallback.clone(),
+                other.clone(),
+                vanished.clone(),
+            ],
+        };
+
+        let deleted = cat.prune_protecting(
+            dir.path(),
+            3,
+            &[&applied.filename, &fallback.filename, &vanished.filename],
+            now(),
+        );
+
+        assert_eq!(
+            deleted,
+            vec![other.filename.clone(), vanished.filename.clone()],
+            "unprotected old file deleted; a protected path with no file is still dropped"
+        );
+        assert!(applied.filename.exists());
+        assert!(fallback.filename.exists());
+        assert_eq!(cat.images, vec![applied, fallback]);
     }
 
     #[test]

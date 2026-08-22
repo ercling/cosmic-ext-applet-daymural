@@ -288,6 +288,13 @@ pub struct Window {
     /// successful apply (auto, manual navigation, shuffle tick): see
     /// [`Window::on_apply_success`].
     cold_start: ColdStart,
+    /// The out-of-retention fallback the last refresh downloaded
+    /// ([`RefreshBatch::fallback`]), exempt from the age prune until it is
+    /// applied (the current-wallpaper protection takes over) or the next
+    /// refresh replaces the selection. In-memory only: a restart between
+    /// the download and a failed apply lets the startup prune delete it,
+    /// and the next refresh simply re-downloads it.
+    protected_fallback: Option<PathBuf>,
     /// Generation counter for the one-shot refresh timer; `RefreshDue`
     /// messages carrying a stale generation are ignored.
     timer_generation: u64,
@@ -1715,10 +1722,16 @@ impl Window {
             return live.into_file();
         }
         self.current = wallpaper::synced_current(&live, self.current.take());
-        self.catalogue.prune(
+        let protected: Vec<&Path> = self
+            .current
+            .iter()
+            .chain(self.protected_fallback.iter())
+            .map(PathBuf::as_path)
+            .collect();
+        self.catalogue.prune_protecting(
             download_dir,
             wallpaper::prune_retention(&live, self.config.retention_days),
-            self.current.as_deref(),
+            &protected,
             Utc::now(),
         );
         self.sweep_thumbnails(state_dir);
@@ -2162,8 +2175,20 @@ impl Window {
         // keeps no matter its age.
         let current = wallpaper::synced_current(&live, self.current.take());
         self.current = current.clone();
+        // The fallback download exists only to give the auto-apply something
+        // to apply; when that is suppressed (the user's own wallpaper is up)
+        // it would be pruned and re-fetched daily, so it is not requested.
+        let downloads = Downloads {
+            horizon: schedule::download_horizon(retention_days),
+            fallback: wallpaper::should_auto_apply(
+                self.cold_start.applies_over(current.as_deref()),
+                current.as_deref(),
+            ),
+        };
         cosmic::task::future(async move {
-            Message::RefreshFinished(run_refresh(catalogue, retention_days, &live, current).await)
+            Message::RefreshFinished(
+                run_refresh(catalogue, retention_days, downloads, &live, current).await,
+            )
         })
     }
 
@@ -2281,6 +2306,12 @@ impl Window {
         // — the pipeline's start-of-fetch snapshot may be stale on both
         // counts, and the currently applied file must never be deleted.
         self.catalogue.merge(batch.fetched);
+        // A fallback is out of retention by construction: protect it from
+        // the prune below until it is applied (then the current-wallpaper
+        // protection takes over) or the next refresh reselects. Replacing
+        // the previous selection unconditionally is what bounds the
+        // protection to one refresh cycle.
+        self.protected_fallback = batch.fallback;
         // Eligibility reconciliation, *before* the prune so its thumbnail
         // sweep collects what this removes. It reuses the prune's evidence:
         // in `CurrentWallpaper::Unknown` the displayed file is unknowable,
@@ -2298,8 +2329,16 @@ impl Window {
 
         // The live catalogue's newest entry answers "is there anything to
         // apply?"; the *response* answers "when is the next refresh due?".
-        // Cloned because the apply arm mutates `self`.
-        let newest = self.catalogue.newest().cloned();
+        // A downloaded fallback is the apply target instead of the newest
+        // entry — it was fetched for exactly that, and the catalogue's
+        // newest may be an ineligible image kept only because it is on
+        // screen. Cloned because the apply arm mutates `self`.
+        let newest = self
+            .protected_fallback
+            .as_ref()
+            .and_then(|path| self.catalogue.entry_for(path))
+            .or_else(|| self.catalogue.newest())
+            .cloned();
         let plan = refresh_success_plan(
             self.cold_start.applies_over(live.as_deref()),
             live.as_deref(),
@@ -2314,7 +2353,11 @@ impl Window {
         {
             let path = newest.filename.clone();
             match wallpaper::apply(&path) {
-                Ok(()) => accent = self.on_apply_success(path),
+                Ok(()) => {
+                    // Applied: the current-wallpaper protection covers it.
+                    self.protected_fallback = None;
+                    accent = self.on_apply_success(path);
+                }
                 Err(error) => {
                     tracing::warn!("failed to apply wallpaper: {error}");
                     apply_failed = true;
@@ -3197,6 +3240,7 @@ fn open_detached(target: OsString) {
 async fn run_refresh(
     catalogue: Catalogue,
     retention_days: u16,
+    downloads: Downloads,
     live: &wallpaper::CurrentWallpaper,
     current: Option<PathBuf>,
 ) -> Result<RefreshBatch, RefreshError> {
@@ -3205,7 +3249,7 @@ async fn run_refresh(
         &client,
         bing::BING_BASE_URL,
         &catalogue,
-        schedule::fetch_count(retention_days),
+        downloads,
         &wallpaper::download_dir(),
         state_dir(),
         &Backfill::new(live, retention_days, current.as_deref()),
@@ -3214,16 +3258,56 @@ async fn run_refresh(
     .map_err(RefreshError::from)
 }
 
-/// Fetch the latest `count` images from `base_url` and download the
-/// missing ones into `download_dir` (thumbnails cached under `state_dir`),
-/// then backfill thumbnails for older catalogue entries per `backfill`.
-/// All roots, the endpoint and the backfill policy are injected so tests can
-/// run the whole pipeline against tempdirs and a loopback mock server.
+/// Which of the archive's eight positions a refresh downloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Downloads {
+    /// Newest archive positions considered (`schedule::download_horizon`).
+    horizon: u8,
+    /// Whether an empty horizon may fall back to the newest eligible image
+    /// beyond it — `wallpaper::should_auto_apply` at the refresh's start.
+    fallback: bool,
+}
+
+/// The eligible entries one refresh downloads: everything eligible inside
+/// the horizon, or — when the horizon holds nothing eligible and a fallback
+/// is permitted — just the newest eligible image beyond it. Never both, and
+/// never any other out-of-retention image: the fallback exists only so the
+/// applet has *something* to apply, not to widen the history.
+struct Selection<'a> {
+    in_window: Vec<&'a ArchiveImage>,
+    fallback: Option<&'a ArchiveImage>,
+}
+
+fn select_downloads(eligible: &[ArchiveImage], downloads: Downloads) -> Selection<'_> {
+    let horizon = usize::from(downloads.horizon);
+    let in_window: Vec<_> = eligible
+        .iter()
+        .filter(|image| image.position < horizon)
+        .collect();
+    let fallback = (in_window.is_empty() && downloads.fallback)
+        .then(|| {
+            // Response order is newest first, so the first beyond the
+            // horizon is the newest eligible one.
+            eligible.iter().find(|image| image.position >= horizon)
+        })
+        .flatten();
+    Selection {
+        in_window,
+        fallback,
+    }
+}
+
+/// Fetch the full archive window from `base_url`, download the missing
+/// images `downloads` selects into `download_dir` (thumbnails cached under
+/// `state_dir`), then backfill thumbnails for older catalogue entries per
+/// `backfill`. All roots, the endpoint, the selection and the backfill
+/// policy are injected so tests can run the whole pipeline against tempdirs
+/// and a loopback mock server.
 async fn fetch_and_download(
     client: &reqwest::Client,
     base_url: &str,
     catalogue: &Catalogue,
-    count: u8,
+    downloads: Downloads,
     download_dir: &Path,
     state_dir: &Path,
     backfill: &Backfill<'_>,
@@ -3231,7 +3315,7 @@ async fn fetch_and_download(
     // A crash mid-download leaves an orphaned `.part` behind; sweep first.
     bing::sweep_part_files(download_dir);
 
-    let archive = bing::fetch_image_list(client, base_url, count).await?;
+    let archive = bing::fetch_image_list(client, base_url).await?;
     if archive.eligible.is_empty() {
         // Distinguishable in logs without a new i18n string: an
         // all-restricted day (explicit `false`) versus a Bing payload change
@@ -3243,11 +3327,24 @@ async fn fetch_and_download(
         );
     }
 
-    // Only `wp: true` entries reach this loop — an image GET is never
-    // issued for an explicitly ineligible or `wp`-less entry.
-    let mut fetched = Vec::with_capacity(archive.eligible.len());
-    for ArchiveImage { position, image } in &archive.eligible {
-        tracing::debug!("archive position {position}: {} is eligible", image.urlbase);
+    // Only `wp: true` entries inside the horizon (or the one fallback) reach
+    // this loop — an image GET is never issued for an explicitly
+    // ineligible, `wp`-less, or merely out-of-retention entry.
+    let selection = select_downloads(&archive.eligible, downloads);
+    if let Some(fallback) = selection.fallback {
+        tracing::info!(
+            "no eligible image within the newest {} position(s); falling back to position {}",
+            downloads.horizon,
+            fallback.position
+        );
+    }
+    let mut fetched = Vec::with_capacity(selection.in_window.len() + 1);
+    let mut fallback_path = None;
+    for ArchiveImage { position, image } in selection.in_window.iter().chain(&selection.fallback) {
+        tracing::debug!(
+            "archive position {position}: {} is downloaded",
+            image.urlbase
+        );
         // A rebuilt entry may already hold this image at a different
         // resolution suffix — that file stays authoritative (no
         // re-download); the merge refills its metadata.
@@ -3273,6 +3370,12 @@ async fn fetch_and_download(
             }
         };
         ensure_thumbnail_logged(&path, state_dir).await;
+        if selection
+            .fallback
+            .is_some_and(|f| f.image.urlbase == image.urlbase)
+        {
+            fallback_path = Some(path.clone());
+        }
         fetched.push(ImageEntry::from_bing(image, path));
     }
 
@@ -3286,6 +3389,7 @@ async fn fetch_and_download(
         fetched,
         ineligible: archive.ineligible,
         anchor: archive.anchor,
+        fallback: fallback_path,
     })
 }
 
@@ -3296,12 +3400,16 @@ async fn fetch_and_download(
 /// state), and the response's scheduling anchor — the newest structurally
 /// valid `fullstartdate` regardless of eligibility, so an all-ineligible day
 /// still schedules the normal daily delay instead of falling into
-/// `next_refresh`'s out-of-range reset off a stale catalogue entry.
+/// `next_refresh`'s out-of-range reset off a stale catalogue entry — and,
+/// when the horizon held nothing eligible, the one out-of-retention
+/// fallback it downloaded ([`select_downloads`]), which `finish_refresh`
+/// protects from its own prune and applies in place of the newest entry.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RefreshBatch {
     pub fetched: Vec<ImageEntry>,
     pub ineligible: Vec<String>,
     pub anchor: Option<String>,
+    pub fallback: Option<PathBuf>,
 }
 
 /// Give catalogue entries that still lack a usable preview one, newest first,
@@ -3637,6 +3745,7 @@ impl cosmic::Application for Window {
             refresh_pending: false,
             thumbnail_pass_pending: false,
             cold_start,
+            protected_fallback: None,
             timer_generation: 0,
             shuffle_generation: 0,
             shuffle_armed: false,
@@ -4946,6 +5055,15 @@ mod tests {
         assert_eq!(Catalogue::load(&cat_path).unwrap(), restored);
     }
 
+    /// Download everything eligible within the newest `horizon` positions,
+    /// falling back beyond it when nothing there is eligible.
+    fn within(horizon: u8) -> Downloads {
+        Downloads {
+            horizon,
+            fallback: true,
+        }
+    }
+
     /// One-image HPImageArchive response for the pipeline tests below.
     const LIST_JSON: &str = r#"{"images":[{"urlbase":"/th?id=OHR.Foo_ROW1","startdate":"20260807","fullstartdate":"202608070700","copyright":"Foo place (© Bar)","copyrightlink":"https://example.com/foo","wp":true}]}"#;
 
@@ -4976,7 +5094,7 @@ mod tests {
             &client,
             &base,
             &Catalogue::default(),
-            1,
+            within(1),
             &download_dir,
             &state,
             &test_backfill(),
@@ -5022,7 +5140,7 @@ mod tests {
             &client,
             &base,
             &catalogue,
-            1,
+            within(1),
             &download_dir,
             &state,
             &test_backfill(),
@@ -5061,7 +5179,7 @@ mod tests {
             &client,
             &base,
             &catalogue,
-            1,
+            within(1),
             &download_dir,
             &state,
             &test_backfill(),
@@ -5121,7 +5239,7 @@ mod tests {
             &client,
             &base,
             &catalogue,
-            1,
+            within(1),
             &download_dir,
             &state,
             &test_backfill(),
@@ -5309,7 +5427,7 @@ mod tests {
             &client,
             &base,
             &catalogue,
-            1,
+            within(1),
             &download_dir,
             &state,
             &capped(CAP),
@@ -5325,7 +5443,7 @@ mod tests {
             &client,
             &base,
             &catalogue,
-            1,
+            within(1),
             &download_dir,
             &state,
             &capped(CAP),
@@ -5343,7 +5461,7 @@ mod tests {
             &client,
             &base,
             &catalogue,
-            1,
+            within(1),
             &download_dir,
             &state,
             &capped(CAP),
@@ -5397,7 +5515,7 @@ mod tests {
             &client,
             &base,
             &catalogue,
-            1,
+            within(1),
             &download_dir,
             &state,
             &capped(CAP),
@@ -5419,7 +5537,7 @@ mod tests {
             &client,
             &base,
             &catalogue,
-            1,
+            within(1),
             &download_dir,
             &state,
             &capped(CAP),
@@ -5454,7 +5572,7 @@ mod tests {
             &client,
             &base,
             &catalogue,
-            1,
+            within(1),
             &download_dir,
             &state,
             &test_backfill(),
@@ -5472,7 +5590,7 @@ mod tests {
             &client,
             &base,
             &catalogue,
-            1,
+            within(1),
             &download_dir,
             &state,
             &test_backfill(),
@@ -5524,7 +5642,7 @@ mod tests {
             &client,
             &base,
             &catalogue,
-            1,
+            within(1),
             &download_dir,
             &state,
             &backfill,
@@ -5583,7 +5701,7 @@ mod tests {
             &client,
             &base,
             &catalogue,
-            1,
+            within(1),
             &download_dir,
             &state,
             &test_backfill(),
@@ -5631,7 +5749,7 @@ mod tests {
             &client,
             &base,
             &Catalogue::default(),
-            2,
+            within(2),
             &download_dir,
             &state,
             &test_backfill(),
@@ -5675,7 +5793,7 @@ mod tests {
             &client,
             &base,
             &catalogue,
-            1,
+            within(1),
             &download_dir,
             &state,
             &test_backfill(),
@@ -7111,6 +7229,7 @@ source = "git+https://example.invalid/repo#abc""#;
                 fetched: vec![entry_in_memory("20260808", "Fresh_ROW1")],
                 ineligible: Vec::new(),
                 anchor: Some("202608080700".to_owned()),
+                fallback: None,
             }),
             Err(RefreshError::Network("offline".to_owned())),
         ] {
@@ -8229,6 +8348,7 @@ source = "git+https://example.invalid/repo#abc""#;
             fetched: Vec::new(),
             ineligible: urlbases.iter().map(|u| (*u).to_owned()).collect(),
             anchor: Some("202608080700".to_owned()),
+            fallback: None,
         })
     }
 
@@ -8273,6 +8393,7 @@ source = "git+https://example.invalid/repo#abc""#;
             fetched: Vec::new(),
             ineligible: archive.ineligible,
             anchor: archive.anchor,
+            fallback: None,
         });
         finish_over(
             &mut window,
@@ -8328,6 +8449,7 @@ source = "git+https://example.invalid/repo#abc""#;
             fetched: Vec::new(),
             ineligible: archive.ineligible,
             anchor: archive.anchor,
+            fallback: None,
         });
         finish_over(
             &mut window,
@@ -8503,6 +8625,7 @@ source = "git+https://example.invalid/repo#abc""#;
                 fetched: Vec::new(),
                 ineligible: vec!["/th?id=OHR.Other_ROW3".to_owned()],
                 anchor: Some(today.clone()),
+                fallback: None,
             }),
         );
         assert_eq!(window.catalogue.images, vec![held.clone()]);
@@ -8530,12 +8653,412 @@ source = "git+https://example.invalid/repo#abc""#;
                 fetched: Vec::new(),
                 ineligible: vec!["/th?id=OHR.Other_ROW3".to_owned()],
                 anchor: Some(today),
+                fallback: None,
             }),
         );
         assert!(window.catalogue.images.is_empty());
         assert_eq!(window.cold_start, ColdStart::Pending, "still armed");
         assert!(window.last_error.is_none());
         assert!(window.timer_generation > generation, "rescheduled");
+    }
+
+    // -----------------------------------------------------------------
+    // Full-window request, horizon selection and the bounded fallback
+    // (Task 2).
+    // -----------------------------------------------------------------
+
+    fn archive_image(position: usize, name: &str, wp: bool) -> ArchiveImage {
+        let day = 7 - position;
+        ArchiveImage {
+            position,
+            image: bing::BingImage {
+                startdate: format!("202608{day:02}"),
+                fullstartdate: format!("202608{day:02}0700"),
+                urlbase: format!("/th?id=OHR.{name}"),
+                copyright: "x (© y)".to_owned(),
+                copyrightlink: "https://example.com".to_owned(),
+                wp: Some(wp),
+            },
+        }
+    }
+
+    /// An eight-entry HPImageArchive body, newest first, with position `i`
+    /// dated `2026-08-(07-i)`; `eligible` names the positions marked
+    /// `wp: true`, every other one is an explicit `false`.
+    fn window_json(eligible: &[usize]) -> String {
+        let entries: Vec<String> = (0..usize::from(bing::ARCHIVE_WINDOW))
+            .map(|i| {
+                let day = 7 - i;
+                format!(
+                    r#"{{"startdate":"202608{day:02}","fullstartdate":"202608{day:02}0700","urlbase":"/th?id=OHR.Pos{i}_ROW{i}","copyright":"x (© y)","copyrightlink":"https://example.com","title":"Info","wp":{}}}"#,
+                    eligible.contains(&i)
+                )
+            })
+            .collect();
+        format!(r#"{{"images":[{}]}}"#, entries.join(","))
+    }
+
+    /// Loopback server answering the list with `json` and every image GET
+    /// with a tiny JPEG, recording the image paths it was asked for.
+    fn window_server(json: String) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = std::sync::Arc::clone(&requests);
+        let jpeg = crate::testutil::tiny_jpeg(32, 18);
+        let base = crate::testutil::spawn_mock(move |path| {
+            if path.starts_with("/HPImageArchive.aspx") {
+                assert!(
+                    path.contains("idx=0&n=8&"),
+                    "always the full supported window, never paginated: {path}"
+                );
+                (200, json.clone().into_bytes())
+            } else {
+                seen.lock().unwrap().push(path.to_owned());
+                (200, jpeg.clone())
+            }
+        });
+        (base, requests)
+    }
+
+    #[test]
+    fn select_downloads_takes_the_horizon_or_exactly_one_fallback() {
+        let urlbases = |slots: &[&ArchiveImage]| -> Vec<String> {
+            slots.iter().map(|s| s.image.urlbase.clone()).collect()
+        };
+        let all = |h: u8, fallback: bool| Downloads {
+            horizon: h,
+            fallback,
+        };
+
+        // Newest eligible: the horizon is served, nothing beyond it.
+        let eligible = vec![
+            archive_image(0, "A", true),
+            archive_image(1, "B", true),
+            archive_image(5, "F", true),
+        ];
+        let sel = select_downloads(&eligible, all(2, true));
+        assert_eq!(urlbases(&sel.in_window), ["/th?id=OHR.A", "/th?id=OHR.B"]);
+        assert!(sel.fallback.is_none(), "a served horizon never falls back");
+
+        // Several older eligible images beyond an empty horizon: only the
+        // newest one of them is the fallback, the rest stay undownloaded.
+        let eligible = vec![
+            archive_image(3, "D", true),
+            archive_image(4, "E", true),
+            archive_image(7, "H", true),
+        ];
+        let sel = select_downloads(&eligible, all(1, true));
+        assert!(sel.in_window.is_empty());
+        assert_eq!(sel.fallback.map(|s| s.position), Some(3));
+
+        // Auto-apply suppressed (foreign wallpaper): no fallback at all.
+        let sel = select_downloads(&eligible, all(1, false));
+        assert!(sel.in_window.is_empty());
+        assert!(sel.fallback.is_none());
+
+        // Nothing eligible anywhere: nothing to download, nothing to fall
+        // back to — the caller completes as a successful no-op.
+        let sel = select_downloads(&[], all(8, true));
+        assert!(sel.in_window.is_empty() && sel.fallback.is_none());
+
+        // Retention 0 / ≥ 8 considers the whole window, so a position-7
+        // image is in-window, not a fallback.
+        let sel = select_downloads(&eligible, all(schedule::download_horizon(0), true));
+        assert_eq!(sel.in_window.len(), 3);
+        assert!(sel.fallback.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_empty_horizon_downloads_only_the_newest_eligible_fallback() {
+        // Retention 1 on a day whose newest image is restricted, with two
+        // older eligible images: exactly one image GET, for the newer of the
+        // two, and the batch names it as the fallback.
+        let (base, requests) = window_server(window_json(&[2, 5]));
+        let dir = tempfile::tempdir().unwrap();
+        let download_dir = dir.path().join("images");
+        let state = dir.path().join("state");
+        let client = bing::http_client().unwrap();
+
+        let batch = fetch_and_download(
+            &client,
+            &base,
+            &Catalogue::default(),
+            Downloads {
+                horizon: schedule::download_horizon(1),
+                fallback: true,
+            },
+            &download_dir,
+            &state,
+            &test_backfill(),
+        )
+        .await
+        .unwrap();
+
+        let expected = download_dir.join("20260805-Pos2_ROW2_UHD.jpg");
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![bing::image_url("", "/th?id=OHR.Pos2_ROW2")],
+            "one GET: the newest eligible image beyond the horizon"
+        );
+        assert_eq!(batch.fallback.as_deref(), Some(expected.as_path()));
+        assert_eq!(batch.fetched.len(), 1);
+        assert_eq!(batch.fetched[0].filename, expected);
+        assert!(expected.is_file());
+        assert!(thumbs::is_cached(&expected, &state));
+        assert_eq!(batch.ineligible.len(), 6, "every explicit false is carried");
+        assert_eq!(batch.anchor.as_deref(), Some("202608070700"));
+    }
+
+    #[tokio::test]
+    async fn a_served_horizon_never_downloads_beyond_it() {
+        // Retention 3 with the newest image eligible: the horizon's eligible
+        // images are fetched and the eligible position-5 image is not — no
+        // out-of-retention download happens just because one exists.
+        let (base, requests) = window_server(window_json(&[0, 2, 5]));
+        let dir = tempfile::tempdir().unwrap();
+        let client = bing::http_client().unwrap();
+
+        let batch = fetch_and_download(
+            &client,
+            &base,
+            &Catalogue::default(),
+            within(schedule::download_horizon(3)),
+            &dir.path().join("images"),
+            &dir.path().join("state"),
+            &test_backfill(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![
+                bing::image_url("", "/th?id=OHR.Pos0_ROW0"),
+                bing::image_url("", "/th?id=OHR.Pos2_ROW2"),
+            ]
+        );
+        assert!(batch.fallback.is_none());
+        assert_eq!(batch.fetched.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_all_ineligible_window_downloads_nothing_and_succeeds() {
+        let (base, requests) = window_server(window_json(&[]));
+        let dir = tempfile::tempdir().unwrap();
+        let client = bing::http_client().unwrap();
+
+        let batch = fetch_and_download(
+            &client,
+            &base,
+            &Catalogue::default(),
+            within(1),
+            &dir.path().join("images"),
+            &dir.path().join("state"),
+            &test_backfill(),
+        )
+        .await
+        .expect("a valid all-ineligible window is a successful no-op");
+
+        assert!(requests.lock().unwrap().is_empty(), "no image GET at all");
+        assert!(batch.fetched.is_empty());
+        assert!(batch.fallback.is_none());
+        assert_eq!(batch.ineligible.len(), 8);
+        assert_eq!(
+            batch.anchor.as_deref(),
+            Some("202608070700"),
+            "still anchors the normal daily schedule"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_warm_retention_one_catalogue_reuses_the_fallback_it_already_holds() {
+        // Retention 1, yesterday's image on disk and on screen, today's
+        // restricted: the fallback *is* yesterday's image. It is hydrated
+        // from disk (no GET) and still reported as the fallback, so the
+        // prune keeps protecting it — and the day is not a permanent no-op.
+        let (base, requests) = window_server(window_json(&[1, 4]));
+        let dir = tempfile::tempdir().unwrap();
+        let download_dir = dir.path().join("images");
+        std::fs::create_dir_all(&download_dir).unwrap();
+        let held = download_dir.join("20260806-Pos1_ROW1_UHD.jpg");
+        std::fs::write(&held, crate::testutil::tiny_jpeg(32, 18)).unwrap();
+        let mut catalogue = Catalogue::default();
+        catalogue.images.push(ImageEntry {
+            urlbase: "/th?id=OHR.Pos1_ROW1".to_owned(),
+            startdate: "20260806".to_owned(),
+            fullstartdate: "202608060700".to_owned(),
+            title: String::new(),
+            copyright: String::new(),
+            copyrightlink: String::new(),
+            filename: held.clone(),
+        });
+        let client = bing::http_client().unwrap();
+
+        let batch = fetch_and_download(
+            &client,
+            &base,
+            &catalogue,
+            within(schedule::download_horizon(1)),
+            &download_dir,
+            &dir.path().join("state"),
+            &test_backfill(),
+        )
+        .await
+        .unwrap();
+
+        assert!(requests.lock().unwrap().is_empty(), "held file: no GET");
+        assert_eq!(batch.fallback.as_deref(), Some(held.as_path()));
+        assert_eq!(batch.fetched.len(), 1);
+        assert_eq!(batch.fetched[0].filename, held);
+        assert_eq!(
+            batch.fetched[0].copyright, "© y",
+            "and the merge will refill its metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_foreign_wallpaper_suppresses_the_fallback_without_churn() {
+        // The user's own wallpaper is up, so nothing would be applied: the
+        // fallback is not downloaded — across two refreshes, zero image GETs
+        // and nothing to prune and re-fetch daily.
+        let (base, requests) = window_server(window_json(&[3]));
+        let dir = tempfile::tempdir().unwrap();
+        let client = bing::http_client().unwrap();
+        let suppressed = Downloads {
+            horizon: schedule::download_horizon(1),
+            fallback: wallpaper::should_auto_apply(
+                false,
+                Some(Path::new("/usr/share/backgrounds/user.jpg")),
+            ),
+        };
+        assert!(!suppressed.fallback);
+
+        for _ in 0..2 {
+            let batch = fetch_and_download(
+                &client,
+                &base,
+                &Catalogue::default(),
+                suppressed,
+                &dir.path().join("images"),
+                &dir.path().join("state"),
+                &test_backfill(),
+            )
+            .await
+            .unwrap();
+            assert!(batch.fetched.is_empty());
+            assert!(batch.fallback.is_none());
+        }
+        assert!(requests.lock().unwrap().is_empty());
+        assert!(
+            !dir.path().join("images").exists()
+                || std::fs::read_dir(dir.path().join("images"))
+                    .unwrap()
+                    .next()
+                    .is_none(),
+            "nothing landed on disk"
+        );
+    }
+
+    #[test]
+    fn a_downloaded_fallback_is_protected_until_applied_or_reselected() {
+        // Retention 1; the refresh brought back an out-of-retention fallback
+        // it could not apply (here: auto-apply suppressed by a foreign live
+        // wallpaper, which also keeps `wallpaper::apply` — real cosmic-bg
+        // config — out of the test). The same completion's prune must keep
+        // it, so must any prune before the next refresh, and the next
+        // refresh's selection replaces the protection.
+        let roots = refresh_roots();
+        let fallback = entry_on_disk(&roots.images, "20200105", "Fallback_ROW5");
+        let stale = entry_on_disk(&roots.images, "20200101", "Stale_ROW1");
+        let mut window = Window::default();
+        window.config.retention_days = 1;
+        window.catalogue.images = vec![stale.clone()];
+        let foreign = wallpaper::CurrentWallpaper::File(PathBuf::from("/usr/share/bg/u.jpg"));
+        let anchor = Some(Utc::now().format("%Y%m%d0700").to_string());
+
+        finish_over(
+            &mut window,
+            &roots,
+            foreign.clone(),
+            Ok(RefreshBatch {
+                fetched: vec![fallback.clone()],
+                ineligible: Vec::new(),
+                anchor: anchor.clone(),
+                fallback: Some(fallback.filename.clone()),
+            }),
+        );
+        assert_eq!(
+            window.catalogue.images,
+            vec![fallback.clone()],
+            "the fallback survives the prune that deleted the stale entry"
+        );
+        assert!(fallback.filename.is_file());
+        assert!(!stale.filename.exists());
+        assert_eq!(
+            window.protected_fallback.as_deref(),
+            Some(fallback.filename.as_path())
+        );
+        assert_eq!(
+            Catalogue::load(&roots.catalogue).unwrap(),
+            window.catalogue,
+            "persisted with the fallback"
+        );
+
+        // An interim prune (retention edit, failed-apply cleanup) keeps it too.
+        drop(window.prune_over(
+            foreign.clone(),
+            &roots.images,
+            &roots.state,
+            &roots.catalogue,
+        ));
+        assert_eq!(window.catalogue.images, vec![fallback.clone()]);
+        assert!(fallback.filename.is_file());
+
+        // The next ordinary refresh selects no fallback: protection ends and
+        // the out-of-retention file goes with the prune.
+        finish_over(
+            &mut window,
+            &roots,
+            foreign,
+            Ok(RefreshBatch {
+                fetched: Vec::new(),
+                ineligible: Vec::new(),
+                anchor,
+                fallback: None,
+            }),
+        );
+        assert!(window.protected_fallback.is_none());
+        assert!(window.catalogue.images.is_empty());
+        assert!(!fallback.filename.exists());
+    }
+
+    #[test]
+    fn an_applied_fallback_hands_over_to_the_current_wallpaper_protection() {
+        // Once the fallback is what cosmic-bg displays, the prune's
+        // current-wallpaper exemption covers it and the fallback
+        // protection is dropped at the next completion like any other.
+        let roots = refresh_roots();
+        let fallback = entry_on_disk(&roots.images, "20200105", "Fallback_ROW5");
+        let mut window = Window::default();
+        window.config.retention_days = 1;
+        window.catalogue.images = vec![fallback.clone()];
+        window.protected_fallback = Some(fallback.filename.clone());
+        let anchor = Some(Utc::now().format("%Y%m%d0700").to_string());
+
+        finish_over(
+            &mut window,
+            &roots,
+            wallpaper::CurrentWallpaper::File(fallback.filename.clone()),
+            Ok(RefreshBatch {
+                fetched: Vec::new(),
+                ineligible: Vec::new(),
+                anchor,
+                fallback: None,
+            }),
+        );
+        assert!(window.protected_fallback.is_none());
+        assert_eq!(window.catalogue.images, vec![fallback.clone()]);
+        assert!(fallback.filename.is_file(), "kept as the live wallpaper");
+        assert_eq!(window.current.as_deref(), Some(fallback.filename.as_path()));
     }
 
     #[test]
