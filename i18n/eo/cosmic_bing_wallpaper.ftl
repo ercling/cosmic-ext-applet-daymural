@@ -4,7 +4,6 @@
 
 
 about-this-image = Pri ĉi tiu bildo
-bing-wallpaper = Bing-ekranfono
 
 tooltip-previous = Antaŭa ekranfono
 tooltip-next = Sekva ekranfono

@@ -4,7 +4,6 @@
 
 
 about-this-image = Giới thiệu về ảnh này
-bing-wallpaper = Ảnh nền Bing
 
 tooltip-previous = Ảnh nền trước
 tooltip-next = Ảnh nền kế tiếp

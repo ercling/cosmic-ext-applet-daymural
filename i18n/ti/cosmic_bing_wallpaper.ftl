@@ -4,7 +4,6 @@
 
 
 about-this-image = ብዛዕባ እዚ ስእሊ
-bing-wallpaper = Bing መንደቕ ስእሊ
 
 tooltip-previous = ናይ ቅድሚ ስእሊ
 tooltip-next = ዝቕጽል ስእሊ

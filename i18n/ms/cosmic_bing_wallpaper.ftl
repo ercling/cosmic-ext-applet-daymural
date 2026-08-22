@@ -4,7 +4,6 @@
 
 
 about-this-image = Tentang imej ini
-bing-wallpaper = Kertas dinding Bing
 
 tooltip-previous = Kertas dinding sebelumnya
 tooltip-next = Kertas dinding seterusnya

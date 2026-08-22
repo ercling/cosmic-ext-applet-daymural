@@ -4,7 +4,6 @@
 
 
 about-this-image = Mun dealbh seo
-bing-wallpaper = Pàipear-balla Bing
 
 tooltip-previous = Am pàipear-balla roimhe
 tooltip-next = An ath-phàipear-balla

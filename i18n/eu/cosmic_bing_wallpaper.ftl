@@ -4,7 +4,6 @@
 
 
 about-this-image = Irudi honi buruz
-bing-wallpaper = Bing horma-papera
 
 tooltip-previous = Aurreko horma-papera
 tooltip-next = Hurrengo horma-papera

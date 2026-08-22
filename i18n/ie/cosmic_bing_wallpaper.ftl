@@ -4,7 +4,6 @@
 
 
 about-this-image = Pri ti-ci image
-bing-wallpaper = Bing-fonde
 
 tooltip-previous = Precedent fonde
 tooltip-next = Sequent fonde

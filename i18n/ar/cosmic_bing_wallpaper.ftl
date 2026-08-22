@@ -4,7 +4,6 @@
 
 
 about-this-image = حول هذه الصورة
-bing-wallpaper = خلفية Bing
 
 tooltip-previous = الخلفية السابقة
 tooltip-next = الخلفية التالية

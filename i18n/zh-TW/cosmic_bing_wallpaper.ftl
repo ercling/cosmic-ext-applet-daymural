@@ -4,7 +4,6 @@
 
 
 about-this-image = 關於此圖片
-bing-wallpaper = Bing 桌布
 
 tooltip-previous = 上一張桌布
 tooltip-next = 下一張桌布

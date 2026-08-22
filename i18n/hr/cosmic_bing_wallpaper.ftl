@@ -4,7 +4,6 @@
 
 
 about-this-image = O ovoj slici
-bing-wallpaper = Bing pozadina
 
 tooltip-previous = Prethodna pozadina
 tooltip-next = Sljedeća pozadina

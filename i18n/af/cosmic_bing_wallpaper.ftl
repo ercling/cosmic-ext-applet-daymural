@@ -4,7 +4,6 @@
 
 
 about-this-image = Meer oor hierdie beeld
-bing-wallpaper = Bing-muurpapier
 
 tooltip-previous = Vorige muurpapier
 tooltip-next = Volgende muurpapier

@@ -4,7 +4,6 @@
 
 
 about-this-image = O tej sliki
-bing-wallpaper = Ozadje Bing
 
 tooltip-previous = Prejšnje ozadje
 tooltip-next = Naslednje ozadje

@@ -4,7 +4,6 @@
 
 
 about-this-image = Осы сурет туралы
-bing-wallpaper = Bing тұсқағазы
 
 tooltip-previous = Алдыңғы тұсқағаз
 tooltip-next = Келесі тұсқағаз

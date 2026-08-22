@@ -4,7 +4,6 @@
 
 
 about-this-image = Apie šį paveikslėlį
-bing-wallpaper = „Bing“ fonas
 
 tooltip-previous = Ankstesnis fonas
 tooltip-next = Kitas fonas

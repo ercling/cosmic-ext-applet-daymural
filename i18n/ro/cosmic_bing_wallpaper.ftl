@@ -4,7 +4,6 @@
 
 
 about-this-image = Despre această imagine
-bing-wallpaper = Imagine de fundal Bing
 
 tooltip-previous = Imaginea anterioară
 tooltip-next = Imaginea următoare

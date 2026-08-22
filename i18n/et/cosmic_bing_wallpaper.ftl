@@ -4,7 +4,6 @@
 
 
 about-this-image = Teave selle pildi kohta
-bing-wallpaper = Bingi taustapilt
 
 tooltip-previous = Eelmine taustapilt
 tooltip-next = Järgmine taustapilt

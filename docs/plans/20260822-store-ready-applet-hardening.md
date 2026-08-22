@@ -329,7 +329,7 @@ There is no external API change. Internal interfaces change as follows:
 
 ### Task 5: Fluent cleanup, documentation, and packaging validation
 
-- [ ] Replace the unreachable `fl!("bing-wallpaper")` fallback in
+- [x] Replace the unreachable `fl!("bing-wallpaper")` fallback in
       `view::display_title` (`src/view.rs:147`) with
       `file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()`
       (`file_stem()` is still an `Option`), confirm
@@ -338,18 +338,18 @@ There is no external API change. Internal interfaces change as follows:
       `bing-wallpaper` id from all 73 Fluent catalogues
       (`every_message_id_is_referenced_by_the_ui` and
       `every_locale_defines_every_english_message` both require it).
-- [ ] Integrate the existing README rights/attribution changes rather than
+- [x] Integrate the existing README rights/attribution changes rather than
       overwriting them.
-- [ ] Explain that the applet creates `catalogue.json` from response metadata
+- [x] Explain that the applet creates `catalogue.json` from response metadata
       and does not embed that metadata into downloaded JPEG bytes.
-- [ ] Replace the documented `wp` limitation with the implemented fail-closed,
+- [x] Replace the documented `wp` limitation with the implemented fail-closed,
       explicit-false-deletes, and bounded-fallback behavior; add a one-line
       troubleshooting note that an applet that stays empty with no error
       should be run with `RUST_LOG=cosmic_bing_wallpaper=warn` to see the
       eligibility counts.
-- [ ] Clarify that GPL covers the applet's code/assets, not downloaded
+- [x] Clarify that GPL covers the applet's code/assets, not downloaded
       imagery, and attribution does not grant redistribution permission.
-- [ ] Make CI run
+- [x] Make CI run
       `appstreamcli validate --pedantic --explain --strict --no-net data/io.github.ercling.CosmicBingWallpaper.metainfo.xml`
       in `.github/workflows/flatpak.yml:88`, **and in the same commit** update
       the literal the packaging test asserts at `src/app.rs:6447`
@@ -359,8 +359,18 @@ There is no external API change. Internal interfaces change as follows:
       fails the step. Do not add a `cid-contains-uppercase-letter` override
       here — that is the rename plan's concern and would fail CI until it
       lands.
-- [ ] Run `just check`, AppStream validation, Flatpak source
+- [x] Run `just check`, AppStream validation, Flatpak source
       generation/prefetch, and a force-clean offline Flatpak build.
+      ⚠️ Ran: `just check` (412 tests, fmt, clippy), the strict
+      `appstreamcli validate` line above (passes; only the pedantic
+      `cid-contains-uppercase-letter` hint, left for the rename plan), and
+      `just flatpak-sources` (cargo-sources.json generated, ignored).
+      `just flatpak-prefetch` failed twice in this environment while
+      flatpak-builder updated `org.freedesktop.Sdk.Extension.rust-stable`
+      25.08 from Flathub (`dl.flathub.org/repo/objects/06/0fdf65…filez`
+      → HTTP 404, then flatpak-builder SIGSEGV) — a remote-repository
+      fault outside this repo — so `just flatpak-build-offline` could not
+      run here; CI's flatpak.yml remains the gate for it.
 
 ### Task 6: Live acceptance
 

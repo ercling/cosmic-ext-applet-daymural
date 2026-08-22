@@ -4,7 +4,6 @@
 
 
 about-this-image = Относно това изображение
-bing-wallpaper = Тапет от Bing
 
 tooltip-previous = Предишен тапет
 tooltip-next = Следващ тапет

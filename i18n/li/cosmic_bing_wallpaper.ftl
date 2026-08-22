@@ -4,7 +4,6 @@
 
 
 about-this-image = Euver dit beeld
-bing-wallpaper = Bing-achtergróndj
 
 tooltip-previous = Veurig achtergróndj
 tooltip-next = Volgend achtergróndj

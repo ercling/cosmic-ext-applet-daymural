@@ -4,7 +4,6 @@
 
 
 about-this-image = ᱱᱚᱶᱟ ᱪᱤᱛᱟᱹᱨ ᱵᱟᱵᱚᱛ
-bing-wallpaper = Bing ᱣᱟᱞᱯᱮᱯᱟᱨ
 
 tooltip-previous = ᱢᱟᱲᱟᱝ ᱣᱟᱞᱯᱮᱯᱟᱨ
 tooltip-next = ᱛᱟᱭᱚᱢ ᱣᱟᱞᱯᱮᱯᱟᱨ

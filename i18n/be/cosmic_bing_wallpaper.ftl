@@ -4,7 +4,6 @@
 
 
 about-this-image = Пра гэту выяву
-bing-wallpaper = Шпалеры Bing
 
 tooltip-previous = Папярэднія шпалеры
 tooltip-next = Наступныя шпалеры

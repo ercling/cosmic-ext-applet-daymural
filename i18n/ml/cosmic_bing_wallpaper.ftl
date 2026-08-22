@@ -4,7 +4,6 @@
 
 
 about-this-image = ഈ ചിത്രത്തെക്കുറിച്ച്
-bing-wallpaper = Bing വാൾപേപ്പർ
 
 tooltip-previous = മുൻ വാൾപേപ്പർ
 tooltip-next = അടുത്ത വാൾപേപ്പർ

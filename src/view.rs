@@ -142,9 +142,8 @@ pub fn display_title(entry: &ImageEntry) -> String {
     entry
         .filename
         .file_stem()
-        .and_then(|s| s.to_str())
-        .map(str::to_owned)
-        .unwrap_or_else(|| fl!("bing-wallpaper"))
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// Footer timestamp: "Updated today at 09:12" / "… yesterday at …" /

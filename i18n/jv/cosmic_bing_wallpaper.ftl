@@ -4,7 +4,6 @@
 
 
 about-this-image = Bab gambar iki
-bing-wallpaper = Wallpaper Bing
 
 tooltip-previous = Wallpaper sadurunge
 tooltip-next = Wallpaper sabanjure

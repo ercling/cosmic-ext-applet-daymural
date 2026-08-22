@@ -4,7 +4,6 @@
 
 
 about-this-image = Ushbu rasm haqida
-bing-wallpaper = Bing fon rasmi
 
 tooltip-previous = Oldingi fon rasmi
 tooltip-next = Keyingi fon rasmi

@@ -4,7 +4,6 @@
 
 
 about-this-image = Bu görsel hakkında
-bing-wallpaper = Bing duvar kâğıdı
 
 tooltip-previous = Önceki duvar kâğıdı
 tooltip-next = Sonraki duvar kâğıdı

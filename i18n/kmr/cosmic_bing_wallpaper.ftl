@@ -4,7 +4,6 @@
 
 
 about-this-image = Derbarê vê wêneyê de
-bing-wallpaper = Kaxeza dîwêr a Bing
 
 tooltip-previous = Kaxeza dîwêr a berê
 tooltip-next = Kaxeza dîwêr a paşê

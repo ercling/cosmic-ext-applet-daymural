@@ -4,7 +4,6 @@
 
 
 about-this-image = 关于此图片
-bing-wallpaper = Bing 壁纸
 
 tooltip-previous = 上一张壁纸
 tooltip-next = 下一张壁纸

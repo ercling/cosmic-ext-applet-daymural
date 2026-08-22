@@ -7024,7 +7024,7 @@ mod tests {
             CARGO_SOURCES_FILENAME.to_owned(),
             "astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b".to_owned(),
             "version: \"0.12.1\"".to_owned(),
-            "appstreamcli validate --no-net data/io.github.ercling.CosmicBingWallpaper.metainfo.xml".to_owned(),
+            "appstreamcli validate --pedantic --explain --strict --no-net data/io.github.ercling.CosmicBingWallpaper.metainfo.xml".to_owned(),
             FLATPAK_BUILDER_ACTION.to_owned(),
             format!("bundle: {}.flatpak", env!("CARGO_PKG_NAME")),
         ] {

@@ -4,7 +4,6 @@
 
 
 about-this-image = Sobre esta imagem
-bing-wallpaper = Papel de parede do Bing
 
 tooltip-previous = Papel de parede anterior
 tooltip-next = Próximo papel de parede

@@ -6,10 +6,6 @@
 
 # Opens Bing's own page about the displayed image in the browser.
 about-this-image = About this image
-# Heading fallback for images that carry no title yet (folder-scan rebuilds).
-# English spells it as the product name (same casing as the desktop entry's
-# `Name=`); translations may use a descriptive phrase instead.
-bing-wallpaper = Bing Wallpaper
 
 ## Tooltips on the icon-only controls
 

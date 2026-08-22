@@ -33,9 +33,11 @@ from the GNOME extension is picked up as-is — no re-downloads.
   separate light- and dark-mode tones. Switching it off restores the accent you
   had when you switched it on; picking an accent yourself in COSMIC Settings
   switches it off and keeps your choice.
-- **Image details** — click the thumbnail to open the full-size image in your
-  default viewer, or use "About this image" to open Bing's info page in the
-  browser (both launched via `xdg-open`, so `xdg-utils` is needed at runtime).
+- **Image details and credit** — the popup shows the photographer/rightsholder
+  credit supplied by Bing. Click the thumbnail to open the full-size image in
+  your default viewer, or use "About this image" to open Bing's supplied info
+  link in the browser (both launched via `xdg-open`, so `xdg-utils` is needed
+  at runtime).
 - **Respects your choices** — if you set a different wallpaper in COSMIC
   Settings, the applet keeps downloading but stops auto-applying until you act
   (prev/next/newest/shuffle).
@@ -47,6 +49,69 @@ from the GNOME extension is picked up as-is — no re-downloads.
   time).
 - **Localized** — the UI follows your desktop language, with catalogues for the
   73 locales COSMIC itself ships (see [Translations](#translations)).
+
+## Image rights and attribution
+
+This is an unofficial, independent project. It is not affiliated with,
+authorized by, sponsored by, or endorsed by Microsoft. The Flatpak and native
+packages contain no Bing homepage photographs: each installation fetches image
+metadata and JPEGs directly from Bing.
+
+Microsoft says that most Bing daily images may be downloaded for use as
+wallpaper, while licensing restrictions make some images unavailable for
+download. Its Services Agreement limits Bing and MSN photos and other material
+to personal, noncommercial use; downloading, copying, redistributing, or using
+that material to build another product otherwise requires authorization from
+Microsoft or the relevant rightsholder, or permission under applicable
+copyright law. See Microsoft's [Bing homepage guidance](https://support.microsoft.com/en-us/bing/explore-the-homepage-1),
+[Services Agreement](https://www.microsoft.com/en-us/servicesagreement#14f_BingandMSN),
+and [copyright guidance](https://www.microsoft.com/en-us/legal/intellectualproperty/copyright/permissions).
+Attribution identifies the rightsholder but does not itself grant additional
+rights.
+
+For an image fetched with Bing metadata, the applet saves the JPEG bytes
+exactly as delivered and creates `catalogue.json` (in its state directory)
+from the response metadata, storing the caption-derived title, credit, and
+information link there. The popup displays that credit and exposes
+the link as **About this image**. The applet does not add the JSON attribution
+to the JPEG file itself, so copying a JPEG alone does not necessarily carry the
+separate credit or link. If the catalogue must be rebuilt from filenames, the
+applet immediately asks Bing again and restores the title, credit, and link
+for every image still in Bing's eight-image window; older images keep an
+honest filename fallback.
+
+Downloads honor Bing's per-image `wp` eligibility flag and fail closed: an
+image is fetched only when Bing marks it `wp: true`. An image Bing marks
+`wp: false` is never downloaded, and one that was downloaded earlier (before
+this rule, or after a later licensing change) is removed — entry and JPEG —
+so it cannot come back through a catalogue rebuild. An image whose `wp` field
+is absent is not downloaded either, but nothing is deleted on that evidence:
+a change in Bing's payload must never erase your history. The one exception
+is the wallpaper currently on screen, which stays until another image
+replaces it, so the popup never credits a different image than the one
+displayed. The list request always asks for Bing's supported eight-image
+window; the retention setting decides which of those are downloaded, and if
+none of them is eligible only the newest eligible image in the rest of the
+window is fetched as a fallback (never more, never older pages).
+
+The `HPImageArchive` endpoint has no public third-party product license
+identified by this project, so `wp` enforcement and attribution do **not**
+amount to a claim that Store publication or every automated download has been
+verified as authorized; that remains gated on the applicable Microsoft terms
+and any written authorization from Microsoft or the rightsholder.
+
+Troubleshooting: an applet that stays empty with no error shown is usually an
+all-restricted day or a payload without `wp`; run it with
+`RUST_LOG=cosmic_bing_wallpaper=warn` to see the per-refresh eligibility
+counts (explicit-`false` and absent-`wp` are reported separately).
+
+Downloaded photographs remain the property of their respective
+rightsholders. Use them only as personal, noncommercial wallpaper unless the
+rightsholder grants broader permission; do not redistribute them based on this
+project. Attribution identifies the rightsholder but does not grant
+redistribution permission. The project's GPL-3.0-only license covers the
+applet's code and project-owned assets (icon, metadata, translations), not
+photographs downloaded from Bing.
 
 ## Native build & install
 
@@ -323,4 +388,6 @@ needs `PKG_CONFIG_PATH=/usr/lib64/pkgconfig:/usr/share/pkgconfig` — the
 
 ## License
 
-[GPL-3.0-only](LICENSE), like the GNOME extension that inspired it.
+[GPL-3.0-only](LICENSE), like the GNOME extension that inspired it. The license
+covers this project's code and assets only — not the photographs the applet
+downloads from Bing; see [Image rights and attribution](#image-rights-and-attribution).

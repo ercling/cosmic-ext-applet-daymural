@@ -4,7 +4,6 @@
 
 
 about-this-image = A prepaus d'aqueste imatge
-bing-wallpaper = Fons d'ecran Bing
 
 tooltip-previous = Fons d'ecran precedent
 tooltip-next = Fons d'ecran seguent

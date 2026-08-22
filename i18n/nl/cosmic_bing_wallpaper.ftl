@@ -4,7 +4,6 @@
 
 
 about-this-image = Over deze afbeelding
-bing-wallpaper = Bing-achtergrond
 
 tooltip-previous = Vorige achtergrond
 tooltip-next = Volgende achtergrond

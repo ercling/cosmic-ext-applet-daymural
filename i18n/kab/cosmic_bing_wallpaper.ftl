@@ -4,7 +4,6 @@
 
 
 about-this-image = Ɣef tugna-a
-bing-wallpaper = Ugdil n Bing
 
 tooltip-previous = Ugdil uzwir
 tooltip-next = Ugdil d-iteddun

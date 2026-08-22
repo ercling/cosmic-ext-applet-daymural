@@ -4,7 +4,6 @@
 
 
 about-this-image = ამ სურათის შესახებ
-bing-wallpaper = Bing-ის ფონი
 
 tooltip-previous = წინა ფონი
 tooltip-next = შემდეგი ფონი

@@ -4,7 +4,6 @@
 
 
 about-this-image = この画像について
-bing-wallpaper = Bing の壁紙
 
 tooltip-previous = 前の壁紙
 tooltip-next = 次の壁紙

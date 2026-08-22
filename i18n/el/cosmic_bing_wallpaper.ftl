@@ -4,7 +4,6 @@
 
 
 about-this-image = Σχετικά με αυτήν την εικόνα
-bing-wallpaper = Ταπετσαρία Bing
 
 tooltip-previous = Προηγούμενη ταπετσαρία
 tooltip-next = Επόμενη ταπετσαρία

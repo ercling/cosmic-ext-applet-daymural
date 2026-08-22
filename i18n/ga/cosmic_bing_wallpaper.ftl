@@ -4,7 +4,6 @@
 
 
 about-this-image = Maidir leis an íomhá seo
-bing-wallpaper = Cúlbhrat Bing
 
 tooltip-previous = An cúlbhrat roimhe seo
 tooltip-next = An chéad chúlbhrat eile

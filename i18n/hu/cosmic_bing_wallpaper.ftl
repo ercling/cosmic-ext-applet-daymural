@@ -4,7 +4,6 @@
 
 
 about-this-image = A képről
-bing-wallpaper = Bing háttérkép
 
 tooltip-previous = Előző háttérkép
 tooltip-next = Következő háttérkép
