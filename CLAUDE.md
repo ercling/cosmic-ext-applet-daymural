@@ -90,23 +90,36 @@ do not duplicate `appstreamcli` or desktop-file syntax validation in Rust.
   thread, injectable dirs + base URL for tests: fetch list → download missing →
   thumbnails; returns a `RefreshBatch` — fetched entries, the explicitly
   ineligible `wp: false` URL bases, the response's scheduling anchor, and
-  the optional `fallback` path). **The list request is always the full
+  the optional `fallback` path, and `thumbnails_deferred` — whether it was
+  produced under the producer write interlock). **The list request is always the full
   `bing::ARCHIVE_WINDOW` (`idx=0&n=8`), never paginated**; retention only
   picks which positions are downloaded (`Downloads { horizon:
   schedule::download_horizon(retention), fallback:
-  wallpaper::should_auto_apply(..) }`, resolved at `start_refresh_over`,
+  Window::fallback_permitted(&live) }`, resolved at `start_refresh_over`,
   applied by the pure tested `select_downloads`): every eligible entry
   inside the horizon, or — when the horizon holds nothing eligible and
   auto-apply is not suppressed — exactly the newest eligible image beyond
   it, so the applet has *something* to apply (`retention=1` with a
   restricted newest image would otherwise be a permanent daily no-op).
   Never both, never any other out-of-retention image, and no fallback at
-  all over a foreign wallpaper — it would be pruned and re-fetched daily)
+  all over a foreign wallpaper — it would be pruned and re-fetched daily.
+  `fallback_permitted` is `should_auto_apply` over `live.into_file()` —
+  the completion's own rule — and **never over `self.current`**: under
+  `CurrentWallpaper::Unknown` `sync_current` keeps the stale path of our
+  own last apply, which `is_ours` passes while the completion maps the
+  same state to `None` and applies nothing warm, so the start would fetch
+  a fallback the end never applies — the exact churn
+  (`an_unknowable_wallpaper_suppresses_the_fallback_like_the_completion_does`))
   and the `RefreshFinished` handler (UI thread, against *live* state: merge →
   eligibility reconciliation (`remove_ineligible_over`: entry **and** file of
-  every `wp: false` image, the live wallpaper's exempt, nothing at all while
+  every `wp: false` image, the live wallpaper's exempt — `finish_refresh_over`
+  calls `sync_current` once and both it and the `prune_synced` that follows
+  exempt the same `protected_paths` list; `prune_over` is the sync-then-prune
+  entry point for the standalone `prune_and_persist` — nothing at all while
   the live state is `CurrentWallpaper::Unknown` — the same evidence the
-  prune's `prune_retention` guard uses) → prune protecting the live current
+  prune's `prune_retention` guard uses, which on a per-output setup is
+  permanent: there nothing is ever removed for eligibility, by the plan's
+  choice, and the README says so) → prune protecting the live current
   wallpaper, whose thumbnail sweep also collects what the reconciliation
   removed → save → auto-apply per the "don't clobber" rule → reschedule —
   never merge/reconcile/prune in the async task, its snapshot goes stale
@@ -114,10 +127,13 @@ do not duplicate `appstreamcli` or desktop-file syntax validation in Rust.
   shuffle (a stale tick is ignored, so rescheduling atomically replaces the
   pending timer), `state_dir()`/`catalogue_path()`, and the tested pure
   decision `refresh_success_plan` — `auto_apply` from the live catalogue's
-  `has_images`, `delay` from the *response* anchor (the newest structurally
+  `has_images` **and** the batch's `delivered` (`fetched` non-empty: the
+  warm is-ours rule re-applies the newest image only when the response
+  handed something over; cold start is exempt so a restored catalogue is
+  still applied), `delay` from the *response* anchor (the newest structurally
   valid `fullstartdate`, eligible or not), so a valid response with zero
   eligible images is a successful no-op: history and the current wallpaper
-  stay, the error clears, cold start stays armed, peers are acknowledged as a
+  stay (even over one of ours the user navigated back to), the error clears, cold start stays armed, peers are acknowledged as a
   success, and the next refresh is the normal daily one rather than
   `next_refresh`'s ~6-minute reset off a stale catalogue entry. The one
   `tracing::warn!` for that day (in `fetch_and_download`) names the explicit
@@ -133,8 +149,11 @@ do not duplicate `appstreamcli` or desktop-file syntax validation in Rust.
   `prune_and_persist` delete the out-of-retention, non-applied fallback and
   the next refresh simply re-downloads it — accepted.
   The out-of-window thumbnail backfill at the end of `fetch_and_download` is
-  governed by the `Backfill` policy struct (budget + retention + applied file,
-  injected by tests). Its rule: **the budget buys decodes, and no entry is ever
+  governed by the `Backfill` policy struct (budget + retention + applied file
+  + `protected_fallback` + the `deferred` write-interlock flag; owned, built
+  on the UI thread by `start_refresh_over` / `start_thumbnail_pass_over`
+  against live state and carried whole into `run_refresh(catalogue,
+  downloads, backfill)` / `run_thumbnail_pass`; injected by tests). Its rule: **the budget buys decodes, and no entry is ever
   paid for twice.** Three free skips come first — an entry the imminent prune
   will delete (`ImageEntry::within_retention`, the *same* test `prune` applies,
   applied file exempt), one already cached (`thumbs::is_cached`), and one that
@@ -159,8 +178,27 @@ do not duplicate `appstreamcli` or desktop-file syntax validation in Rust.
   producers write `<thumb>.part`/`<thumb>.meta` at fixed names, so they
   are interlocked on **writes** as well: a refresh started while
   `thumbnail_pass_pending` is `Backfill::deferred` and writes no thumbnails
-  (neither `ensure_thumbnail_logged` per download nor the tail backfill);
-  the next refresh backfills what it downloaded. The repair itself is plain
+  (neither `ensure_thumbnail_logged` per download nor the tail backfill).
+  Its batch reports `thumbnails_deferred` — only when the download loop
+  actually handled an entry; a deferred refresh that fetched nothing
+  (all-ineligible day, suppressed fallback) owes nothing, else it would
+  buy an extra pass, sweep and accent recompute for no preview
+  (`a_deferred_refresh_that_fetches_nothing_owes_no_thumbnail_pass`) —
+  which `finish_refresh_over`
+  books as `thumbnails_owed`, and whichever producer ends *last* pays it
+  (`settle_owed_thumbnails`): one more `start_thumbnail_pass_over` over
+  the merged catalogue — cached slots are free skips, so it costs only the
+  withheld decodes — ending in its own sweep and `ThumbnailsReady` accent
+  recompute. Without it the just-applied image showed the placeholder, and
+  got no accent (`start_accent_compute` decodes only cached slots), until
+  the next refresh ~24 h out. The refresh end settles the debt **before**
+  its apply arm (the pass takes the pre-apply live state, as the prune
+  does), so `Backfill::protected_fallback` mirrors `prune_over`'s
+  exemption: a bounded fallback is out of retention by construction and
+  not yet `current` at that instant, and without it the owed pass skipped
+  exactly the image the refresh then applied
+  (`the_owed_pass_decodes_the_out_of_retention_fallback_it_was_armed_for`).
+  The repair itself is plain
   `fetch_and_download`: every eligible entry in the eight-entry window whose
   JPEG is already on disk is hydrated from the response (no GET, even beyond
   the download horizon — nothing out of retention is downloaded for
@@ -190,7 +228,13 @@ do not duplicate `appstreamcli` or desktop-file syntax validation in Rust.
   acknowledgement is pending) and its timeout retry. Only the reload a
   *settled* request triggers never re-asks (`non_leader_reload_repairs`):
   an offline leader's repair fetch fails and is acknowledged as such, and
-  re-asking per acknowledgement would never end. A follower may apply
+  re-asking per acknowledgement would never end. Popup opens and timeouts
+  *do* ask again (the plan's choice): a popup open over a still-rebuilt
+  catalogue is the same request the button makes and reaches the leader's
+  fetch like a manual refresh would, and a leader that never acknowledges
+  is re-asked once per `PEER_REFRESH_ACK_TIMEOUT` — one mailbox key write
+  and one catalogue reload per ~5 min, unbounded but cheap, and it ends
+  the moment any leader settles the request. A follower may apply
   navigation choices directly, then
   posts an apply notice; the leader verifies cosmic-bg's live wallpaper before
   updating `current`, spending `ColdStart`, and recomputing the accent.
@@ -240,8 +284,11 @@ do not duplicate `appstreamcli` or desktop-file syntax validation in Rust.
   eligible entry would hit `next_refresh`'s ~6-minute out-of-range reset).
   **An image GET is only ever issued for `Some(true)`**; absent `wp` blocks
   the download but never authorizes a removal — only an explicit `false`
-  does (see `catalogue.rs`). `EmptyList` means *no structurally valid entry*;
-  an all-ineligible response is a successful no-op, logged by
+  does (see `catalogue.rs`). `EmptyList` means *no structurally valid entry*
+  — decided once, in `fetch_image_list`, from the anchor being absent (every
+  valid entry anchors), which returns a `FetchedArchive { archive, anchor:
+  String }` so the schedule never sees an `Option`; an all-ineligible
+  response is a successful no-op, logged by
   `fetch_and_download` with the `false`/absent counts separately so an
   all-restricted day and a payload change that dropped the field stay
   distinguishable.
@@ -262,8 +309,17 @@ do not duplicate `appstreamcli` or desktop-file syntax validation in Rust.
   rename). Used by `bing::download_image`, `Catalogue::save` and
   `thumbs::ensure_thumbnail` — never hand-roll another temp-then-rename.
 - `src/catalogue.rs` — `ImageEntry`/`Catalogue`: JSON persistence (atomic write),
-  merge-with-dedupe by `urlbase`, retention prune (never deletes the currently
-  applied file), `rebuild_from_folder` (filename ↔ urlbase mapping is
+  merge-with-dedupe by `urlbase` (an entry's file claim is dead, and the
+  incoming fresh download adopted, when the file is gone, not
+  `is_own_file(images_dir)` — the *same* containment gate `existing_file`
+  and `prune` apply, so a same-named JPEG outside the download dir loses
+  to the in-dir download instead of being pruned as foreign with the
+  download orphaned — **or not a JPEG** — the pipeline re-downloads past a
+  magic-byte failure and its unlink of the bad file can fail, which must
+  not pin the entry to it and orphan the download), retention prune — `prune_protecting`
+  exempts an explicit list of paths from the *age* rule (the applied file
+  and `app.rs`'s in-memory `protected_fallback`), `prune` is the one-path
+  wrapper — `entry_for(path)`, `rebuild_from_folder` (filename ↔ urlbase mapping is
   deterministic both ways, so rebuilds dedupe against the next fetch with no
   re-downloads), `remove_ineligible` (Bing's explicit `wp: false` verdicts,
   carried by the `RefreshBatch`: removes entry **and** file so a rebuild
@@ -271,10 +327,22 @@ do not duplicate `appstreamcli` or desktop-file syntax validation in Rust.
   entry legitimately names inside `images_dir` is unlinked, the entry is
   dropped only once the file is confirmed gone (unlink succeeded or already
   absent; on failure it is kept and the next refresh retries, so no window
-  ever has an entry gone with a rebuildable JPEG left), and the currently
+  ever has an entry gone with a rebuildable JPEG left), and it takes the
+  same `protected: &[&Path]` list `prune_protecting` does — the currently
   applied file is exempt, entry and file, so `view::displayed` keeps
   attributing the image on screen — it goes on the first refresh after
-  another image is applied. The caller in `app.rs` adds the
+  another image is applied *while Bing still lists it*; kept on screen past
+  the eight-day window it simply ages out through retention (no deferred
+  verdict is persisted — accepted). Like `prune` the pass is skipped while
+  `images_dir` cannot be enumerated. The guarantee is held at the **file**
+  level: after the entry pass every wallpaper-named file in `images_dir`
+  that `bing::parse_filename` attributes to an ineligible image and no
+  surviving entry *owns* (`ImageEntry::is_own_file` — a tampered entry of
+  another image pointing at it is foreign, which `prune` later drops
+  without unlinking, so its claim shields nothing) is unlinked too — the
+  rebuild's deduplicated
+  second-resolution copy, or a download that landed before its merge,
+  would otherwise resurrect. The caller in `app.rs` adds the
   `CurrentWallpaper::Unknown` guard: when the displayed file is unknowable
   `currently_applied` protects nothing, so nothing is deleted that refresh.
   Absent `wp` never reaches it — it blocks downloads only), navigation
@@ -528,7 +596,10 @@ disabled styling / i18n / theme conformance, `20260808-accent-from-wallpaper.md`
 plus its `-notes.md` for the accent feature, `20260810-popup-destroy-order-crash.md`
 for the popup-stack invariant and its libcosmic source-line evidence, and
 `20260817-single-instance-leader.md` for multi-output ownership and peer
-coordination — each in
+coordination, `20260822-store-ready-applet-hardening.md` for `wp`
+eligibility / the full-window fetch with bounded fallback /
+rebuilt-catalogue metadata repair, and `20260822-daymural-rename.md` for
+the pending app rename — each in
 `docs/plans/` or, once archived, `docs/plans/completed/`). Gotchas recorded
 there worth knowing: the
 `zune-jpeg` `log`-feature workaround in `Cargo.toml`, the transitive

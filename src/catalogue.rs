@@ -80,6 +80,14 @@ impl ImageEntry {
             .is_some_and(|n| bing::filename_names_urlbase(n, &self.urlbase))
     }
 
+    /// The containment gate every file-deleting pass applies: the entry's
+    /// file lives directly in `images_dir` *and* is named for the entry's
+    /// own image ([`ImageEntry::names_own_file`]). Anything else is foreign
+    /// — dropped from the catalogue, never unlinked.
+    pub fn is_own_file(&self, images_dir: &Path) -> bool {
+        self.filename.parent() == Some(images_dir) && self.names_own_file()
+    }
+
     /// The entry's start time, if its `fullstartdate` parses.
     fn start_time(&self) -> Option<DateTime<Utc>> {
         NaiveDateTime::parse_from_str(&self.fullstartdate, "%Y%m%d%H%M")
@@ -268,7 +276,14 @@ impl Catalogue {
     /// kept — the file on disk (possibly at a different resolution
     /// suffix) stays authoritative, so nothing is re-downloaded. Result
     /// stays sorted ascending by `fullstartdate`.
-    pub fn merge(&mut self, new_entries: Vec<ImageEntry>) {
+    ///
+    /// "Authoritative" is decided by the same containment gate
+    /// [`Catalogue::existing_file`] and [`Catalogue::prune`] apply
+    /// ([`ImageEntry::is_own_file`] against `images_dir`): a claim the
+    /// pipeline refused to reuse must not win over the download that
+    /// refusal caused, or the prune drops the foreign claim and the fresh
+    /// file is orphaned until a later rebuild.
+    pub fn merge(&mut self, new_entries: Vec<ImageEntry>, images_dir: &Path) {
         for incoming in new_entries {
             match self
                 .images
@@ -302,11 +317,21 @@ impl Catalogue {
                     // illegitimate while the incoming entry holds a fresh
                     // download: the file vanished externally, or a
                     // tampered catalogue pointed the entry at a file it
-                    // does not name (either way `existing_file` misses
-                    // and the pipeline re-downloads) — adopt the new
-                    // path instead of orphaning the download.
-                    if (!existing.filename.is_file() || !existing.names_own_file())
+                    // does not name or one outside `images_dir` (either
+                    // way `existing_file` misses — it requires the same
+                    // containment — and the pipeline re-downloads) —
+                    // adopt the new
+                    // path instead of orphaning the download. A file that
+                    // is not a JPEG counts as dead too: the pipeline
+                    // re-downloads past it and unlinks it afterwards, but
+                    // when that unlink *fails* the bad file is still there,
+                    // and keeping the claim would pin the entry to it while
+                    // orphaning the good download under another suffix.
+                    // Same-path replacements are already the fresh bytes.
+                    if incoming.filename != existing.filename
                         && incoming.filename.is_file()
+                        && (!existing.is_own_file(images_dir)
+                            || !bing::is_jpeg_file(&existing.filename))
                     {
                         existing.filename = incoming.filename;
                     }
@@ -385,8 +410,7 @@ impl Catalogue {
         }
         let mut removed = Vec::new();
         self.images.retain(|entry| {
-            let ours = entry.filename.parent() == Some(images_dir) && entry.names_own_file();
-            if !ours {
+            if !entry.is_own_file(images_dir) {
                 tracing::warn!(
                     "dropping catalogue entry with foreign path {} (file left untouched)",
                     entry.filename.display()
@@ -414,13 +438,17 @@ impl Catalogue {
                 }
             }
         });
-        // A scrubbed entry may have pointed at a file another (legitimate)
-        // entry still holds — never report a path the catalogue still
-        // references, or the caller would delete the survivor's cached
-        // thumbnail. Thumbnails are keyed by *basename*
-        // ([`crate::thumbs::thumbnail_path`]), so the comparison must be
-        // too: a foreign path merely *sharing* a survivor's basename
-        // would otherwise take the survivor's thumbnail with it.
+        self.drop_still_referenced(removed)
+    }
+
+    /// Filter a removal report for the thumbnail sweep: a scrubbed entry
+    /// may have pointed at a file another (legitimate) entry still holds —
+    /// never report a path the catalogue still references, or the caller
+    /// would delete the survivor's cached thumbnail. Thumbnails are keyed by
+    /// *basename* ([`crate::thumbs::thumbnail_path`]), so the comparison
+    /// must be too: a foreign path merely *sharing* a survivor's basename
+    /// would otherwise take the survivor's thumbnail with it.
+    fn drop_still_referenced(&self, mut removed: Vec<PathBuf>) -> Vec<PathBuf> {
         removed.retain(|path| {
             !self
                 .images
@@ -430,7 +458,7 @@ impl Catalogue {
         removed
     }
 
-    /// Remove the entries Bing has *explicitly* marked ineligible
+    /// Remove the images Bing has *explicitly* marked ineligible
     /// (`wp: false`) — entry **and** file, so a later
     /// [`Catalogue::rebuild_from_folder`] cannot resurrect the image.
     /// Returns the removed paths, for the thumbnail sweep.
@@ -445,27 +473,48 @@ impl Catalogue {
     /// file is exempt, entry and file, so the popup keeps attributing the
     /// image that is actually on screen (`view::displayed` would otherwise
     /// fall back to the newest entry). It goes on the first refresh after
-    /// another image is applied. Callers hold the `CurrentWallpaper::Unknown`
-    /// guard (see `app.rs`): when the displayed file is unknowable,
-    /// `currently_applied` protects nothing and nothing may be deleted.
+    /// another image is applied, provided Bing still lists it then. Like
+    /// prune, the whole pass is skipped while `images_dir` cannot be
+    /// enumerated: an absent folder is not evidence that its files are
+    /// gone, and dropping the entries over it would leave rebuildable JPEGs
+    /// behind once it returns. `protected` is the same exemption list
+    /// [`Catalogue::prune_protecting`] takes (the applied file plus any
+    /// fallback awaiting its apply). Callers hold the
+    /// `CurrentWallpaper::Unknown` guard (see `app.rs`): when the displayed
+    /// file is unknowable, `protected` protects nothing and nothing may be
+    /// deleted.
+    ///
+    /// The guarantee is held at the *file* level, not just the entry level:
+    /// after the entry pass, every wallpaper-named file in `images_dir` that
+    /// [`bing::parse_filename`] attributes to an ineligible image and that
+    /// no surviving entry legitimately *owns* ([`ImageEntry::is_own_file`])
+    /// references is unlinked too — a second copy at
+    /// another resolution suffix the rebuild deduplicated away, or a
+    /// download that landed before a crash ahead of its merge, would
+    /// otherwise resurrect through the next rebuild.
     pub fn remove_ineligible(
         &mut self,
         urlbases: &[String],
         images_dir: &Path,
-        currently_applied: Option<&Path>,
+        protected: &[&Path],
     ) -> Vec<PathBuf> {
         let mut removed = Vec::new();
         if urlbases.is_empty() {
             return removed;
         }
+        let Ok(listing) = fs::read_dir(images_dir) else {
+            tracing::warn!(
+                "skipping removal of ineligible images: {} cannot be read right now",
+                images_dir.display()
+            );
+            return removed;
+        };
         self.images.retain(|entry| {
-            if !urlbases.contains(&entry.urlbase)
-                || currently_applied == Some(entry.filename.as_path())
+            if !urlbases.contains(&entry.urlbase) || protected.contains(&entry.filename.as_path())
             {
                 return true;
             }
-            let ours = entry.filename.parent() == Some(images_dir) && entry.names_own_file();
-            if !ours {
+            if !entry.is_own_file(images_dir) {
                 tracing::warn!(
                     "dropping ineligible catalogue entry with foreign path {} (file left untouched)",
                     entry.filename.display()
@@ -473,35 +522,39 @@ impl Catalogue {
                 removed.push(entry.filename.clone());
                 return false;
             }
-            match fs::remove_file(&entry.filename) {
-                Ok(()) => {
-                    tracing::info!(
-                        "removed {}: Bing marks it ineligible as a wallpaper",
-                        entry.filename.display()
-                    );
-                    removed.push(entry.filename.clone());
-                    false
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    removed.push(entry.filename.clone());
-                    false
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        "failed to remove ineligible {}: {error}",
-                        entry.filename.display()
-                    );
-                    true // keep the entry — retry on the next refresh
-                }
+            if unlink_ineligible(&entry.filename) {
+                removed.push(entry.filename.clone());
+                false
+            } else {
+                true // keep the entry — retry on the next refresh
             }
         });
-        removed.retain(|path| {
-            !self
-                .images
-                .iter()
-                .any(|e| e.filename.file_name() == path.file_name())
-        });
-        removed
+        for file in listing.flatten() {
+            let path = file.path();
+            let attributed = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(bing::parse_filename)
+                .is_some_and(|(_, urlbase)| urlbases.contains(&urlbase));
+            // Only an entry that legitimately *owns* the file exempts it:
+            // a tampered entry of another image pointing here is foreign
+            // (`prune` drops it without unlinking), and honouring its claim
+            // would leave a rebuildable ineligible JPEG behind.
+            if !attributed
+                || protected.contains(&path.as_path())
+                || self
+                    .images
+                    .iter()
+                    .any(|e| e.filename == path && e.is_own_file(images_dir))
+                || !path.is_file()
+            {
+                continue;
+            }
+            if unlink_ineligible(&path) {
+                removed.push(path);
+            }
+        }
+        self.drop_still_referenced(removed)
     }
 
     /// Newest image (last in ascending order).
@@ -599,6 +652,26 @@ impl Catalogue {
             (a.fullstartdate.as_str(), a.urlbase.as_str())
                 .cmp(&(b.fullstartdate.as_str(), b.urlbase.as_str()))
         });
+    }
+}
+
+/// Unlink one ineligible image; `true` once the file is confirmed gone
+/// (the unlink succeeded or it was already absent), `false` on any other
+/// error, which is logged and left for the next refresh to retry.
+fn unlink_ineligible(path: &Path) -> bool {
+    match fs::remove_file(path) {
+        Ok(()) => {
+            tracing::info!(
+                "removed {}: Bing marks it ineligible as a wallpaper",
+                path.display()
+            );
+            true
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+        Err(error) => {
+            tracing::warn!("failed to remove ineligible {}: {error}", path.display());
+            false
+        }
     }
 }
 
@@ -868,7 +941,7 @@ mod tests {
             images: vec![a.clone(), b.clone()],
         };
         // Incoming newest-first (Bing's order) and overlapping with existing.
-        cat.merge(vec![c.clone(), b.clone(), a.clone()]);
+        cat.merge(vec![c.clone(), b.clone(), a.clone()], dir.path());
 
         assert_eq!(cat.images, vec![a, b, c]); // deduped, oldest first
     }
@@ -894,7 +967,7 @@ mod tests {
                 .image,
             dir.path().join("20260807-Foo_ROW1_UHD.jpg"),
         );
-        cat.merge(vec![fetched]);
+        cat.merge(vec![fetched], dir.path());
 
         // One entry, metadata refilled, existing file kept (no re-download).
         assert_eq!(cat.images.len(), 1);
@@ -1016,7 +1089,7 @@ mod tests {
         fs::write(&legit_path, b"fresh jpeg").unwrap();
         let mut incoming = tampered.clone();
         incoming.filename = legit_path.clone();
-        cat.merge(vec![incoming]);
+        cat.merge(vec![incoming], dir.path());
 
         let healed = cat
             .images
@@ -1049,13 +1122,93 @@ mod tests {
         fs::write(&fresh_path, b"fresh jpeg").unwrap();
         let mut incoming = real.clone();
         incoming.filename = fresh_path.clone();
-        cat.merge(vec![incoming]);
+        cat.merge(vec![incoming], dir.path());
 
         // The entry now points at the fresh download instead of the
         // vanished path (which prune would drop, orphaning the download).
         assert_eq!(cat.images.len(), 1);
         assert_eq!(cat.images[0].filename, fresh_path);
         assert_eq!(cat.images[0].title, real.title); // metadata untouched
+    }
+
+    #[test]
+    fn merge_adopts_the_fresh_download_when_the_old_file_is_not_a_jpeg() {
+        // The pipeline re-downloaded past a catalogued file that failed the
+        // JPEG magic-byte test, then failed to unlink it (a read-only
+        // folder, say): the bad file is still there, and the merge must
+        // not keep the entry pinned to it while the good download under
+        // another suffix is orphaned.
+        let dir = tempfile::tempdir().unwrap();
+        let mut real = entry_with_file(dir.path(), "20260807", "Foo_ROW1");
+        real.filename = dir.path().join("20260807-Foo_ROW1_1920x1080.jpg");
+        fs::write(&real.filename, b"<html>captive portal</html>").unwrap();
+        let mut cat = Catalogue {
+            images: vec![real.clone()],
+        };
+        let fresh_path = dir.path().join("20260807-Foo_ROW1_UHD.jpg");
+        fs::write(&fresh_path, crate::testutil::tiny_jpeg(4, 4)).unwrap();
+        let mut incoming = real.clone();
+        incoming.filename = fresh_path.clone();
+
+        cat.merge(vec![incoming], dir.path());
+
+        assert_eq!(cat.images.len(), 1);
+        assert_eq!(cat.images[0].filename, fresh_path);
+        assert_eq!(cat.images[0].title, real.title);
+
+        // Whereas a legitimate JPEG at another suffix stays authoritative.
+        let held = entry_with_file(dir.path(), "20260808", "Bar_ROW2");
+        fs::write(&held.filename, crate::testutil::tiny_jpeg(4, 4)).unwrap();
+        let mut cat = Catalogue {
+            images: vec![held.clone()],
+        };
+        let other = dir.path().join("20260808-Bar_ROW2_1920x1080.jpg");
+        fs::write(&other, crate::testutil::tiny_jpeg(4, 4)).unwrap();
+        let mut incoming = held.clone();
+        incoming.filename = other;
+        cat.merge(vec![incoming], dir.path());
+        assert_eq!(cat.images[0].filename, held.filename);
+    }
+
+    #[test]
+    fn merge_adopts_the_fresh_download_when_the_old_file_lives_outside_the_images_dir() {
+        // The entry names its own image with a valid JPEG, but the file
+        // sits outside the download dir (a hand-edited catalogue, or a
+        // download dir that moved). `existing_file` refuses that claim
+        // (containment), so the refresh downloaded a fresh in-dir copy;
+        // the merge must agree and adopt it — otherwise the prune drops
+        // the foreign entry and the fresh download is orphaned.
+        let images = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let mut foreign = entry_with_file(elsewhere.path(), "20260807", "Foo_ROW1");
+        fs::write(&foreign.filename, crate::testutil::tiny_jpeg(4, 4)).unwrap();
+        foreign.fullstartdate = "202608070700".to_owned();
+        let mut cat = Catalogue {
+            images: vec![foreign.clone()],
+        };
+        assert_eq!(
+            cat.existing_file(&urlbase("Foo_ROW1"), images.path()),
+            None,
+            "the pipeline re-downloads past a foreign claim"
+        );
+
+        let fresh_path = images.path().join("20260807-Foo_ROW1_UHD.jpg");
+        fs::write(&fresh_path, crate::testutil::tiny_jpeg(4, 4)).unwrap();
+        let mut incoming = foreign.clone();
+        incoming.filename = fresh_path.clone();
+        cat.merge(vec![incoming], images.path());
+        assert_eq!(cat.images.len(), 1);
+        assert_eq!(cat.images[0].filename, fresh_path);
+
+        let now = Utc.with_ymd_and_hms(2026, 8, 7, 12, 0, 0).unwrap();
+        let removed = cat.prune(images.path(), 7, None, now);
+        assert!(removed.is_empty());
+        assert_eq!(cat.images.len(), 1);
+        assert_eq!(cat.images[0].filename, fresh_path);
+        assert!(
+            foreign.filename.is_file(),
+            "the foreign file is never unlinked"
+        );
     }
 
     #[test]
@@ -1075,7 +1228,7 @@ mod tests {
         incoming.startdate = "20260808".to_owned();
         incoming.fullstartdate = "202608080700".to_owned();
         incoming.filename = dir.path().join("20260808-Foo_ROW1_UHD.jpg");
-        cat.merge(vec![incoming]);
+        cat.merge(vec![incoming], dir.path());
 
         let repeated = cat
             .images
@@ -1103,7 +1256,7 @@ mod tests {
         let mut incoming = real.clone();
         incoming.startdate = "20240101".to_owned();
         incoming.fullstartdate = "202401010700".to_owned();
-        cat.merge(vec![incoming]);
+        cat.merge(vec![incoming], dir.path());
 
         assert_eq!(cat.images, vec![real]);
     }
@@ -1119,7 +1272,7 @@ mod tests {
         let mut imposter = real.clone();
         imposter.title = "Different title".to_owned();
         imposter.filename = dir.path().join("elsewhere.jpg");
-        cat.merge(vec![imposter]);
+        cat.merge(vec![imposter], dir.path());
 
         assert_eq!(cat.images, vec![real]);
     }
@@ -1350,7 +1503,7 @@ mod tests {
             urlbase("Restricted_ROW4"),
         ];
 
-        let removed = cat.remove_ineligible(&ineligible, &images, Some(&shown.filename));
+        let removed = cat.remove_ineligible(&ineligible, &images, &[shown.filename.as_path()]);
 
         assert!(victim.is_file(), "foreign file must never be deleted");
         assert!(shown.filename.is_file(), "the applied file is exempt");
@@ -1362,8 +1515,143 @@ mod tests {
             vec![victim, vanished.filename, restricted.filename]
         );
 
-        // An empty list is a no-op even against an unreadable folder.
-        assert!(cat.remove_ineligible(&[], &images, None).is_empty());
+        // An empty list is a no-op, against a readable folder or not.
+        assert!(cat.remove_ineligible(&[], &images, &[]).is_empty());
+        assert!(
+            cat.remove_ineligible(&[], &dir.path().join("absent"), &[])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn remove_ineligible_skips_the_pass_while_the_folder_is_unreadable() {
+        // Same guard as prune: an absent folder (unmounted, renamed) is
+        // not evidence that its files are gone. Dropping the entry over it
+        // would leave a rebuildable JPEG behind once the folder returns.
+        let dir = tempfile::tempdir().unwrap();
+        let images = dir.path().join("BingWallpaper");
+        fs::create_dir_all(&images).unwrap();
+        let restricted = entry_with_file(&images, "20200104", "Restricted_ROW4");
+        let mut cat = Catalogue {
+            images: vec![restricted.clone()],
+        };
+        let unmounted = dir.path().join("elsewhere");
+
+        let removed =
+            cat.remove_ineligible(std::slice::from_ref(&restricted.urlbase), &unmounted, &[]);
+
+        assert!(removed.is_empty());
+        assert_eq!(
+            cat.images,
+            vec![restricted.clone()],
+            "entry kept for the retry"
+        );
+        assert!(restricted.filename.is_file());
+
+        // Once readable again the retry removes entry and file.
+        let removed =
+            cat.remove_ineligible(std::slice::from_ref(&restricted.urlbase), &images, &[]);
+        assert_eq!(removed, vec![restricted.filename.clone()]);
+        assert!(cat.images.is_empty());
+        assert!(!restricted.filename.exists());
+    }
+
+    #[test]
+    fn remove_ineligible_unlinks_untracked_copies_so_no_rebuild_resurrects_them() {
+        // The guarantee is held at the file level: a copy at another
+        // resolution suffix the rebuild deduplicated away, or a download
+        // that landed before its merge, has no entry but would come back
+        // through `rebuild_from_folder`.
+        let dir = tempfile::tempdir().unwrap();
+        let images = dir.path().join("BingWallpaper");
+        fs::create_dir_all(&images).unwrap();
+        let tracked = entry_with_file(&images, "20200104", "Restricted_ROW4");
+        let loser = images.join("20200104-Restricted_ROW4_1920x1080.jpg");
+        fs::write(&loser, b"jpeg").unwrap();
+        let orphan = images.join("20200105-Orphan_ROW5_UHD.jpg");
+        fs::write(&orphan, b"jpeg").unwrap();
+        // Untracked files of *other* images, and non-wallpaper names, stay.
+        let innocent = images.join("20200106-Innocent_ROW6_UHD.jpg");
+        fs::write(&innocent, b"jpeg").unwrap();
+        let vacation = images.join("vacation.jpg");
+        fs::write(&vacation, b"mine").unwrap();
+        // An untracked copy that is the live wallpaper is exempt like an
+        // entry would be.
+        let shown = images.join("20200107-Shown_ROW7_UHD.jpg");
+        fs::write(&shown, b"jpeg").unwrap();
+        let mut cat = Catalogue {
+            images: vec![tracked.clone()],
+        };
+        let ineligible = [
+            tracked.urlbase.clone(),
+            urlbase("Orphan_ROW5"),
+            urlbase("Shown_ROW7"),
+        ];
+
+        let removed = cat.remove_ineligible(&ineligible, &images, &[shown.as_path()]);
+
+        assert!(cat.images.is_empty());
+        assert!(!tracked.filename.exists());
+        assert!(!loser.exists(), "the deduplicated copy is gone too");
+        assert!(!orphan.exists(), "the entry-less download is gone too");
+        assert!(innocent.is_file());
+        assert!(vacation.is_file());
+        assert!(
+            shown.is_file(),
+            "the live wallpaper is exempt untracked too"
+        );
+        assert_eq!(removed.len(), 3);
+        assert!(removed.contains(&tracked.filename));
+        assert!(removed.contains(&loser));
+        assert!(removed.contains(&orphan));
+        assert!(
+            Catalogue::rebuild_from_folder(&images)
+                .images
+                .iter()
+                .all(|e| !ineligible.contains(&e.urlbase) || e.filename == shown),
+            "nothing ineligible resurrects"
+        );
+    }
+
+    #[test]
+    fn a_foreign_entry_claiming_an_ineligible_file_does_not_shield_it() {
+        // Tampered catalogue: an entry of an *eligible* image points at the
+        // ineligible image's own file. Prune would later drop that entry as
+        // foreign without unlinking, so honouring its claim in the sweep
+        // would leave a rebuildable ineligible JPEG behind. Only an owning
+        // entry exempts a file; the foreign claim is left alone.
+        let dir = tempfile::tempdir().unwrap();
+        let images = dir.path().join("BingWallpaper");
+        fs::create_dir_all(&images).unwrap();
+        let restricted = images.join("20200104-Restricted_ROW4_UHD.jpg");
+        fs::write(&restricted, b"jpeg").unwrap();
+        let mut impostor = entry_with_file(&images, "20200105", "Innocent_ROW5");
+        impostor.filename = restricted.clone();
+        // A legitimate owner of another ineligible file still shields it
+        // from the *file* pass (the entry pass unlinks it in the same call
+        // only when it is named ineligible — here it is not).
+        let owner = entry_with_file(&images, "20200106", "Owner_ROW6");
+        let mut cat = Catalogue {
+            images: vec![impostor.clone(), owner.clone()],
+        };
+        let ineligible = [urlbase("Restricted_ROW4")];
+
+        let removed = cat.remove_ineligible(&ineligible, &images, &[]);
+
+        assert!(!restricted.exists(), "the foreign claim shields nothing");
+        assert!(owner.filename.is_file());
+        assert_eq!(cat.images, vec![impostor.clone(), owner]);
+        assert!(
+            removed.is_empty(),
+            "still referenced by the foreign entry, so withheld from the sweep list"
+        );
+        assert!(
+            Catalogue::rebuild_from_folder(&images)
+                .images
+                .iter()
+                .all(|e| e.urlbase != ineligible[0]),
+            "nothing ineligible resurrects"
+        );
     }
 
     #[test]

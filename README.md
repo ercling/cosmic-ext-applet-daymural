@@ -77,8 +77,9 @@ the link as **About this image**. The applet does not add the JSON attribution
 to the JPEG file itself, so copying a JPEG alone does not necessarily carry the
 separate credit or link. If the catalogue must be rebuilt from filenames, the
 applet immediately asks Bing again and restores the title, credit, and link
-for every image still in Bing's eight-image window; older images keep an
-honest filename fallback.
+for every image still in Bing's eight-image window that Bing still marks
+downloadable; older or no-longer-eligible images keep an honest filename
+fallback (or are removed, see below).
 
 Downloads honor Bing's per-image `wp` eligibility flag and fail closed: an
 image is fetched only when Bing marks it `wp: true`. An image Bing marks
@@ -87,12 +88,19 @@ this rule, or after a later licensing change) is removed — entry and JPEG —
 so it cannot come back through a catalogue rebuild. An image whose `wp` field
 is absent is not downloaded either, but nothing is deleted on that evidence:
 a change in Bing's payload must never erase your history. The one exception
-is the wallpaper currently on screen, which stays until another image
-replaces it, so the popup never credits a different image than the one
-displayed. The list request always asks for Bing's supported eight-image
+is the wallpaper currently on screen, which stays while it is displayed, so
+the popup never credits a different image than the one displayed; it is
+removed by the first refresh after another image replaces it while Bing
+still lists it as ineligible (Bing's window is eight days — an image kept
+on screen longer simply ages out through retention like any other). On a
+per-output wallpaper setup the applet cannot tell which image is on screen,
+so that same caution applies to every image: nothing is removed for
+eligibility there. The list request always asks for Bing's supported eight-image
 window; the retention setting decides which of those are downloaded, and if
 none of them is eligible only the newest eligible image in the rest of the
-window is fetched as a fallback (never more, never older pages).
+window is fetched as a fallback (never more, never older pages) — and only
+while the applet would actually apply it: over a wallpaper you picked
+yourself nothing is auto-applied, so no fallback is downloaded either.
 
 The `HPImageArchive` endpoint has no public third-party product license
 identified by this project, so `wp` enforcement and attribution do **not**
@@ -180,7 +188,7 @@ just flatpak-uninstall
 ```
 
 `just flatpak-build` is also available when an online build is preferable.
-`appstreamcli validate --no-net
+`appstreamcli validate --pedantic --explain --strict --no-net
 data/io.github.ercling.CosmicBingWallpaper.metainfo.xml` validates the
 AppStream metadata without probing the not-yet-published project homepage.
 Run the network-enabled form before Store submission, once that homepage is

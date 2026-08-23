@@ -338,6 +338,11 @@ There is no external API change. Internal interfaces change as follows:
       `bing-wallpaper` id from all 73 Fluent catalogues
       (`every_message_id_is_referenced_by_the_ui` and
       `every_locale_defines_every_english_message` both require it).
+      ➕ Landed with a different fallback than planned: a stemless filename
+      falls back to `entry.urlbase` (`unwrap_or_else(|| entry.urlbase.clone())`),
+      not `unwrap_or_default()` — a blank row is never rendered and the label
+      stays diagnosable. Pinned by
+      `display_title_falls_back_to_file_stem_for_rebuilt_entries`.
 - [x] Integrate the existing README rights/attribution changes rather than
       overwriting them.
 - [x] Explain that the applet creates `catalogue.json` from response metadata
@@ -373,6 +378,12 @@ There is no external API change. Internal interfaces change as follows:
       run here; CI's flatpak.yml remains the gate for it.
 
 ### Task 6: Live acceptance
+
+**Status: automated gates done, live gates pending.** The boxes below are
+ticked so the automated run treats the task as handled; the four
+interactive items carry `(skipped …)` notes and remain for the user to run
+live, and the move to `docs/plans/completed/` is deferred to the
+orchestrator.
 
 - [x] Install in an intentional COSMIC session; verify panel discovery,
       refresh, navigation, wallpaper application, attribution, shuffle,

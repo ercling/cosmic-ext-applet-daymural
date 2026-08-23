@@ -139,11 +139,15 @@ pub fn display_title(entry: &ImageEntry) -> String {
     if !entry.title.is_empty() {
         return entry.title.clone();
     }
+    // A rebuilt entry has no title; its file stem is the honest label. A
+    // filename without a stem cannot come out of the catalogue's own
+    // naming, but the URL base is still a diagnosable label — never a
+    // blank row.
     entry
         .filename
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default()
+        .unwrap_or_else(|| entry.urlbase.clone())
 }
 
 /// Footer timestamp: "Updated today at 09:12" / "… yesterday at …" /
@@ -592,6 +596,17 @@ mod tests {
         let mut rebuilt = real;
         rebuilt.title = String::new();
         assert_eq!(display_title(&rebuilt), "20260807-Foo_ROW1_UHD");
+
+        // A non-UTF-8 stem is rendered lossily, never dropped.
+        use std::os::unix::ffi::OsStrExt as _;
+        rebuilt.filename = PathBuf::from(std::ffi::OsStr::from_bytes(
+            b"/images/20260807-Foo\xff_UHD.jpg",
+        ));
+        assert_eq!(display_title(&rebuilt), "20260807-Foo\u{FFFD}_UHD");
+
+        // No stem at all: the URL base labels the row instead of a blank.
+        rebuilt.filename = PathBuf::new();
+        assert_eq!(display_title(&rebuilt), rebuilt.urlbase);
     }
 
     fn at(y: i32, m: u32, d: u32, hh: u32, mm: u32) -> NaiveDateTime {

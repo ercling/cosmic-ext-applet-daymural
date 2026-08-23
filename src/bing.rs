@@ -93,9 +93,26 @@ impl ImageArchive {
     /// Whether the response carried no structurally valid entry at all —
     /// [`fetch_image_list`]'s [`FetchError::EmptyList`] condition. A valid
     /// but all-ineligible response is *not* empty: it is a successful no-op.
+    ///
+    /// Equivalent to `self.anchor.is_none()`, which is what production
+    /// tests — every valid entry lands in a bucket *and* anchors; spelled
+    /// out over the buckets here so the parser tests can pin that
+    /// equivalence rather than assume it.
+    #[cfg(test)]
     pub fn has_no_valid_entries(&self) -> bool {
         self.eligible.is_empty() && self.ineligible.is_empty() && self.absent_wp == 0
     }
+}
+
+/// A fetched [`ImageArchive`] that is known to hold at least one valid
+/// entry, with its scheduling anchor resolved: [`fetch_image_list`] turns an
+/// absent anchor into [`FetchError::EmptyList`] exactly once, so no caller
+/// has to re-derive "no valid entry" from the buckets.
+#[derive(Debug, Clone)]
+pub struct FetchedArchive {
+    pub archive: ImageArchive,
+    /// [`ImageArchive::anchor`], present by construction.
+    pub anchor: String,
 }
 
 /// Parse an HPImageArchive JSON response, dropping the images whose three
@@ -262,10 +279,13 @@ pub fn http_client() -> Result<reqwest::Client, FetchError> {
 /// were all dropped by [`parse_image_list`]'s validation. A batch whose
 /// images are all *ineligible* is not: it parses into an [`ImageArchive`]
 /// with nothing to download, which the caller treats as a successful no-op.
+/// The scheduling anchor comes back resolved ([`FetchedArchive`]): the
+/// schedule must never see an absent one (it would reuse the 5 s cold-start
+/// delay and tight-loop against Bing).
 pub async fn fetch_image_list(
     client: &reqwest::Client,
     base_url: &str,
-) -> Result<ImageArchive, FetchError> {
+) -> Result<FetchedArchive, FetchError> {
     let resp = client
         .get(api_url(base_url))
         .send()
@@ -283,10 +303,12 @@ pub async fn fetch_image_list(
     let body = read_capped(resp, MAX_LIST_BYTES).await?;
     let body = String::from_utf8_lossy(&body);
     let archive = parse_image_list(&body).map_err(FetchError::Parse)?;
-    if archive.has_no_valid_entries() {
+    // Every structurally valid entry anchors, so an absent anchor is the
+    // "no valid entry" condition ([`ImageArchive::has_no_valid_entries`]).
+    let Some(anchor) = archive.anchor.clone() else {
         return Err(FetchError::EmptyList);
-    }
-    Ok(archive)
+    };
+    Ok(FetchedArchive { archive, anchor })
 }
 
 /// Where `image` lands on disk inside the download dir
@@ -835,7 +857,8 @@ mod tests {
         });
         let archive = fetch_image_list(&http_client().unwrap(), &base)
             .await
-            .unwrap();
+            .unwrap()
+            .archive;
         assert_eq!(archive.eligible.len(), 8);
         assert_eq!(
             archive.eligible[0].image.urlbase,
@@ -1218,7 +1241,8 @@ mod tests {
 
         let archive = fetch_image_list(&http_client().unwrap(), &base)
             .await
-            .expect("an unsized body under the budget must be read to EOF");
+            .expect("an unsized body under the budget must be read to EOF")
+            .archive;
         assert_eq!(archive.eligible.len(), 8);
     }
 
@@ -1382,13 +1406,16 @@ mod tests {
             image_json_wp("/th?id=OHR.B_ROW2", "20260806", "202608060700", ""),
         );
         let base = crate::testutil::spawn_mock(move |_| (200, json.clone().into_bytes()));
-        let archive = fetch_image_list(&http_client().unwrap(), &base)
+        let fetched = fetch_image_list(&http_client().unwrap(), &base)
             .await
             .expect("an all-ineligible batch is a success with nothing to download");
-        assert!(archive.eligible.is_empty());
-        assert_eq!(archive.ineligible, vec!["/th?id=OHR.A_ROW1".to_owned()]);
-        assert_eq!(archive.absent_wp, 1);
-        assert_eq!(archive.anchor.as_deref(), Some("202608070700"));
+        assert!(fetched.archive.eligible.is_empty());
+        assert_eq!(
+            fetched.archive.ineligible,
+            vec!["/th?id=OHR.A_ROW1".to_owned()]
+        );
+        assert_eq!(fetched.archive.absent_wp, 1);
+        assert_eq!(fetched.anchor, "202608070700");
     }
 
     #[tokio::test]
@@ -1416,7 +1443,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let client = http_client().unwrap();
-        let archive = fetch_image_list(&client, &base).await.unwrap();
+        let archive = fetch_image_list(&client, &base).await.unwrap().archive;
         for slot in &archive.eligible {
             download_image(&client, &base, &slot.image, dir.path())
                 .await
