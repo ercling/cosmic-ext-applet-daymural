@@ -5144,7 +5144,7 @@ mod tests {
         assert_eq!(env!("CARGO_PKG_HOMEPAGE"), PROJECT_URL);
         assert_eq!(
             env!("CARGO_PKG_DESCRIPTION"),
-            "Daymural: daily Bing wallpaper applet for the COSMIC desktop"
+            "Daymural: daily Microsoft Bing wallpaper applet for the COSMIC desktop"
         );
     }
 
@@ -6377,11 +6377,16 @@ mod tests {
         assert_eq!(web_url(""), None);
     }
 
-    const DESKTOP: &str = include_str!("../data/io.github.ercling.CosmicBingWallpaper.desktop");
+    const DESKTOP: &str = include_str!("../data/io.github.ercling.cosmic-applet-daymural.desktop");
     const METAINFO: &str =
-        include_str!("../data/io.github.ercling.CosmicBingWallpaper.metainfo.xml");
-    const FLATPAK_MANIFEST: &str = include_str!("../io.github.ercling.CosmicBingWallpaper.json");
+        include_str!("../data/io.github.ercling.cosmic-applet-daymural.metainfo.xml");
+    const FLATPAK_MANIFEST: &str = include_str!("../io.github.ercling.cosmic-applet-daymural.json");
     const JUSTFILE: &str = include_str!("../justfile");
+    const README: &str = include_str!("../README.md");
+    const AGENT_GUIDE: &str = include_str!("../AGENTS.md");
+    const LEGACY_GUIDE: &str = include_str!("../CLAUDE.md");
+    const ACTIVE_FLATPAK_PLAN: &str =
+        include_str!("../docs/plans/20260820-flatpak-distribution.md");
     const CARGO_SOURCES_SCRIPT: &str = include_str!("../flatpak/generate-cargo-sources.sh");
     const CARGO_GENERATOR: &str = include_str!("../flatpak/flatpak-cargo-generator.py");
     const GIT_MANIFEST_SCAN: &str = include_str!("../flatpak/git_manifest_scan.py");
@@ -6478,6 +6483,11 @@ mod tests {
         };
 
         require(
+            APP_ID.bytes().all(|byte| !byte.is_ascii_uppercase()),
+            "APP_ID must be lowercase",
+        )?;
+
+        require(
             desktop_value(desktop, "Exec") == Some(expected_binary),
             "desktop Exec must be the bare Cargo binary name",
         )?;
@@ -6562,10 +6572,11 @@ mod tests {
             "metainfo release must have a YYYY-MM-DD date",
         )?;
         require(
-            metainfo.contains(
-                "<url type=\"homepage\">https://github.com/ercling/cosmic-applet-daymural</url>",
-            ),
-            "metainfo homepage must name the project repository",
+            metainfo.contains(&format!(
+                "<url type=\"homepage\">{}</url>",
+                env!("CARGO_PKG_REPOSITORY")
+            )) && env!("CARGO_PKG_REPOSITORY") == env!("CARGO_PKG_HOMEPAGE"),
+            "metainfo homepage, Cargo repository, and Cargo homepage must agree",
         )?;
         require(
             metainfo.contains("<developer id=\"io.github.ercling\">")
@@ -6786,6 +6797,18 @@ mod tests {
     }
 
     #[test]
+    fn flatpak_manifest_rejects_an_uppercase_application_id() {
+        let uppercase = FLATPAK_MANIFEST.replace(
+            "io.github.ercling.cosmic-applet-daymural",
+            "io.github.ercling.CosmicAppletDaymural",
+        );
+        assert!(
+            validate_flatpak_manifest(&uppercase, DESKTOP).is_err(),
+            "an uppercase Flatpak application ID unexpectedly passed"
+        );
+    }
+
+    #[test]
     fn flatpak_manifest_rejects_missing_or_broadened_sandbox_permissions() {
         let valid: serde_json::Value =
             serde_json::from_str(FLATPAK_MANIFEST).expect("checked-in manifest is JSON");
@@ -6858,10 +6881,10 @@ mod tests {
             .expect("checked-in manifest has build commands");
         for command in commands {
             if let Some(text) = command.as_str()
-                && text.contains("/app/bin/cosmic-bing-wallpaper")
+                && text.contains("/app/bin/daymural")
             {
                 *command = serde_json::Value::String(
-                    text.replace("/app/bin/cosmic-bing-wallpaper", "/app/bin/wrong-binary"),
+                    text.replace("/app/bin/daymural", "/app/bin/wrong-binary"),
                 );
             }
         }
@@ -6870,7 +6893,7 @@ mod tests {
             "a command without a matching /app/bin install unexpectedly passed"
         );
 
-        let wrong_desktop = DESKTOP.replace("Exec=cosmic-bing-wallpaper", "Exec=another-binary");
+        let wrong_desktop = DESKTOP.replace("Exec=daymural", "Exec=another-binary");
         assert!(
             validate_flatpak_manifest(FLATPAK_MANIFEST, &wrong_desktop).is_err(),
             "an exported desktop command that differs from the manifest unexpectedly passed"
@@ -6886,8 +6909,8 @@ mod tests {
                 "echo cargo --offline fetch --locked --manifest-path Cargo.toml --verbose",
             ),
             (
-                "install -Dm644 data/io.github.ercling.CosmicBingWallpaper.metainfo.xml /app/share/metainfo/io.github.ercling.CosmicBingWallpaper.metainfo.xml",
-                "echo install -Dm644 data/io.github.ercling.CosmicBingWallpaper.metainfo.xml /app/share/metainfo/io.github.ercling.CosmicBingWallpaper.metainfo.xml",
+                "install -Dm644 data/io.github.ercling.cosmic-applet-daymural.metainfo.xml /app/share/metainfo/io.github.ercling.cosmic-applet-daymural.metainfo.xml",
+                "echo install -Dm644 data/io.github.ercling.cosmic-applet-daymural.metainfo.xml /app/share/metainfo/io.github.ercling.cosmic-applet-daymural.metainfo.xml",
             ),
             (
                 "cargo --offline build --release --locked --verbose",
@@ -7219,7 +7242,7 @@ mod tests {
             CARGO_SOURCES_FILENAME.to_owned(),
             "astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b".to_owned(),
             "version: \"0.12.1\"".to_owned(),
-            "appstreamcli validate --pedantic --explain --strict --no-net data/io.github.ercling.cosmic-applet-daymural.metainfo.xml".to_owned(),
+            "appstreamcli validate --pedantic --explain --strict --no-net --override cid-contains-uppercase-letter=error data/io.github.ercling.cosmic-applet-daymural.metainfo.xml".to_owned(),
             FLATPAK_BUILDER_ACTION.to_owned(),
             format!("bundle: {}.flatpak", env!("CARGO_PKG_NAME")),
         ] {
@@ -7271,6 +7294,7 @@ mod tests {
                 "permissions:\n  contents: write",
             ),
             FLATPAK_WORKFLOW.replace("persist-credentials: false", "persist-credentials: true"),
+            FLATPAK_WORKFLOW.replace(" --override cid-contains-uppercase-letter=error", ""),
         ] {
             assert!(
                 validate_ci_workflows(
@@ -7383,6 +7407,41 @@ mod tests {
     }
 
     #[test]
+    fn active_packaging_and_documentation_reject_legacy_identity_drift() {
+        for (name, text) in [
+            ("desktop entry", DESKTOP),
+            ("metainfo", METAINFO),
+            ("Flatpak manifest", FLATPAK_MANIFEST),
+            ("justfile", JUSTFILE),
+            ("Rust workflow", RUST_WORKFLOW),
+            ("Flatpak workflow", FLATPAK_WORKFLOW),
+            ("README", README),
+            ("AGENTS.md", AGENT_GUIDE),
+            ("active Flatpak plan", ACTIVE_FLATPAK_PLAN),
+        ] {
+            for legacy in [
+                "io.github.ercling.CosmicBingWallpaper",
+                "cosmic-bing-wallpaper",
+                "cosmic_bing_wallpaper",
+                "https://github.com/ercling/cosmic-wallpaper-applet",
+            ] {
+                assert!(
+                    !text.contains(legacy),
+                    "{name} still contains legacy identity `{legacy}`"
+                );
+            }
+        }
+        assert!(
+            LEGACY_GUIDE.contains("20260807-cosmic-bing-wallpaper-applet.md")
+                && LEGACY_GUIDE.matches("cosmic-bing-wallpaper").count() == 1
+                && !LEGACY_GUIDE.contains("io.github.ercling.CosmicBingWallpaper")
+                && !LEGACY_GUIDE.contains("cosmic_bing_wallpaper")
+                && !LEGACY_GUIDE.contains("https://github.com/ercling/cosmic-wallpaper-applet"),
+            "CLAUDE.md may retain the old name only in a completed historical plan filename"
+        );
+    }
+
+    #[test]
     fn flatpak_metadata_stays_in_sync_with_the_crate_and_desktop_entry() {
         assert!(
             !env!("CARGO_PKG_DESCRIPTION").contains(['&', '<', '>']),
@@ -7422,11 +7481,8 @@ mod tests {
 
     #[test]
     fn flatpak_identity_checks_reject_desktop_and_metainfo_drift() {
-        for invalid_exec in ["/usr/bin/cosmic-bing-wallpaper", "wrong-binary"] {
-            let desktop = DESKTOP.replace(
-                "Exec=cosmic-bing-wallpaper",
-                &format!("Exec={invalid_exec}"),
-            );
+        for invalid_exec in ["/usr/bin/daymural", "wrong-binary"] {
+            let desktop = DESKTOP.replace("Exec=daymural", &format!("Exec={invalid_exec}"));
             let error = flatpak_identity_is_consistent(
                 &desktop,
                 METAINFO,
@@ -7438,17 +7494,14 @@ mod tests {
 
         let mismatches = [
             (
-                "<id>io.github.ercling.CosmicBingWallpaper</id>",
+                "<id>io.github.ercling.cosmic-applet-daymural</id>",
                 "<id>wrong.id</id>",
             ),
             (
-                "io.github.ercling.CosmicBingWallpaper.desktop",
+                "io.github.ercling.cosmic-applet-daymural.desktop",
                 "wrong.id.desktop",
             ),
-            (
-                "<binary>cosmic-bing-wallpaper</binary>",
-                "<binary>wrong</binary>",
-            ),
+            ("<binary>daymural</binary>", "<binary>wrong</binary>"),
             (
                 "<id>com.system76.CosmicApplet</id>",
                 "<id>com.example.NotAnApplet</id>",
@@ -7458,7 +7511,7 @@ mod tests {
                 "<project_license>MIT</project_license>",
             ),
             (
-                "<summary>COSMIC panel applet that applies Bing's image of the day as wallpaper</summary>",
+                "<summary>Daymural: daily Microsoft Bing wallpaper applet for the COSMIC desktop</summary>",
                 "<summary>Wrong summary</summary>",
             ),
             ("<release version=\"0.1.0\"", "<release version=\"9.9.9\""),
@@ -7481,7 +7534,7 @@ mod tests {
             "a metainfo filename that does not match APP_ID must fail"
         );
         let desktop = DESKTOP.replace(
-            "Icon=io.github.ercling.CosmicBingWallpaper-symbolic",
+            "Icon=io.github.ercling.cosmic-applet-daymural-symbolic",
             "Icon=wrong-symbolic",
         );
         assert!(

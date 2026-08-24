@@ -97,28 +97,33 @@ and WIPO recommends also checking relevant national and regional registers.
 
 ### Task 3: Rename the packaging identity
 
-- [ ] Rename and update the desktop entry, AppStream metainfo, symbolic icon,
+- [x] Rename and update the desktop entry, AppStream metainfo, symbolic icon,
       root Flatpak manifest (module name **and** `CARGO_HOME`), install
       paths, and the embedded fixtures.
-- [ ] Update the justfile, both workflows, the Flatpak bundle artifact name,
+- [x] Update the justfile, both workflows, the Flatpak bundle artifact name,
       `flatpak/` wrapper references, README, `AGENTS.md`, `CLAUDE.md`, and
       the active Flatpak plan.
-- [ ] Use **Daymural** for visible names. Mention **Microsoft Bing** only in
+- [x] Use **Daymural** for visible names. Mention **Microsoft Bing** only in
       truthful descriptive text and add an unofficial/non-affiliation notice.
-- [ ] Set the homepage/repository URL to
+- [x] Set the homepage/repository URL to
       `https://github.com/ercling/cosmic-applet-daymural`. Note in the
       metainfo commit that this URL 404s until Task 5 renames the repository;
       CI's `--no-net` validation does not check it.
-- [ ] Extend identity tests to require a lowercase App ID and exact agreement
+- [x] Extend identity tests to require a lowercase App ID and exact agreement
       among Cargo, desktop, AppStream, icon, manifest module, `CARGO_HOME`,
       executable, workflow, repository URL, and install paths.
-- [ ] Add `--override cid-contains-uppercase-letter=error` to the CI
+- [x] Add `--override cid-contains-uppercase-letter=error` to the CI
       `appstreamcli validate --pedantic --explain --strict --no-net` step so
       the lowercase ID is a hard gate.
-- [ ] Permit the old identity only in completed historical plans and explicit
+- [x] Permit the old identity only in completed historical plans and explicit
       uninstall instructions; reject accidental active packaging drift.
-- [ ] Run `just check`, strict AppStream validation, Flatpak source
+- [x] Run `just check`, strict AppStream validation, Flatpak source
       generation/prefetch, and a force-clean offline Flatpak build.
+
+Task 3 validated the new metainfo URL while it is intentionally unpublished;
+`https://github.com/ercling/cosmic-applet-daymural` may return 404 until Task 5
+renames or publishes the repository. The CI validation remains `--no-net` and
+does not probe that URL.
 
 ### Task 4: Migration documentation
 

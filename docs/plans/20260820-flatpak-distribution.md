@@ -2,7 +2,7 @@
 
 ## Overview
 
-- Package `cosmic-bing-wallpaper` for distribution through `pop-os/cosmic-flatpak` while
+- Package `daymural` for distribution through `pop-os/cosmic-flatpak` while
   preserving the native `just install` route and full applet behavior.
 - Follow the established Awake/weather packaging pattern: AppStream metadata, a developer
   manifest, offline Rust dependency vendoring, local Flatpak recipes, CI, and a pinned COSMIC
@@ -26,7 +26,7 @@
 - **Existing patterns:** `APP_ID` is already shared by the desktop entry and applet config;
   the icon is already installed under the app-ID-prefixed name Flatpak can export. Tests embed
   declarative files and pin hand-written identity values. The source desktop entry currently
-  names `/usr/bin/cosmic-bing-wallpaper`; the manifest installs that file verbatim into
+  names `/usr/bin/daymural`; the manifest installs that file verbatim into
   `/app/share/applications`, where that path does not exist (the binary is `/app/bin/…`), so it
   must become the bare command. `flatpak build-export` preserves that bare command in its export
   tree; the manifest command and `/app/bin` destination provide the matching launch target.
@@ -114,19 +114,19 @@ live Flatpak verification.
 
 ## Technical Details
 
-The root manifest `io.github.ercling.CosmicBingWallpaper.json` will use:
+The root manifest `io.github.ercling.cosmic-applet-daymural.json` will use:
 
 - `runtime: org.freedesktop.Platform`, `runtime-version: 25.08`,
   `sdk: org.freedesktop.Sdk`, and `org.freedesktop.Sdk.Extension.rust-stable`;
-- `command` and module name `cosmic-bing-wallpaper`;
-- `CARGO_HOME=/run/build/cosmic-bing-wallpaper/cargo`;
+- `command` and module name `daymural`;
+- `CARGO_HOME=/run/build/daymural/cargo`;
 - offline, lockfile-enforced Cargo fetch/build commands and explicit `/app` install destinations;
 - a local directory source excluding `.git`, `target`, `examples`, `.flatpak-builder`, and
   `build-dir`, plus generated `cargo-sources.json`.
 
-The source desktop entry will use `Exec=cosmic-bing-wallpaper` (see Context for why). The
+The source desktop entry will use `Exec=daymural` (see Context for why). The
 Flatpak build export preserves that bare command; it matches the manifest command and resolves
-to `/app/bin/cosmic-bing-wallpaper` in the sandbox. Native `just install` retains its existing
+to `/app/bin/daymural` in the sandbox. Native `just install` retains its existing
 `sed` rewrite to the selected native installation path. Tests pin all four names together.
 
 The exact sandbox contract is:
@@ -154,7 +154,7 @@ Sandbox facts measured live against a flatpak 1.18 sandbox, to be recorded in RE
   `NoSessionForPID`. The watch survives only through the `$XDG_SESSION_ID` →
   `Manager.GetSession` fallback (flatpak forwards `XDG_SESSION_ID`). If that variable is ever
   absent, `is_session_absence` parks the watch permanently. Task 7 must assert *which* path
-  resolved (`RUST_LOG=cosmic_bing_wallpaper=debug` prints `resolved_via`).
+  resolved (`RUST_LOG=daymural=debug` prints `resolved_via`).
 - **Icons:** the 25.08 runtime ships **no** icon SVGs; the six themed names
   (`preferences-desktop-wallpaper-symbolic` in `app.rs`, five in `view.rs`) resolve only via
   flatpak's host passthrough `/run/host/share/icons` on `XDG_DATA_DIRS`. Contingency if it
@@ -174,10 +174,10 @@ Portal APIs are available under Flatpak's default policy, so `xdg-open` does not
 redundant explicit portal talk-name. The permission tests must reject `home`, `host`, session or
 system bus sockets, X11, and every `--persist` entry.
 
-AppStream metadata will identify `io.github.ercling.CosmicBingWallpaper`, launch the matching
-desktop entry, provide `com.system76.CosmicApplet` and binary `cosmic-bing-wallpaper`, use
+AppStream metadata will identify `io.github.ercling.cosmic-applet-daymural`, launch the matching
+desktop entry, provide `com.system76.CosmicApplet` and binary `daymural`, use
 GPL-3.0-only/CC0-1.0 licensing, name the COSMIC project group, carry an OARS rating and release
-entry, and use `https://github.com/ercling/cosmic-wallpaper-applet` as its homepage. Its
+entry, and use `https://github.com/ercling/cosmic-applet-daymural` as its homepage. Its
 `<summary>` is pinned to `Cargo.toml`'s `description` (which must stay free of XML-special
 characters). `appstreamcli validate` will warn about the missing `<screenshots>` until
 Post-Completion; that warning is accepted.
@@ -215,11 +215,11 @@ Post-Completion; that warning is accepted.
 
 **Files:**
 
-- Create: `data/io.github.ercling.CosmicBingWallpaper.metainfo.xml`
-- Modify: `data/io.github.ercling.CosmicBingWallpaper.desktop`
+- Create: `data/io.github.ercling.cosmic-applet-daymural.metainfo.xml`
+- Modify: `data/io.github.ercling.cosmic-applet-daymural.desktop`
 - Modify: `src/app.rs`
 
-- [x] change the source desktop entry to `Exec=cosmic-bing-wallpaper`; preserve the native
+- [x] change the source desktop entry to `Exec=daymural`; preserve the native
       justfile rewrite to an absolute installed binary path
 - [x] add desktop-application metadata with the exact app ID, desktop launchable, applet
       category provide, binary, licenses, developer, project group, homepage, OARS rating,
@@ -230,14 +230,15 @@ Post-Completion; that warning is accepted.
 - [x] add failure assertions for an absolute or mismatched desktop `Exec` and mismatched
       identity/category fields (no generic well-formedness checks — `appstreamcli` owns those)
 - [x] run focused identity tests and `appstreamcli validate
-      data/io.github.ercling.CosmicBingWallpaper.metainfo.xml` (screenshot warning accepted);
+      --override cid-contains-uppercase-letter=error
+      data/io.github.ercling.cosmic-applet-daymural.metainfo.xml` (screenshot warning accepted);
       both must pass before Task 2
 
 ### Task 2: Add the developer manifest and sandbox contract
 
 **Files:**
 
-- Create: `io.github.ercling.CosmicBingWallpaper.json`
+- Create: `io.github.ercling.cosmic-applet-daymural.json`
 - Modify: `src/app.rs`
 
 - [x] add the Freedesktop 25.08/Rust SDK manifest, offline build, explicit install commands,
@@ -298,7 +299,7 @@ Post-Completion; that warning is accepted.
       not need them)
 - [x] add a Freedesktop 25.08 Flatpak job that installs `uv`, generates Cargo sources, runs the
       `Cargo.lock` coverage check, builds the manifest, and emits a
-      `cosmic-bing-wallpaper.flatpak` artifact
+      `daymural.flatpak` artifact
 - [x] add success tests (comment-stripped text scan) pinning workflow manifest, generator,
       runtime image, bundle name, and equivalent Rust check commands
 - [x] add negative assertions against runtime-version drift and omitted source generation
@@ -339,7 +340,7 @@ Post-Completion; that warning is accepted.
 - [ ] precondition: native copy uninstalled (`just uninstall`); Flatpak is the only install
       (not yet run; requires an intentional live COSMIC acceptance session)
 - [ ] install the built Flatpak intentionally in a live COSMIC session; confirm Panel discovers
-      it and the exported desktop command starts `/app/bin/cosmic-bing-wallpaper`
+      it and the exported desktop command starts `/app/bin/daymural`
       (not yet run)
 - [ ] confirm the panel button, prev/next/newest/refresh, and empty-catalogue placeholder icons
       all render (host passthrough); if not, apply the bundling contingency
@@ -351,7 +352,7 @@ Post-Completion; that warning is accepted.
 - [ ] enable accent matching and verify both theme modes update; verify disable restores the
       snapshot and an external accent change disarms without being overwritten
       (not yet run)
-- [ ] with `RUST_LOG=cosmic_bing_wallpaper=debug`: confirm `resolved_via` is the
+- [ ] with `RUST_LOG=daymural=debug`: confirm `resolved_via` is the
       `XDG_SESSION_ID` path, login1 lock and resume signals cross `xdg-dbus-proxy`, and the
       cosmic-bg state poke lands as a **changed value**; greeter healing is best-effort here
       (GDM is this machine's DM); treat a missing poke as release-blocking
@@ -388,7 +389,7 @@ validation passed with `--no-net` (the network-enabled homepage probe returns
 all 713 sourced lockfile packages; source prefetch and a force-clean `--disable-download` build
 passed. The built `/app` tree and export contain the executable, desktop entry, AppStream metadata,
 symbolic icon, and exact scoped permissions. Contrary to the earlier design note, measured
-`flatpak build-export` output preserves `Exec=cosmic-bing-wallpaper` instead of rewriting it; the
+`flatpak build-export` output preserves `Exec=daymural` instead of rewriting it; the
 name is nevertheless identical to the manifest command and `/app/bin` executable. A staged native
 install under `/tmp` confirmed the documented binary, desktop, icon, and absolute installed `Exec`
 rewrite. Native and Flatpak state-layout differences remain intentional and documented. This is
@@ -405,10 +406,10 @@ plan stays active until they pass.
 
 ### External updates
 
-- Publish/tag the exact tested commit at `https://github.com/ercling/cosmic-wallpaper-applet`.
+- Publish/tag the exact tested commit at `https://github.com/ercling/cosmic-applet-daymural`.
 - Capture and host a COSMIC screenshot, add it to AppStream, and re-run validation (clears the
   accepted screenshot warning).
 - Replace the developer directory source with the pinned release commit and submit the manifest
   plus generated `cargo-sources.json` under
-  `app/io.github.ercling.CosmicBingWallpaper/` in `pop-os/cosmic-flatpak`.
+  `app/io.github.ercling.cosmic-applet-daymural/` in `pop-os/cosmic-flatpak`.
 - Repeat the clean build and live sandbox audit against the exact submission commit.

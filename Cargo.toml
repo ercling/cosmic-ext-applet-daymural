@@ -3,7 +3,7 @@ name = "daymural"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-only"
-description = "Daymural: daily Bing wallpaper applet for the COSMIC desktop"
+description = "Daymural: daily Microsoft Bing wallpaper applet for the COSMIC desktop"
 repository = "https://github.com/ercling/cosmic-applet-daymural"
 homepage = "https://github.com/ercling/cosmic-applet-daymural"
 

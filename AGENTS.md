@@ -2,7 +2,7 @@
 
 ## Project
 
-`cosmic-bing-wallpaper` is a Rust 2024/libcosmic panel applet for the COSMIC
+`daymural` is a Rust 2024/libcosmic panel applet for the COSMIC
 desktop. It fetches Bing's daily UHD image, maintains a local catalogue and
 thumbnail cache, applies wallpapers through `cosmic-bg`, optionally shuffles
 them, and can derive the COSMIC accent colour from the current wallpaper.
@@ -47,7 +47,7 @@ wallpapers, or Bing.
 Do not casually run the applet binary. A cold standalone start with an empty
 `~/Pictures/BingWallpaper` performs a real Bing fetch and applies a wallpaper
 after a short delay. Production logging is silent by default; use
-`RUST_LOG=cosmic_bing_wallpaper=debug` when intentional runtime diagnosis is
+`RUST_LOG=daymural=debug` when intentional runtime diagnosis is
 needed.
 
 ## Repository Map
@@ -79,7 +79,7 @@ needed.
 - `src/testutil.rs`: test-only HTTP/JPEG and popup-surface helpers.
 - `data/`: desktop entry and app-ID icon installed by both packaging routes,
   plus AppStream metainfo installed by Flatpak packaging.
-- `io.github.ercling.CosmicBingWallpaper.json`: developer Flatpak manifest and
+- `io.github.ercling.cosmic-applet-daymural.json`: developer Flatpak manifest and
   the authoritative scoped sandbox contract.
 - `flatpak/`: pinned Cargo source generator and its `uv` wrapper; generated
   `cargo-sources.json` is deliberately ignored.
@@ -218,7 +218,7 @@ upstream issue and deployed COSMIC behavior.
 All user-visible strings use this crate's compile-time `fl!` macro. Do not add
 inline UI strings.
 
-- `i18n/en/cosmic_bing_wallpaper.ftl` is the human-authored source catalogue.
+- `i18n/en/daymural.ftl` is the human-authored source catalogue.
 - Adding or renaming an id requires updating all 73 locale catalogues. Each
   locale must preserve the English placeables; guard tests enforce both rules.
 - Localized label collections are functions returning `Vec<String>`, not

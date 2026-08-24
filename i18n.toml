@@ -1,7 +1,7 @@
 # Fluent i18n configuration (read at compile time by `i18n-embed-fl`'s `fl!`
 # macro and at runtime by `fluent_language_loader!`). The fluent domain is
 # derived from the crate name, so the catalogues live at
-# `i18n/<locale>/cosmic_bing_wallpaper.ftl`.
+# `i18n/<locale>/daymural.ftl`.
 fallback_language = "en"
 
 [fluent]

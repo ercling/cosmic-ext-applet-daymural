@@ -29,13 +29,13 @@ cargo fmt
 ```
 
 Logging goes through `tracing` with an env-filter and is silent by default;
-set `RUST_LOG` to see it, e.g. `RUST_LOG=cosmic_bing_wallpaper=debug` (or
+set `RUST_LOG` to see it, e.g. `RUST_LOG=daymural=debug` (or
 `RUST_LOG=info` for everything) when running the binary or a test.
 
 `rustfmt`/`clippy` binaries live in `~/.local/bin` (extracted from Fedora RPMs to
 match system rustc 1.97.1 — the distro rustc package ships without them).
 
-Running the binary standalone (`cargo run` / `target/release/cosmic-bing-wallpaper`)
+Running the binary standalone (`cargo run` / `target/release/daymural`)
 opens a floating applet window; **beware**: a cold start (empty
 `~/Pictures/BingWallpaper`) triggers a real Bing fetch and a wallpaper apply ~5 s
 in. The normal home is the COSMIC panel (add via Settings → Desktop → Panel after
@@ -55,9 +55,9 @@ vendoring. libcosmic APIs move fast, so verify against the locked revision befor
 coding against remembered names.
 
 Packaging is part of the checked-in architecture. The root
-`io.github.ercling.CosmicBingWallpaper.json` developer manifest installs the
+`io.github.ercling.cosmic-applet-daymural.json` developer manifest installs the
 binary, desktop entry, app-ID icon, and
-`data/io.github.ercling.CosmicBingWallpaper.metainfo.xml` into `/app`. Its
+`data/io.github.ercling.cosmic-applet-daymural.metainfo.xml` into `/app`. Its
 Freedesktop 25.08 sandbox contract grants only the wallpaper directory, COSMIC
 config/state, Settings Daemon notifications, logind, Wayland/DRI, and network.
 `flatpak/` holds the pinned upstream Cargo source generator and `uv` wrapper;
@@ -73,7 +73,7 @@ drift/failure cases. Do not make them read generated `cargo-sources.json`, and
 do not duplicate `appstreamcli` or desktop-file syntax validation in Rust.
 
 - `src/main.rs` — entry point: `localize()` then `cosmic::applet::run::<Window>(())`.
-- `src/localize.rs` — Fluent i18n: `rust-embed`ded `i18n/<locale>/cosmic_bing_wallpaper.ftl`,
+- `src/localize.rs` — Fluent i18n: `rust-embed`ded `i18n/<locale>/daymural.ftl`,
   the `LANGUAGE_LOADER` `LazyLock`, the crate's own `fl!` macro, `localize()`,
   and the locale guard tests. See "i18n" below.
 - `src/leader.rs` — cross-process single-owner election for COSMIC's one-applet-
@@ -358,7 +358,7 @@ do not duplicate `appstreamcli` or desktop-file syntax validation in Rust.
 - `src/config.rs` — `AppletConfig` (shuffle on/off, interval, retention, and
   the accent feature's `accent_enabled` / `accent_snapshot` /
   `accent_last_written` — colour types imported from `accent.rs`) via
-  cosmic-config under app ID `io.github.ercling.CosmicBingWallpaper`, version 1,
+  cosmic-config under app ID `io.github.ercling.cosmic-applet-daymural`, version 1,
   write-on-change setters, watch subscription for external edits. The separate
   `CoordinationConfig` entry uses the same app ID/version but disjoint raw keys:
   monotonically increasing `refresh_request`, covering `refresh_completion`
@@ -898,7 +898,7 @@ exposes no path to the inner `Icon`). Don't "fix" this with
 ## i18n
 
 Every user-visible string goes through the crate's `fl!` macro; none are
-written inline. Ids live in `i18n/en/cosmic_bing_wallpaper.ftl` (the fluent
+written inline. Ids live in `i18n/en/daymural.ftl` (the fluent
 domain is the crate name) and `i18n-embed-fl` resolves them **at compile time**,
 so a typo or a missing id is a build error. `i18n/` holds all 73 locales COSMIC
 ships; the 72 non-English ones are machine-generated. Notes:

@@ -1,12 +1,12 @@
 {
-    "id": "io.github.ercling.CosmicBingWallpaper",
+    "id": "io.github.ercling.cosmic-applet-daymural",
     "runtime": "org.freedesktop.Platform",
     "runtime-version": "25.08",
     "sdk": "org.freedesktop.Sdk",
     "sdk-extensions": [
         "org.freedesktop.Sdk.Extension.rust-stable"
     ],
-    "command": "cosmic-bing-wallpaper",
+    "command": "daymural",
     "finish-args": [
         "--socket=wayland",
         "--device=dri",
@@ -21,20 +21,20 @@
     "build-options": {
         "append-path": "/usr/lib/sdk/rust-stable/bin",
         "env": {
-            "CARGO_HOME": "/run/build/cosmic-bing-wallpaper/cargo"
+            "CARGO_HOME": "/run/build/daymural/cargo"
         }
     },
     "modules": [
         {
-            "name": "cosmic-bing-wallpaper",
+            "name": "daymural",
             "buildsystem": "simple",
             "build-commands": [
                 "cargo --offline fetch --locked --manifest-path Cargo.toml --verbose",
                 "cargo --offline build --release --locked --verbose",
-                "install -Dm755 target/release/cosmic-bing-wallpaper /app/bin/cosmic-bing-wallpaper",
-                "install -Dm644 data/io.github.ercling.CosmicBingWallpaper.desktop /app/share/applications/io.github.ercling.CosmicBingWallpaper.desktop",
-                "install -Dm644 data/io.github.ercling.CosmicBingWallpaper.metainfo.xml /app/share/metainfo/io.github.ercling.CosmicBingWallpaper.metainfo.xml",
-                "install -Dm644 data/icons/io.github.ercling.CosmicBingWallpaper-symbolic.svg /app/share/icons/hicolor/scalable/apps/io.github.ercling.CosmicBingWallpaper-symbolic.svg"
+                "install -Dm755 target/release/daymural /app/bin/daymural",
+                "install -Dm644 data/io.github.ercling.cosmic-applet-daymural.desktop /app/share/applications/io.github.ercling.cosmic-applet-daymural.desktop",
+                "install -Dm644 data/io.github.ercling.cosmic-applet-daymural.metainfo.xml /app/share/metainfo/io.github.ercling.cosmic-applet-daymural.metainfo.xml",
+                "install -Dm644 data/icons/io.github.ercling.cosmic-applet-daymural-symbolic.svg /app/share/icons/hicolor/scalable/apps/io.github.ercling.cosmic-applet-daymural-symbolic.svg"
             ],
             "sources": [
                 {

@@ -1,7 +1,7 @@
-# COSMIC Bing Wallpaper Applet
+# Daymural
 
-A COSMIC panel applet that brings Bing's image of the day to the COSMIC desktop.
-It fetches Bing's daily wallpaper (UHD, 3840×2160), applies it via `cosmic-bg`,
+A COSMIC panel applet that brings Microsoft Bing's image of the day to the COSMIC desktop.
+It fetches Microsoft Bing's daily wallpaper (UHD, 3840×2160), applies it via `cosmic-bg`,
 lets you browse previously downloaded images from the panel popup, optionally
 shuffles among them on a timer, and prunes old images per a retention setting.
 
@@ -110,7 +110,7 @@ and any written authorization from Microsoft or the rightsholder.
 
 Troubleshooting: an applet that stays empty with no error shown is usually an
 all-restricted day or a payload without `wp`; run it with
-`RUST_LOG=cosmic_bing_wallpaper=warn` to see the per-refresh eligibility
+`RUST_LOG=daymural=warn` to see the per-refresh eligibility
 counts (explicit-`false` and absent-`wp` are reported separately).
 
 Downloaded photographs remain the property of their respective
@@ -140,8 +140,8 @@ just uninstall
 
 `just uninstall` removes only what `just install` put in place (binary,
 desktop entry, icon). Downloaded images (`~/Pictures/BingWallpaper`), the
-catalogue/thumbnails (`~/.local/state/io.github.ercling.CosmicBingWallpaper/`),
-and settings (`~/.config/cosmic/io.github.ercling.CosmicBingWallpaper/`) are
+catalogue/thumbnails (`~/.local/state/io.github.ercling.cosmic-applet-daymural/`),
+and settings (`~/.config/cosmic/io.github.ercling.cosmic-applet-daymural/`) are
 left behind — delete them by hand if you want a clean sweep.
 
 With either installation method, if **Match accent to wallpaper** is on, switch
@@ -176,7 +176,7 @@ flatpak remote-add --user --if-not-exists flathub \
 ```
 
 Generate the offline Cargo sources before building. The recipes use the root
-manifest `io.github.ercling.CosmicBingWallpaper.json` and a retained
+manifest `io.github.ercling.cosmic-applet-daymural.json` and a retained
 `build-dir` cache:
 
 ```bash
@@ -188,8 +188,8 @@ just flatpak-uninstall
 ```
 
 `just flatpak-build` is also available when an online build is preferable.
-`appstreamcli validate --pedantic --explain --strict --no-net
-data/io.github.ercling.CosmicBingWallpaper.metainfo.xml` validates the
+`appstreamcli validate --pedantic --explain --strict --no-net --override cid-contains-uppercase-letter=error
+data/io.github.ercling.cosmic-applet-daymural.metainfo.xml` validates the
 AppStream metadata without probing the not-yet-published project homepage.
 Run the network-enabled form before Store submission, once that homepage is
 public. The developer metadata currently has no screenshot; adding and hosting
@@ -199,9 +199,9 @@ Repository acceptance on 2026-08-21 passed all 374 native checks, regenerated
 Cargo sources covering all 713 sourced `Cargo.lock` packages, prefetched every
 manifest input, and completed a force-clean Flatpak build with downloads
 disabled. The resulting build contains the desktop entry, AppStream metadata,
-symbolic icon, executable `/app/bin/cosmic-bing-wallpaper`, and the documented
+symbolic icon, executable `/app/bin/daymural`, and the documented
 scoped permissions. `flatpak build-export` preserves the desktop entry's bare
-`Exec=cosmic-bing-wallpaper`; that name matches both the manifest command and
+`Exec=daymural`; that name matches both the manifest command and
 the `/app/bin` executable. Interactive COSMIC-session checks were not performed
 by this automated acceptance pass and remain release checks before external
 Store publication.
@@ -224,7 +224,7 @@ than manifest permissions.
 Wallpaper files and COSMIC configuration are intentionally shared with a
 native installation. The catalogue, thumbnail cache, leadership lock, and
 other applet state stay private under
-`~/.var/app/io.github.ercling.CosmicBingWallpaper/.local/state/`. On the first
+`~/.var/app/io.github.ercling.cosmic-applet-daymural/.local/state/`. On the first
 Flatpak start, the applet rescans the shared `~/Pictures/BingWallpaper` folder,
 so existing images reappear without being downloaded again even though the
 native catalogue is not copied.
@@ -255,12 +255,12 @@ Everything lives in the panel popup; there is no separate settings window.
 | Keep images | 3 / 8 / 30 days / forever | 8 days | Older images are deleted after each fetch and immediately when you reduce the setting. The currently applied image is never deleted. |
 
 Settings persist via `cosmic-config` under the app ID
-`io.github.ercling.CosmicBingWallpaper`. Images live in
+`io.github.ercling.cosmic-applet-daymural`. Images live in
 `~/Pictures/BingWallpaper`. With a native install, the catalogue and cached
-thumbnails live in `~/.local/state/io.github.ercling.CosmicBingWallpaper/`;
+thumbnails live in `~/.local/state/io.github.ercling.cosmic-applet-daymural/`;
 with Flatpak they live under
-`$XDG_STATE_HOME/io.github.ercling.CosmicBingWallpaper/` (normally
-`~/.var/app/io.github.ercling.CosmicBingWallpaper/.local/state/io.github.ercling.CosmicBingWallpaper/`).
+`$XDG_STATE_HOME/io.github.ercling.cosmic-applet-daymural/` (normally
+`~/.var/app/io.github.ercling.cosmic-applet-daymural/.local/state/io.github.ercling.cosmic-applet-daymural/`).
 
 ## Disk usage
 
@@ -359,7 +359,7 @@ Bing's UHD images are roughly **5 MB each**. Expect about:
 
 ## Translations
 
-Strings live in Fluent catalogues under `i18n/<locale>/cosmic_bing_wallpaper.ftl`,
+Strings live in Fluent catalogues under `i18n/<locale>/daymural.ftl`,
 embedded into the binary at build time — there are no runtime data files to
 install. All 73 locales COSMIC ships are present, plus `Comment[…]` lines in the
 desktop entry for the dozen largest.
@@ -378,7 +378,7 @@ there is no in-app language setting. **To get the English UI back** — because
 your locale's machine translation reads poorly, or to report what it says —
 launch the applet with `LC_MESSAGES=C`, e.g. by adding `Env=LC_MESSAGES=C` to
 the panel's launcher or running
-`LC_MESSAGES=C cosmic-bing-wallpaper` from a terminal. Corrections are welcome
+`LC_MESSAGES=C daymural` from a terminal. Corrections are welcome
 either way.
 
 ## Development

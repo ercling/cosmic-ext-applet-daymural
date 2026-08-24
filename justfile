@@ -1,5 +1,5 @@
-name := 'cosmic-bing-wallpaper'
-appid := 'io.github.ercling.CosmicBingWallpaper'
+name := 'daymural'
+appid := 'io.github.ercling.cosmic-applet-daymural'
 
 # Default to a per-user install (no sudo needed); override with e.g.
 # `just prefix=/usr/local install` or `just rootdir=$PKGDIR prefix=/usr install`.
@@ -34,7 +34,7 @@ install: build
     @echo
     @echo 'Installed. Run `pkill -x cosmic-panel` to load the new binary (cosmic-session'
     @echo 'restarts the panel and its applets right away), or log out and back in;'
-    @echo 'then add "Bing Wallpaper" in Settings → Desktop → Panel → Configure applets.'
+    @echo 'then add "Daymural" in Settings → Desktop → Panel → Configure applets.'
 
 uninstall:
     rm -f {{bin-dst}} {{desktop-dst}} {{icon-dst}}

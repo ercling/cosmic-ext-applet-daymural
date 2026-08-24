@@ -85,10 +85,10 @@ jobs:
           PY
 
       - name: Validate AppStream metadata
-        run: appstreamcli validate --pedantic --explain --strict --no-net data/io.github.ercling.CosmicBingWallpaper.metainfo.xml
+        run: appstreamcli validate --pedantic --explain --strict --no-net --override cid-contains-uppercase-letter=error data/io.github.ercling.cosmic-applet-daymural.metainfo.xml
 
       - name: Build and bundle the Flatpak
         uses: flatpak/flatpak-github-actions/flatpak-builder@401fe28a8384095fc1531b9d320b292f0ee45adb # v6
         with:
-          manifest-path: io.github.ercling.CosmicBingWallpaper.json
-          bundle: cosmic-bing-wallpaper.flatpak
+          manifest-path: io.github.ercling.cosmic-applet-daymural.json
+          bundle: daymural.flatpak
