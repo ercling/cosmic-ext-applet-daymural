@@ -960,30 +960,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cosmic-bing-wallpaper"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "cosmic-bg-config",
- "dirs",
- "i18n-embed",
- "i18n-embed-fl",
- "image",
- "libcosmic",
- "reqwest",
- "ron 0.12.2",
- "rust-embed",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "zbus",
- "zune-jpeg 0.5.15",
-]
-
-[[package]]
 name = "cosmic-client-toolkit"
 version = "0.2.0"
 source = "git+https://github.com/pop-os/cosmic-protocols?rev=32283d7#32283d76a8d0342da74c4cc022a533c52dcf378f"
@@ -1289,6 +1265,30 @@ name = "data-url"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
+
+[[package]]
+name = "daymural"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "cosmic-bg-config",
+ "dirs",
+ "i18n-embed",
+ "i18n-embed-fl",
+ "image",
+ "libcosmic",
+ "reqwest",
+ "ron 0.12.2",
+ "rust-embed",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "zbus",
+ "zune-jpeg 0.5.15",
+]
 
 [[package]]
 name = "defmt"

@@ -83,17 +83,17 @@ and WIPO recommends also checking relevant national and regional registers.
 
 ### Task 2: Rename the code identity
 
-- [ ] Rename the Cargo package and executable to `daymural`; update only the
+- [x] Rename the Cargo package and executable to `daymural`; update only the
       root package identity in `Cargo.lock`.
-- [ ] Change `APP_ID` to `io.github.ercling.cosmic-applet-daymural`.
-- [ ] Update the user agent (`src/bing.rs:22`) and Cargo metadata
+- [x] Change `APP_ID` to `io.github.ercling.cosmic-applet-daymural`.
+- [x] Update the user agent (`src/bing.rs:22`) and Cargo metadata
       (description, repository, homepage).
-- [ ] Rename all 73 Fluent resource files to `daymural.ftl`; confirm
+- [x] Rename all 73 Fluent resource files to `daymural.ftl`; confirm
       `every_locale_defines_every_english_message` and
       `loader_is_pinned_to_english` still pass.
-- [ ] Update the homepage literal at `src/app.rs:5791` and the workflow
+- [x] Update the homepage literal at `src/app.rs:5791` and the workflow
       string expectations listed in Context.
-- [ ] Run focused identity and localization tests before Task 3.
+- [x] Run focused identity and localization tests before Task 3.
 
 ### Task 3: Rename the packaging identity
 

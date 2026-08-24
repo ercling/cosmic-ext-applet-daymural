@@ -1,6 +1,6 @@
 // Fluent i18n plumbing (cosmic-greeter's / libcosmic's pattern).
 //
-// The catalogues under `i18n/<locale>/cosmic_bing_wallpaper.ftl` are embedded
+// The catalogues under `i18n/<locale>/daymural.ftl` are embedded
 // into the binary by `rust-embed` (`debug-embed` is on, so debug builds embed
 // them too instead of reading the source tree at runtime), so the applet needs
 // no data files at runtime. Every user-visible string goes through the [`fl!`]
@@ -28,7 +28,7 @@ pub static LANGUAGE_LOADER: LazyLock<FluentLanguageLoader> = LazyLock::new(|| {
     let loader: FluentLanguageLoader = fluent_language_loader!();
     loader
         .load_fallback_language(&Localizations)
-        .expect("i18n/en/cosmic_bing_wallpaper.ftl must be embedded and parse");
+        .expect("i18n/en/daymural.ftl must be embedded and parse");
     disable_bidi_isolation(&loader);
     loader
 });
@@ -215,7 +215,7 @@ mod tests {
     #[test]
     fn english_catalogue_is_embedded_and_resolves() {
         assert!(
-            Localizations::get("en/cosmic_bing_wallpaper.ftl").is_some(),
+            Localizations::get("en/daymural.ftl").is_some(),
             "the fluent domain must match the crate name"
         );
         assert_eq!(fl!("status-up-to-date"), "Up to date");

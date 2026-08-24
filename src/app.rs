@@ -34,7 +34,7 @@ use crate::leader::Leadership;
 use crate::{accent, bing, lockwatch, schedule, thumbs, tooltip, view, wallpaper};
 
 /// One name everywhere: cosmic-config app ID, state dir, desktop entry.
-pub const APP_ID: &str = "io.github.ercling.CosmicBingWallpaper";
+pub const APP_ID: &str = "io.github.ercling.cosmic-applet-daymural";
 
 /// Symbolic icon shown in the panel.
 const PANEL_ICON: &str = "preferences-desktop-wallpaper-symbolic";
@@ -5130,9 +5130,22 @@ mod tests {
 
     #[test]
     fn app_id_is_reverse_dns() {
-        assert_eq!(APP_ID, "io.github.ercling.CosmicBingWallpaper");
+        assert_eq!(APP_ID, "io.github.ercling.cosmic-applet-daymural");
         assert_eq!(<Window as cosmic::Application>::APP_ID, APP_ID);
         assert!(APP_ID.split('.').count() >= 3);
+    }
+
+    #[test]
+    fn cargo_identity_is_daymural() {
+        const PROJECT_URL: &str = "https://github.com/ercling/cosmic-applet-daymural";
+
+        assert_eq!(env!("CARGO_PKG_NAME"), "daymural");
+        assert_eq!(env!("CARGO_PKG_REPOSITORY"), PROJECT_URL);
+        assert_eq!(env!("CARGO_PKG_HOMEPAGE"), PROJECT_URL);
+        assert_eq!(
+            env!("CARGO_PKG_DESCRIPTION"),
+            "Daymural: daily Bing wallpaper applet for the COSMIC desktop"
+        );
     }
 
     #[test]
@@ -6550,7 +6563,7 @@ mod tests {
         )?;
         require(
             metainfo.contains(
-                "<url type=\"homepage\">https://github.com/ercling/cosmic-wallpaper-applet</url>",
+                "<url type=\"homepage\">https://github.com/ercling/cosmic-applet-daymural</url>",
             ),
             "metainfo homepage must name the project repository",
         )?;
@@ -7206,7 +7219,7 @@ mod tests {
             CARGO_SOURCES_FILENAME.to_owned(),
             "astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b".to_owned(),
             "version: \"0.12.1\"".to_owned(),
-            "appstreamcli validate --pedantic --explain --strict --no-net data/io.github.ercling.CosmicBingWallpaper.metainfo.xml".to_owned(),
+            "appstreamcli validate --pedantic --explain --strict --no-net data/io.github.ercling.cosmic-applet-daymural.metainfo.xml".to_owned(),
             FLATPAK_BUILDER_ACTION.to_owned(),
             format!("bundle: {}.flatpak", env!("CARGO_PKG_NAME")),
         ] {

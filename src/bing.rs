@@ -19,7 +19,7 @@ pub const BING_BASE_URL: &str = "https://www.bing.com";
 
 /// User-Agent sent with every request (Bing serves generic UAs fine; this
 /// just identifies us honestly).
-pub const USER_AGENT: &str = concat!("cosmic-bing-wallpaper/", env!("CARGO_PKG_VERSION"));
+pub const USER_AGENT: &str = concat!("daymural/", env!("CARGO_PKG_VERSION"));
 
 /// Prefix every Bing `urlbase` carries; stripped for filenames and
 /// re-added when rebuilding a catalogue from a folder scan.
@@ -562,6 +562,12 @@ pub fn filename_names_urlbase(filename: &str, urlbase: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_agent_uses_the_daymural_identity() {
+        assert_eq!(USER_AGENT, concat!("daymural/", env!("CARGO_PKG_VERSION")));
+        assert!(!USER_AGENT.contains("cosmic-bing-wallpaper"));
+    }
 
     const FIXTURE: &str = include_str!("../tests/fixtures/hpimagearchive.json");
 

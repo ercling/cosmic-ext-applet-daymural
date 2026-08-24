@@ -1,7 +1,7 @@
 // Image catalogue: the persistent record of every downloaded wallpaper.
 //
 // Stored as JSON in the applet's state dir
-// (`~/.local/state/io.github.ercling.CosmicBingWallpaper/catalogue.json`;
+// (`~/.local/state/io.github.ercling.cosmic-applet-daymural/catalogue.json`;
 // path always injected by the caller so tests never touch the real one).
 // The catalogue is rebuildable: if the JSON is corrupt or missing, the
 // download folder is rescanned by filename pattern (`bing::parse_filename`
