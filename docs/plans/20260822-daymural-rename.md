@@ -55,9 +55,31 @@ tasks also edit, and is the least reversible change in the set.
 
 ### Task 1: Name clearance gate
 
-- [ ] Complete the Daymural name check (Flathub/Flatpak app IDs, crates.io,
+- [x] Complete the Daymural name check (Flathub/Flatpak app IDs, crates.io,
       GitHub, common package registries, trademark search) and record the
       result and date here. **Do not start Task 2 until this is `[x]`.**
+
+Name check completed **2026-08-24**. Exact-name/identifier searches found no
+existing `Daymural` software project, package, or application ID that blocks
+the proposed identity:
+
+- Flathub returned no app for
+  `io.github.ercling.cosmic-applet-daymural`, and searches of Flathub's public
+  application/repository listings found no `daymural` entry.
+- crates.io reported that the `daymural` crate does not exist. GitHub's public
+  repository search returned zero repositories for `daymural`, and the
+  proposed `ercling/cosmic-applet-daymural` repository did not exist.
+- Exact package lookups returned no result on npm, PyPI, RubyGems, Packagist,
+  NuGet, Maven Central, or the Snap Store.
+- Exact-term searches of the public/indexed USPTO, WIPO Global Brand Database,
+  and EUIPO records, plus a general web search for `Daymural` as a software
+  name or trademark, found no exact mark. The only web hits were unrelated
+  uses where “day” and “mural” ran together in prose or a product listing.
+
+This is a preliminary knockout search, not a legal opinion or a comprehensive
+similarity/common-law search. Recheck before publication or trademark filing;
+the USPTO itself recommends searching similar marks and related goods/services,
+and WIPO recommends also checking relevant national and regional registers.
 
 ### Task 2: Rename the code identity
 
