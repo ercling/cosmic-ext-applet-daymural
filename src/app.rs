@@ -6383,6 +6383,8 @@ mod tests {
     const FLATPAK_MANIFEST: &str = include_str!("../io.github.ercling.cosmic-applet-daymural.json");
     const JUSTFILE: &str = include_str!("../justfile");
     const README: &str = include_str!("../README.md");
+    const SCREENSHOT_PROVENANCE: &str = include_str!("../resources/screenshots/README.md");
+    const STORE_SCREENSHOT: &[u8] = include_bytes!("../resources/screenshots/screenshot-main.png");
     const AGENT_GUIDE: &str = include_str!("../AGENTS.md");
     const LEGACY_GUIDE: &str = include_str!("../CLAUDE.md");
     const ACTIVE_FLATPAK_PLAN: &str =
@@ -6402,6 +6404,38 @@ mod tests {
     const FLATPAK_BUILDER_ACTION: &str =
         "flatpak/flatpak-github-actions/flatpak-builder@401fe28a8384095fc1531b9d320b292f0ee45adb";
     const FLATPAK_BUILDER_IMAGE: &str = "ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08@sha256:6f3180c6765cb55e5dcd8ee4127b82aba25163c8c655a161422b7c447c14e4af";
+
+    fn store_screenshot_contract(readme: &str, provenance: &str, screenshot: &[u8]) -> bool {
+        readme.contains(
+            "![Daymural panel popup showing project-owned dawn artwork](resources/screenshots/screenshot-main.png)",
+        ) && provenance.contains("not a Microsoft Bing image")
+            && provenance.contains("CC0-1.0")
+            && screenshot.starts_with(b"\x89PNG\r\n\x1a\n")
+    }
+
+    #[test]
+    fn store_screenshot_is_present_and_has_licensed_provenance() {
+        assert!(store_screenshot_contract(
+            README,
+            SCREENSHOT_PROVENANCE,
+            STORE_SCREENSHOT
+        ));
+        assert!(!store_screenshot_contract(
+            &README.replace("screenshot-main.png", "missing.png"),
+            SCREENSHOT_PROVENANCE,
+            STORE_SCREENSHOT
+        ));
+        assert!(!store_screenshot_contract(
+            README,
+            &SCREENSHOT_PROVENANCE.replace("CC0-1.0", "license-pending"),
+            STORE_SCREENSHOT
+        ));
+        assert!(!store_screenshot_contract(
+            README,
+            SCREENSHOT_PROVENANCE,
+            b"not a PNG"
+        ));
+    }
 
     fn just_var<'a>(justfile: &'a str, name: &str) -> Option<&'a str> {
         justfile

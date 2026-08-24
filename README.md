@@ -10,7 +10,7 @@ rebuilt as a native libcosmic applet. Downloaded files use the same
 `~/Pictures/BingWallpaper/<date>-<name>_<res>.jpg` naming, so an existing folder
 from the GNOME extension is picked up as-is — no re-downloads.
 
-<!-- TODO: screenshot of the panel popup (requires a live COSMIC session) -->
+![Daymural panel popup showing project-owned dawn artwork](resources/screenshots/screenshot-main.png)
 
 ## Features
 
