@@ -6411,6 +6411,8 @@ mod tests {
         ) && provenance.contains("not a Microsoft Bing image")
             && provenance.contains("CC0-1.0")
             && screenshot.starts_with(b"\x89PNG\r\n\x1a\n")
+            && image::load_from_memory(screenshot)
+                .is_ok_and(|image| image.width() == 371 && image.height() == 585)
     }
 
     #[test]
@@ -6434,6 +6436,11 @@ mod tests {
             README,
             SCREENSHOT_PROVENANCE,
             b"not a PNG"
+        ));
+        assert!(!store_screenshot_contract(
+            README,
+            SCREENSHOT_PROVENANCE,
+            b"\x89PNG\r\n\x1a\ntruncated"
         ));
     }
 
@@ -7445,25 +7452,26 @@ mod tests {
         const LEGACY_APP_ID: &str = "io.github.ercling.CosmicBingWallpaper";
         const LEGACY_BINARY: &str = "cosmic-bing-wallpaper";
 
-        let readme_without_documented_uninstall =
-            README.replace(LEGACY_APP_ID, "").replace(LEGACY_BINARY, "");
-        assert_eq!(
-            README.matches(LEGACY_APP_ID).count(),
-            3,
-            "README must name the legacy desktop, icon, and Flatpak identities exactly"
-        );
-        assert_eq!(
-            README.matches(LEGACY_BINARY).count(),
-            1,
-            "README must name the legacy native binary exactly once"
-        );
+        let uninstall_heading = "## Uninstall the previous identity before upgrading";
+        let uninstall_start = README
+            .find(uninstall_heading)
+            .expect("README must retain the legacy uninstall section");
+        let uninstall_tail = &README[uninstall_start..];
+        let uninstall_end = uninstall_tail[uninstall_heading.len()..]
+            .find("\n## ")
+            .map_or(README.len(), |end| {
+                uninstall_start + uninstall_heading.len() + end
+            });
+        let uninstall_section = &README[uninstall_start..uninstall_end];
         assert!(
-            README.contains("flatpak uninstall --user io.github.ercling.CosmicBingWallpaper")
-                && README.contains("$HOME/.local/bin/cosmic-bing-wallpaper")
-                && README.contains("Old settings, catalogue state, thumbnails, leadership locks")
-                && README.contains("coordination mailbox are not migrated")
-                && README.contains("~/Pictures/BingWallpaper` image folder is\nkept")
-                && README.contains("COSMIC Settings →\nDesktop → Panel"),
+            uninstall_section
+                .contains("flatpak uninstall --user io.github.ercling.CosmicBingWallpaper")
+                && uninstall_section.contains("$HOME/.local/bin/cosmic-bing-wallpaper")
+                && uninstall_section
+                    .contains("Old settings, catalogue state, thumbnails, leadership locks")
+                && uninstall_section.contains("coordination mailbox are not migrated")
+                && uninstall_section.contains("~/Pictures/BingWallpaper` image folder is\nkept")
+                && uninstall_section.contains("COSMIC Settings →\nDesktop → Panel"),
             "README must retain the complete legacy uninstall and migration warning"
         );
 
@@ -7475,8 +7483,12 @@ mod tests {
             ("Rust workflow", RUST_WORKFLOW),
             ("Flatpak workflow", FLATPAK_WORKFLOW),
             (
-                "README outside explicit uninstall instructions",
-                &readme_without_documented_uninstall,
+                "README before explicit uninstall instructions",
+                &README[..uninstall_start],
+            ),
+            (
+                "README after explicit uninstall instructions",
+                &README[uninstall_end..],
             ),
             ("AGENTS.md", AGENT_GUIDE),
             ("active Flatpak plan", ACTIVE_FLATPAK_PLAN),
@@ -7501,6 +7513,78 @@ mod tests {
                 && !LEGACY_GUIDE.contains("https://github.com/ercling/cosmic-wallpaper-applet"),
             "CLAUDE.md may retain the old name only in a completed historical plan filename"
         );
+    }
+
+    fn identity_inventory(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+        fn collect_files(dir: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
+            if !dir.is_dir() {
+                return Ok(());
+            }
+            for entry in std::fs::read_dir(dir)? {
+                let path = entry?.path();
+                if path.is_dir() {
+                    collect_files(&path, files)?;
+                } else {
+                    files.push(path);
+                }
+            }
+            Ok(())
+        }
+
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(root)? {
+            let path = entry?.path();
+            if path.is_file() && path.extension().is_some_and(|ext| ext == "json") {
+                files.push(path);
+            }
+        }
+        collect_files(&root.join("data"), &mut files)?;
+        collect_files(&root.join("i18n"), &mut files)?;
+        Ok(files)
+    }
+
+    fn inventory_has_legacy_identity(paths: &[PathBuf]) -> bool {
+        paths.iter().any(|path| {
+            let path = path.to_string_lossy();
+            path.contains("io.github.ercling.CosmicBingWallpaper")
+                || path.contains("cosmic-bing-wallpaper")
+                || path.contains("cosmic_bing_wallpaper")
+        })
+    }
+
+    #[test]
+    fn active_file_inventory_rejects_legacy_identity_drift() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let inventory = identity_inventory(root).expect("repository identity inventory");
+        assert!(!inventory_has_legacy_identity(&inventory));
+        for expected in [
+            "io.github.ercling.cosmic-applet-daymural.json",
+            "data/io.github.ercling.cosmic-applet-daymural.desktop",
+            "data/icons/io.github.ercling.cosmic-applet-daymural-symbolic.svg",
+            "i18n/en/daymural.ftl",
+        ] {
+            assert!(
+                inventory.iter().any(|path| path.ends_with(expected)),
+                "identity inventory omitted `{expected}`"
+            );
+        }
+
+        for relative in [
+            "io.github.ercling.CosmicBingWallpaper.json",
+            "data/io.github.ercling.CosmicBingWallpaper.desktop",
+            "data/icons/io.github.ercling.CosmicBingWallpaper-symbolic.svg",
+            "i18n/en/cosmic_bing_wallpaper.ftl",
+        ] {
+            let drift = tempfile::tempdir().unwrap();
+            let path = drift.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"legacy identity drift").unwrap();
+            let drift_inventory = identity_inventory(drift.path()).unwrap();
+            assert!(
+                inventory_has_legacy_identity(&drift_inventory),
+                "identity inventory missed legacy path `{relative}`"
+            );
+        }
     }
 
     #[test]

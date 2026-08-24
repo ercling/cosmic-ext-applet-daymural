@@ -137,28 +137,28 @@ does not probe that URL.
 
 ### Task 5: Release acceptance and submission
 
-- [x] Uninstall the previous native and Flatpak identities, then install
+- [ ] Uninstall the previous native and Flatpak identities, then install
       Daymural in an intentional COSMIC session. *(skipped - not automatable;
       this mutates the user's live installation and COSMIC state)*
-- [x] Re-add the panel entry; verify discovery, refresh, navigation,
+- [ ] Re-add the panel entry; verify discovery, refresh, navigation,
       wallpaper application, attribution, shuffle, retention, accent
       behavior, and multi-output leader ownership. *(skipped - not
       automatable without an attended COSMIC acceptance session)*
-- [x] Start with retained JPEGs but fresh Daymural state and confirm
+- [ ] Start with retained JPEGs but fresh Daymural state and confirm
       automatic title/author hydration (the hardening plan's behavior under
       the new identity). *(skipped - not automatable without mutating real
       wallpaper and applet state)*
-- [x] Publish or rename the repository to `ercling/cosmic-applet-daymural`,
+- [ ] Publish or rename the repository to `ercling/cosmic-applet-daymural`,
       then rerun network-enabled AppStream validation. *(skipped - external
       repository publication was not authorized)*
-- [x] Submit under `app/io.github.ercling.cosmic-applet-daymural/` only after
+- [ ] Submit under `app/io.github.ercling.cosmic-applet-daymural/` only after
       the exact commit passes offline and live validation. *(skipped - external
       Store submission was not authorized and the live gates remain manual)*
 - [x] Use developer-owned or clearly licensed Store screenshots unless
       separate permission allows Bing imagery. The local candidate now embeds
       project-owned generated artwork rather than Bing/Getty imagery, with
       provenance recorded in `resources/screenshots/README.md`.
-- [x] Move this plan to `docs/plans/completed/` only after all automated and
+- [ ] Move this plan to `docs/plans/completed/` only after all automated and
       live gates pass. *(skipped - the planning-exec orchestrator performs the
       archive step after review; this task must not move the active plan)*
 
