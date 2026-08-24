@@ -7408,6 +7408,31 @@ mod tests {
 
     #[test]
     fn active_packaging_and_documentation_reject_legacy_identity_drift() {
+        const LEGACY_APP_ID: &str = "io.github.ercling.CosmicBingWallpaper";
+        const LEGACY_BINARY: &str = "cosmic-bing-wallpaper";
+
+        let readme_without_documented_uninstall =
+            README.replace(LEGACY_APP_ID, "").replace(LEGACY_BINARY, "");
+        assert_eq!(
+            README.matches(LEGACY_APP_ID).count(),
+            3,
+            "README must name the legacy desktop, icon, and Flatpak identities exactly"
+        );
+        assert_eq!(
+            README.matches(LEGACY_BINARY).count(),
+            1,
+            "README must name the legacy native binary exactly once"
+        );
+        assert!(
+            README.contains("flatpak uninstall --user io.github.ercling.CosmicBingWallpaper")
+                && README.contains("$HOME/.local/bin/cosmic-bing-wallpaper")
+                && README.contains("Old settings, catalogue state, thumbnails, leadership locks")
+                && README.contains("coordination mailbox are not migrated")
+                && README.contains("~/Pictures/BingWallpaper` image folder is\nkept")
+                && README.contains("COSMIC Settings →\nDesktop → Panel"),
+            "README must retain the complete legacy uninstall and migration warning"
+        );
+
         for (name, text) in [
             ("desktop entry", DESKTOP),
             ("metainfo", METAINFO),
@@ -7415,13 +7440,16 @@ mod tests {
             ("justfile", JUSTFILE),
             ("Rust workflow", RUST_WORKFLOW),
             ("Flatpak workflow", FLATPAK_WORKFLOW),
-            ("README", README),
+            (
+                "README outside explicit uninstall instructions",
+                &readme_without_documented_uninstall,
+            ),
             ("AGENTS.md", AGENT_GUIDE),
             ("active Flatpak plan", ACTIVE_FLATPAK_PLAN),
         ] {
             for legacy in [
-                "io.github.ercling.CosmicBingWallpaper",
-                "cosmic-bing-wallpaper",
+                LEGACY_APP_ID,
+                LEGACY_BINARY,
                 "cosmic_bing_wallpaper",
                 "https://github.com/ercling/cosmic-wallpaper-applet",
             ] {

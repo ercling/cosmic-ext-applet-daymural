@@ -127,11 +127,11 @@ does not probe that URL.
 
 ### Task 4: Migration documentation
 
-- [ ] README uninstall section: remove the old native *and* Flatpak
+- [x] README uninstall section: remove the old native *and* Flatpak
       installation before starting Daymural, stating the consequence — two
       differently identified leaders over one `~/Pictures/BingWallpaper`,
       pruning and applying concurrently.
-- [ ] README: the panel entry must be re-added after the rename (Settings →
+- [x] README: the panel entry must be re-added after the rename (Settings →
       Desktop → Panel); old config, state, thumbnails, locks, and the
       coordination mailbox are not migrated; the image folder is kept.
 

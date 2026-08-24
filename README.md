@@ -121,6 +121,39 @@ redistribution permission. The project's GPL-3.0-only license covers the
 applet's code and project-owned assets (icon, metadata, translations), not
 photographs downloaded from Bing.
 
+## Uninstall the previous identity before upgrading
+
+Before starting Daymural for the first time, remove every previous native and
+Flatpak installation that you used. The renamed app has a different identity,
+so an old instance and a Daymural instance each consider themselves the leader
+while both manage `~/Pictures/BingWallpaper`. If they run together, they can
+prune the same catalogue and apply wallpapers concurrently.
+
+The current `just uninstall` recipe knows only the Daymural filenames. Remove a
+previous per-user native installation explicitly:
+
+```bash
+rm -f "$HOME/.local/bin/cosmic-bing-wallpaper" \
+  "$HOME/.local/share/applications/io.github.ercling.CosmicBingWallpaper.desktop" \
+  "$HOME/.local/share/icons/hicolor/scalable/apps/io.github.ercling.CosmicBingWallpaper-symbolic.svg"
+```
+
+Remove the previous Flatpak identity too if it was installed:
+
+```bash
+flatpak uninstall --user io.github.ercling.CosmicBingWallpaper
+```
+
+The renamed desktop-entry ID does not preserve the old panel entry. Remove the
+old entry, then after installing Daymural add it again via **COSMIC Settings →
+Desktop → Panel → Configure panel applets**.
+
+Old settings, catalogue state, thumbnails, leadership locks, and the
+coordination mailbox are not migrated; Daymural starts with fresh config and
+state under its new ID. The shared `~/Pictures/BingWallpaper` image folder is
+kept, and Daymural discovers its retained JPEGs on startup. Do not delete that
+folder as part of the identity uninstall.
+
 ## Native build & install
 
 Requires Rust (edition 2024; developed and tested with rustc 1.97),
