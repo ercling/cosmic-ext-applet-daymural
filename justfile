@@ -45,8 +45,11 @@ flatpak-sources:
     flatpak/generate-cargo-sources.sh
 
 # All local Flatpak build modes share this invocation so cache, remote, and
-# force-clean behavior cannot drift between recipes.
-flatpak-builder-cmd := 'flatpak-builder --user --install-deps-from=flathub --force-clean'
+# force-clean behavior cannot drift between recipes. Flags follow the `build`
+# target of pop-os/cosmic-flatpak's justfile (ccache, delete-build-dirs,
+# sandboxed build) minus its repo/GPG handling, which only applies to their
+# OSTree repo publishing.
+flatpak-builder-cmd := 'flatpak-builder --ccache --delete-build-dirs --force-clean --install-deps-from=flathub --sandbox --user'
 
 # Fetch the runtime, SDK, and every manifest source into Flatpak's retained
 # download cache without compiling the applet.
