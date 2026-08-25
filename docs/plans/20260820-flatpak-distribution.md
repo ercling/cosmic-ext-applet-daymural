@@ -277,6 +277,9 @@ Post-Completion; that warning is accepted.
       changing native recipes, sharing one `flatpak-builder-cmd` variable so they cannot drift;
       also add a source-prefetch recipe and a `flatpak-build-offline` recipe that passes
       `--disable-download`
+- [x] ➕ keep flatpak-builder's `--sandbox` command flag out of the shared invocation because it
+      rejects the centralized manifest's repository source outside the manifest directory;
+      individual module builds remain sandboxed by Flatpak Builder
 - [x] add success tests tying manifest source names, module/Cargo-home paths, the script's
       `Cargo.lock` input / `cargo-sources.json` output names, and just recipes together —
       **never reading `cargo-sources.json` itself**

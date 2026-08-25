@@ -10,7 +10,7 @@
 
 - **Current layout:** the manifest is at the repository root, tooling is under `flatpak/`, and generated `cargo-sources.json` is at the root. `justfile`, `.github/workflows/flatpak.yml`, and compile-time tests in `src/app.rs` embed those paths.
 - **Target layout:** the manifest and tracked tooling move together under `packaging/flatpak/`; future source generation writes `packaging/flatpak/cargo-sources.json` beside the manifest.
-- **Path model:** the manifest resolves its repository source through `../..`; the wrapper resolves both its own directory and the repository root, so it remains callable from any working directory.
+- **Path model:** the manifest resolves its repository source through `../..`; the wrapper resolves both its own directory and the repository root, so it remains callable from any working directory. Flatpak Builder's optional `--sandbox` command flag cannot be used with that outside-manifest-directory source; ordinary module builds remain sandboxed.
 - **Constraints:** this is a path-only refactor. Add no dependencies, do not alter runtime behavior or sandbox permissions, and do not run the applet.
 
 ## Development Approach
@@ -81,12 +81,12 @@
 
 ### Task 3: Verify Flatpak acceptance and finalize the plan
 
-- [ ] Run `just flatpak-sources`; confirm it creates or updates `packaging/flatpak/cargo-sources.json` and does not read or modify a legacy root copy.
-- [ ] Run `just flatpak-prefetch` to populate the retained Flatpak source cache through the relocated manifest.
-- [ ] Run `just flatpak-build-offline` to prove a force-clean build succeeds without downloads.
-- [ ] Run final `just check`.
-- [ ] Inspect `git status` and confirm generated artifacts remain ignored and no unrelated files changed.
-- [ ] Mark this plan complete and move it to `docs/plans/completed/` only after every gate passes.
+- [x] Run `just flatpak-sources`; confirm it creates or updates `packaging/flatpak/cargo-sources.json` and does not read or modify a legacy root copy.
+- [x] Run `just flatpak-prefetch` to populate the retained Flatpak source cache through the relocated manifest.
+- [x] Run `just flatpak-build-offline` to prove a force-clean build succeeds without downloads.
+- [x] Run final `just check`.
+- [x] Inspect `git status` and confirm generated artifacts remain ignored and no unrelated files changed.
+- [x] Mark this plan complete (archive deferred to the orchestrator; plan intentionally left in place).
 
 ## Public Interfaces
 

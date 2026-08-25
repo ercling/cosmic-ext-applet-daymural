@@ -7076,7 +7076,8 @@ mod tests {
             builder.starts_with("flatpak-builder ")
                 && builder.contains("--user")
                 && builder.contains("--install-deps-from=flathub")
-                && builder.contains("--force-clean"),
+                && builder.contains("--force-clean")
+                && !builder.contains("--sandbox"),
             "shared flatpak-builder invocation",
         )?;
         for recipe in [
@@ -7233,6 +7234,19 @@ mod tests {
             validate_flatpak_tooling(FLATPAK_MANIFEST, CARGO_SOURCES_SCRIPT, &no_offline_guard,)
                 .is_err(),
             "an offline recipe without --disable-download unexpectedly passed"
+        );
+        let incompatible_source_sandbox = JUSTFILE.replace(
+            "--install-deps-from=flathub --user",
+            "--install-deps-from=flathub --sandbox --user",
+        );
+        assert!(
+            validate_flatpak_tooling(
+                FLATPAK_MANIFEST,
+                CARGO_SOURCES_SCRIPT,
+                &incompatible_source_sandbox,
+            )
+            .is_err(),
+            "--sandbox cannot read the relocated manifest's ../.. directory source"
         );
         let unlocked_script = CARGO_SOURCES_SCRIPT.replace(" run --locked", " run");
         assert!(
