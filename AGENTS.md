@@ -79,10 +79,9 @@ needed.
 - `src/testutil.rs`: test-only HTTP/JPEG and popup-surface helpers.
 - `data/`: desktop entry and app-ID icon installed by both packaging routes,
   plus AppStream metainfo installed by Flatpak packaging.
-- `io.github.ercling.cosmic-applet-daymural.json`: developer Flatpak manifest and
-  the authoritative scoped sandbox contract.
-- `flatpak/`: pinned Cargo source generator and its `uv` wrapper; generated
-  `cargo-sources.json` is deliberately ignored.
+- `packaging/flatpak/`: developer manifest and authoritative scoped sandbox
+  contract, pinned Cargo source generator and its `uv` wrapper, helper tests,
+  and the deliberately ignored generated `cargo-sources.json`.
 - `.github/workflows/`: native Rust checks and the Freedesktop 25.08 Flatpak
   build/bundle job.
 - `tests/fixtures/`: hermetic external-data fixtures.

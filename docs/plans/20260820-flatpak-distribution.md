@@ -15,6 +15,11 @@
 
 ## Context
 
+- **Current layout (2026-08-25):** the developer manifest, Cargo vendoring
+  tools, helper tests, lockfile, and generated source list now live together in
+  `packaging/flatpak/`. Completed task entries below retain their original paths
+  as historical implementation evidence.
+
 - **Base branch:** implement on a branch cut from `main` **after** `single-instance-leader`
   merges. Four tasks edit `src/app.rs`; landing them on top of the in-flight leader branch
   guarantees conflicts and makes the multi-output gate unverifiable. The leader's multi-output
@@ -92,9 +97,10 @@
 
 ## Solution Overview
 
-Add a developer Flatpak manifest at the repository root and install the existing binary,
-desktop entry, and app-ID icon alongside new AppStream metadata. Generate every Cargo source,
-prefetch the declared Flatpak inputs, then prove a clean repeat build with downloads disabled.
+Use the developer manifest under `packaging/flatpak/` to install the existing binary, desktop
+entry, and app-ID icon alongside the AppStream metadata. Generate every Cargo source beside the
+manifest, prefetch the declared Flatpak inputs, then prove a clean repeat build with downloads
+disabled.
 Grant only the host integrations the existing implementation requires: network, Wayland/DRI,
 the exact wallpaper directory, COSMIC config and cosmic-bg state, COSMIC Settings Daemon
 notifications, and logind.
@@ -114,15 +120,16 @@ live Flatpak verification.
 
 ## Technical Details
 
-The root manifest `io.github.ercling.cosmic-applet-daymural.json` will use:
+The manifest `packaging/flatpak/io.github.ercling.cosmic-applet-daymural.json` uses:
 
 - `runtime: org.freedesktop.Platform`, `runtime-version: 25.08`,
   `sdk: org.freedesktop.Sdk`, and `org.freedesktop.Sdk.Extension.rust-stable`;
 - `command` and module name `daymural`;
 - `CARGO_HOME=/run/build/daymural/cargo`;
 - offline, lockfile-enforced Cargo fetch/build commands and explicit `/app` install destinations;
-- a local directory source excluding `.git`, `target`, `examples`, `.flatpak-builder`, and
-  `build-dir`, plus generated `cargo-sources.json`.
+- a `../..` local directory source excluding `.git`, `target`, `examples`,
+  `.flatpak-builder`, and `build-dir`, plus adjacent generated
+  `packaging/flatpak/cargo-sources.json`.
 
 The source desktop entry will use `Exec=daymural` (see Context for why). The
 Flatpak build export preserves that bare command; it matches the manifest command and resolves

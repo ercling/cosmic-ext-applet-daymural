@@ -72,12 +72,12 @@
 
 - Modify: `README.md`, `AGENTS.md`, `CLAUDE.md`, `docs/plans/20260820-flatpak-distribution.md`
 
-- [ ] Update user-facing manifest and generated-source paths while preserving all documented `just` commands.
-- [ ] Replace the repository-map descriptions of the root manifest and `flatpak/` directory with the consolidated packaging directory.
-- [ ] Update durable architecture references in `CLAUDE.md`.
-- [ ] Add a current-layout note to the original Flatpak distribution plan and update its normative layout descriptions; retain completed task history where old paths are historical evidence.
-- [ ] Search active source, workflow, recipes, and current documentation for stale root-manifest or `flatpak/` tooling references; allow only action identifiers, historical evidence, and legacy-ignore comments.
-- [ ] Run `just check`; it must pass before Task 3.
+- [x] Update user-facing manifest and generated-source paths while preserving all documented `just` commands.
+- [x] Replace the repository-map descriptions of the root manifest and `flatpak/` directory with the consolidated packaging directory.
+- [x] Update durable architecture references in `CLAUDE.md`.
+- [x] Add a current-layout note to the original Flatpak distribution plan and update its normative layout descriptions; retain completed task history where old paths are historical evidence.
+- [x] Search active source, workflow, recipes, and current documentation for stale root-manifest or `flatpak/` tooling references; allow only action identifiers, historical evidence, and legacy-ignore comments.
+- [x] Run `just check`; it must pass before Task 3.
 
 ### Task 3: Verify Flatpak acceptance and finalize the plan
 

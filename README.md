@@ -208,12 +208,13 @@ flatpak remote-add --user --if-not-exists flathub \
   https://flathub.org/repo/flathub.flatpakrepo
 ```
 
-Generate the offline Cargo sources before building. The recipes use the root
-manifest `io.github.ercling.cosmic-applet-daymural.json` and a retained
+Generate the offline Cargo sources before building. The recipes use
+`packaging/flatpak/io.github.ercling.cosmic-applet-daymural.json`, generate the
+gitignored `packaging/flatpak/cargo-sources.json` beside it, and retain the root
 `build-dir` cache:
 
 ```bash
-just flatpak-sources        # generate gitignored cargo-sources.json with uv
+just flatpak-sources        # generate packaging/flatpak/cargo-sources.json with uv
 just flatpak-prefetch       # fetch the runtime, SDK, and declared sources
 just flatpak-build-offline  # force-clean build with downloads disabled
 just flatpak-install        # build and install for the current user

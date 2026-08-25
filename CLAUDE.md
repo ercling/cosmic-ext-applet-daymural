@@ -15,7 +15,7 @@ just check        # cargo fmt --check + clippy --all-targets -D warnings + cargo
 just build        # cargo build --release
 just install      # install binary + .desktop + icon into ~/.local (no sudo)
 just uninstall
-just flatpak-sources        # generate cargo-sources.json (requires uv)
+just flatpak-sources        # generate packaging/flatpak/cargo-sources.json (requires uv)
 just flatpak-prefetch       # retain every Flatpak input in the builder cache
 just flatpak-build-offline  # force-clean build with downloads disabled
 just flatpak-install
@@ -54,15 +54,16 @@ source id. A second `?rev=` spelling splits that repo and breaks offline Flatpak
 vendoring. libcosmic APIs move fast, so verify against the locked revision before
 coding against remembered names.
 
-Packaging is part of the checked-in architecture. The root
-`io.github.ercling.cosmic-applet-daymural.json` developer manifest installs the
+Packaging is part of the checked-in architecture.
+`packaging/flatpak/io.github.ercling.cosmic-applet-daymural.json` installs the
 binary, desktop entry, app-ID icon, and
 `data/io.github.ercling.cosmic-applet-daymural.metainfo.xml` into `/app`. Its
 Freedesktop 25.08 sandbox contract grants only the wallpaper directory, COSMIC
 config/state, Settings Daemon notifications, logind, Wayland/DRI, and network.
-`flatpak/` holds the pinned upstream Cargo source generator and `uv` wrapper;
-`cargo-sources.json` is generated and ignored. `.github/workflows/rust.yml`
-runs the native checks without generated sources, while
+The same `packaging/flatpak/` directory holds the pinned upstream Cargo source
+generator, its `uv` wrapper, and helper tests; `packaging/flatpak/cargo-sources.json`
+is generated and ignored. `.github/workflows/rust.yml` runs the native checks
+without generated sources, while
 `.github/workflows/flatpak.yml` generates them and emits the Flatpak bundle.
 
 The hand-written packaging identity web is tested by embedding the desktop
