@@ -385,6 +385,24 @@ changed-value state poke were not triggered, so that gate remains open. Icon ren
 interactive controls, both `xdg-open` actions, live theme changes, and accent state-machine
 behavior were not visually exercised and remain release blockers.
 
+Retry evidence (2026-08-25): a non-interactive COSMIC workspace-overview screenshot exposed both
+panels and visibly confirmed that the Daymural panel button renders its framed-landscape symbolic
+icon through host passthrough. The popup control icons and empty-catalogue placeholder were still not
+opened or observed, so their combined checkbox remains open.
+
+The retry also exercised the live accent watcher with an exact backup of the Daymural config and both
+COSMIC builder/serialized-theme directories. Starting from an empty new-identity config, the light and
+dark builder accents were deliberately swapped, then matching was enabled through the watched config.
+Daymural persisted the swapped pair as its snapshot and wrote both computed wallpaper accents
+(`light=(79,73,0)`, `dark=(207,198,100)`). A normal disable restored the stored pair and cleared both
+snapshot and last-written records. However, the external-choice gate failed: while enabled, changing
+the light builder accent to `(207,198,100)` and restarting only the two Daymural Flatpak instances did
+not disarm matching. The restarted leader overwrote the external light accent with `(79,73,0)`, kept
+`accent_enabled=true`, and replaced the snapshot instead. This is release-blocking under the accent
+contract, so the combined accent checkbox remains open. After observation, all affected app/theme
+directories were restored byte-for-byte from the pre-test backup and the three temporary Daymural
+accent keys were removed; recursive diffs against the backup were clean.
+
 ### Task 7: Final acceptance and plan state
 
 **Files:**
