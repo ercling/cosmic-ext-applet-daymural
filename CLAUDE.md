@@ -493,11 +493,13 @@ do not duplicate `appstreamcli` or desktop-file syntax validation in Rust.
     distinction and is shared by watcher confirmation and takeover hydration.
     Only the one-shot initial
     confirmation may make either decision, and any local toggle or non-skip
-    accent action consumes that opportunity so a delayed pre-disarm read
-    cannot resurrect the lifecycle. Adoption immediately recomputes so the
-    normal builder comparison can skip or disarm before any write; treating a
-    persisted lifecycle as a new enable would replace the saved snapshot and
-    overwrite a user accent chosen while the applet was stopped.
+    accent action consumes that opportunity. A local toggle also advances the
+    config-confirmation generation, so an already-running pre-toggle disk read
+    cannot undo the new lifecycle when it completes. Adoption immediately
+    recomputes so the normal builder comparison can skip or disarm before any
+    write; treating a persisted lifecycle as a new enable would replace the
+    saved snapshot and overwrite a user accent chosen while the applet was
+    stopped.
     A follower is the explicit exception: it never owns the accent lifecycle,
     adopts only a freshly confirmed `accent_enabled` value for display, and
     preserves its in-memory snapshot/last-written fields until a takeover

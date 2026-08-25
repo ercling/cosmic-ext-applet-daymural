@@ -3194,6 +3194,12 @@ impl Window {
         if self.initial_config_confirmation_pending {
             self.initial_config_confirmation_pending = false;
             self.accent_recompute_queued = false;
+            // A local toggle wins over the startup snapshot that may already
+            // be loading. Consuming the one-shot recovery opportunity is not
+            // enough: invalidate that read as well, or its stale raw flag can
+            // undo this lifecycle transition when ConfigConfirmed arrives.
+            self.config_confirmation_generation =
+                self.config_confirmation_generation.wrapping_add(1);
         }
         if !self.is_active_leader() {
             return self.set_non_leader_accent_enabled(enabled);
@@ -13820,6 +13826,57 @@ source = "git+https://example.invalid/repo#abc""#;
         assert_eq!(window.config.accent_snapshot, None);
         assert_eq!(window.config.accent_last_written, None);
         assert_eq!(current_accents(&window), (picked.light, picked.dark));
+        assert_eq!(persisted_config(&window), window.config);
+    }
+
+    #[test]
+    fn local_enable_invalidates_an_inflight_disabled_startup_confirmation() {
+        use cosmic::Application as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = accent_window(&dir);
+        start_disabled(&mut window);
+        window.initial_config_confirmation_pending = true;
+        window.config_confirmation_generation = 7;
+        let stale_disabled = window.config.clone();
+
+        drop(window.update(Message::SetAccentEnabled(true)));
+
+        assert!(!window.initial_config_confirmation_pending);
+        assert_eq!(window.config_confirmation_generation, 8);
+        assert!(window.config.accent_enabled);
+        assert!(window.config.accent_snapshot.is_some());
+
+        let task = window.finish_config_confirmation(7, true, stale_disabled);
+
+        assert_eq!(task.units(), 0, "the stale read is rejected");
+        assert!(window.config.accent_enabled, "local enable still wins");
+        assert!(window.config.accent_snapshot.is_some());
+        assert_eq!(persisted_config(&window), window.config);
+    }
+
+    #[test]
+    fn local_disable_invalidates_an_inflight_raw_enabled_startup_confirmation() {
+        use cosmic::Application as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = accent_window(&dir);
+        window.initial_config_confirmation_pending = true;
+        window.config_confirmation_generation = 11;
+        let stale_raw_enabled = window.config.clone();
+
+        drop(window.update(Message::SetAccentEnabled(false)));
+
+        assert!(!window.initial_config_confirmation_pending);
+        assert_eq!(window.config_confirmation_generation, 12);
+        assert!(!window.config.accent_enabled);
+
+        let task = window.finish_config_confirmation(11, true, stale_raw_enabled);
+
+        assert_eq!(task.units(), 0, "the stale read is rejected");
+        assert!(!window.config.accent_enabled, "local disable still wins");
+        assert_eq!(window.config.accent_snapshot, None);
+        assert_eq!(window.config.accent_last_written, None);
         assert_eq!(persisted_config(&window), window.config);
     }
 

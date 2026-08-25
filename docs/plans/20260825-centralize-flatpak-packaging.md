@@ -99,6 +99,7 @@
 - [x] Resolve the startup confirmation gate from fresh takeover hydration, and route a confirmed matching raw enabled flag through the normal reversible enable lifecycle.
 - [x] Centralize startup accent recovery in a table-tested pure classifier shared by config confirmation and takeover hydration.
 - [x] Make local manifest staging consume the shared canonical and staged manifest path variables directly.
+- [x] Invalidate an in-flight startup config confirmation when a local accent toggle consumes the recovery opportunity, with regressions for both toggle directions.
 
 ## Public Interfaces
 
