@@ -243,10 +243,10 @@ pub struct Window {
     /// watcher payloads.
     config_confirmation_generation: u64,
     /// One-shot provenance for the settings daemon's initial full config
-    /// confirmation. Only that completion may adopt an enabled accent
-    /// lifecycle loaded after this process was constructed; any local accent
-    /// transition consumes the opportunity so a delayed pre-transition read
-    /// cannot resurrect state that was subsequently disarmed.
+    /// confirmation. While pending, a confirmed complete enabled lifecycle
+    /// may replace a per-key partial startup load; any local accent transition
+    /// consumes the opportunity so a delayed pre-transition read cannot
+    /// resurrect state that was subsequently disarmed.
     initial_config_confirmation_pending: bool,
     /// Injectable state root used by asynchronous accent extraction. In
     /// production this is [`state_dir`]; tests point it at a tempdir so task
@@ -1498,17 +1498,21 @@ impl Window {
         // can legitimately retain its snapshot after a failed restore, and
         // `last_written` may be absent after a crash between a theme write and
         // its record. Adopt either recovery shape before handling new toggles.
-        // Adopt only from the pristine in-memory shape; a genuine raw
-        // external enable has no snapshot and must still run the normal
-        // enable lifecycle. An unrelated/default confirmation does not
-        // consume this one startup opportunity because the daemon may
-        // deliver the enabled lifecycle in a later confirmation.
+        // A complete enabled lifecycle is safe to adopt over any startup
+        // shape: `AppletConfig::load` degrades keys independently, so the
+        // first read may have defaulted exactly one of these three fields.
+        // Incomplete crash/recovery shapes are adopted only over pristine
+        // memory; otherwise a genuine raw external enable with no snapshot
+        // must still run the normal enable lifecycle. An unrelated/default
+        // confirmation does not consume this one startup opportunity because
+        // the daemon may deliver the lifecycle in a later confirmation.
+        let pristine_in_memory_accent_lifecycle = !self.config.accent_enabled
+            && self.config.accent_snapshot.is_none()
+            && self.config.accent_last_written.is_none();
         let adopt_persisted_accent_lifecycle = initial_config_confirmation
             && self.accent_inflight.is_none()
-            && !self.config.accent_enabled
-            && self.config.accent_snapshot.is_none()
-            && self.config.accent_last_written.is_none()
-            && config.accent_snapshot.is_some();
+            && config.accent_snapshot.is_some()
+            && (confirmed_enabled_accent_lifecycle || pristine_in_memory_accent_lifecycle);
         let accent_flip = if self.accent_inflight.is_some() || confirmed_enabled_accent_lifecycle {
             None
         } else {
@@ -13183,6 +13187,84 @@ source = "git+https://example.invalid/repo#abc""#;
         assert_eq!(window.config.accent_snapshot, Some(user));
         assert_eq!(window.config.accent_last_written, Some(ours));
         assert_eq!(task.units(), 1);
+    }
+
+    #[test]
+    fn complete_initial_confirmation_repairs_each_partial_accent_load_before_disable() {
+        use cosmic::Application as _;
+        use cosmic_config::CosmicConfigEntry as _;
+
+        // `AppletConfig::load` falls back per key. Exercise every accent key
+        // independently defaulting during the construction-time read, then a
+        // fresh complete confirmation arriving while the startup adoption
+        // opportunity is still pending. Disable must always retain enough
+        // state to restore the user's original accents.
+        for missing in ["enabled", "snapshot", "last_written"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut window = accent_window(&dir);
+            window.initial_config_confirmation_pending = true;
+            let user = AccentSnapshot {
+                light: Some([10, 20, 30]),
+                dark: Some([40, 50, 60]),
+            };
+            let ours = AccentPair {
+                light: [70, 80, 90],
+                dark: [100, 110, 120],
+            };
+            accent::restore_accents(
+                window.accent_handles.as_ref().unwrap(),
+                AccentSnapshot {
+                    light: Some(ours.light),
+                    dark: Some(ours.dark),
+                },
+            )
+            .unwrap();
+
+            let complete = AppletConfig {
+                accent_enabled: true,
+                accent_snapshot: Some(user),
+                accent_last_written: Some(ours),
+                ..window.config.clone()
+            };
+            complete
+                .write_entry(window.config_context.as_ref().unwrap())
+                .unwrap();
+            window.config = complete.clone();
+            match missing {
+                "enabled" => window.config.accent_enabled = false,
+                "snapshot" => window.config.accent_snapshot = None,
+                "last_written" => window.config.accent_last_written = None,
+                _ => unreachable!(),
+            }
+            window.config_confirmation_generation = 1;
+
+            drop(window.finish_config_confirmation(1, true, complete));
+
+            assert!(
+                !window.initial_config_confirmation_pending,
+                "{missing} repair consumes the startup opportunity"
+            );
+            assert!(window.config.accent_enabled, "{missing} was repaired");
+            assert_eq!(
+                window.config.accent_snapshot,
+                Some(user),
+                "{missing} repair preserved the restore snapshot"
+            );
+            assert_eq!(window.config.accent_last_written, Some(ours));
+
+            drop(window.update(Message::SetAccentEnabled(false)));
+            settle_accent_tasks(&mut window);
+
+            assert!(!window.config.accent_enabled);
+            assert_eq!(window.config.accent_snapshot, None);
+            assert_eq!(window.config.accent_last_written, None);
+            assert_eq!(
+                current_accents(&window),
+                (user.light, user.dark),
+                "{missing} repair made disable reversible"
+            );
+            assert_eq!(persisted_config(&window), window.config);
+        }
     }
 
     #[tokio::test]

@@ -91,6 +91,7 @@
 ### Review corrections
 
 - [x] Preserve a disabled persisted accent snapshot during initial config confirmation so a later enable can retry the deferred restore without replacing the user's original accents.
+- [x] Let a complete initial accent lifecycle repair any independently defaulted accent key before startup confirmation, preserving disable-time restoration.
 - [x] Restore `flatpak-builder --sandbox` for every local build recipe by atomically staging a root-relative manifest view from the canonical `packaging/flatpak/` manifest.
 - [x] Add hermetic regression coverage for both recovery paths and rerun the repository and Flatpak validation gates.
 

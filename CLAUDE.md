@@ -546,6 +546,11 @@ do not duplicate `appstreamcli` or desktop-file syntax validation in Rust.
     onto the disk config (raw `ConfigSet::set`; the external flip is already
     persisted, and a disk-enabled/memory-disabled split would re-arm at the
     next startup over state the toggler never built).
+    Startup config reads are per-key and can therefore transiently contain a
+    partial lifecycle. While the initial-confirmation opportunity remains
+    pending, a fresh complete enabled lifecycle replaces any such partial
+    in-memory shape; otherwise a missing snapshot could later make disable
+    erase the valid on-disk snapshot without restoring the user's accents.
   - **Checked persists**: the accent state machine's config persists (the
     enable-time snapshot/toggle, `snapshot_now`, `last_written`) go through
     the derive's per-key setters — which return the error — never the
