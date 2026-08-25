@@ -482,20 +482,27 @@ do not duplicate `appstreamcli` or desktop-file syntax validation in Rust.
     on the next recompute — the oscillation class); the active leader's
     in-memory accent state is authoritative, and a not-in-flight
     payload flip is only routed after a **fresh disk read** confirms it. The
-    narrow restart exception is a pristine/default in-memory accent state plus
-    a freshly confirmed enabled disk lifecycle with both its snapshot and
-    `last_written`: this is an already-armed lifecycle, not a new external
-    enable. Only the one-shot initial confirmation may adopt it, and any local
-    toggle or non-skip accent action consumes that opportunity so a delayed
-    pre-disarm read cannot resurrect the lifecycle. Adoption immediately
-    recomputes so the normal builder comparison can skip or disarm before any
-    write; treating it as a new enable would replace the saved snapshot and
+    narrow restart exception is a freshly confirmed persisted lifecycle: a
+    complete enabled lifecycle can repair any independently defaulted startup
+    key, while incomplete crash/recovery shapes require pristine/default
+    memory. This is an already-armed lifecycle, not a new external enable.
+    A confirmed matching raw enable (`true` with neither lifecycle record) is
+    instead routed through the normal leader enable path so the live user
+    accents are snapshotted before computation. Only the one-shot initial
+    confirmation may make either decision, and any local toggle or non-skip
+    accent action consumes that opportunity so a delayed pre-disarm read
+    cannot resurrect the lifecycle. Adoption immediately recomputes so the
+    normal builder comparison can skip or disarm before any write; treating a
+    persisted lifecycle as a new enable would replace the saved snapshot and
     overwrite a user accent chosen while the applet was stopped.
     A follower is the explicit exception: it never owns the accent lifecycle,
     adopts only a freshly confirmed `accent_enabled` value for display, and
     preserves its in-memory snapshot/last-written fields until a takeover
-    hydration replaces the complete trio from disk. Its popup toggle persists
-    only the raw enabled key and runs no snapshot, restore, compute, or write.
+    hydration replaces the complete trio from disk. That fresh takeover read
+    also resolves the startup confirmation gate before leader duties; a raw
+    enabled-only state enters the normal enable lifecycle at that boundary.
+    Its popup toggle persists only the raw enabled key and runs no snapshot,
+    restore, compute, or write while it remains a follower.
     The completion reconciles once: a recorded user toggle wins (it is the
     newest action whose ordering is known), else a genuine external flip — evidenced by
     the disk flag read **before the completion's own persists** (they

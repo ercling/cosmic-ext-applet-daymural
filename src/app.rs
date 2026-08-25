@@ -1045,6 +1045,22 @@ impl Window {
             self.coordination_context = Some(context);
         }
         self.config = hydration.config;
+        // This blocking snapshot is the follower's fresh, authoritative
+        // config read. Followers deliberately leave the startup confirmation
+        // opportunity pending, but no later watcher event is guaranteed once
+        // this process takes over. Resolve the gate before leader duties so
+        // their accent recompute cannot be queued forever. A raw enabled flag
+        // with no lifecycle records is a request that has not yet passed
+        // through the leader-owned enable path; temporarily expose it as a
+        // flip below so that path captures and persists the user snapshot.
+        let initialize_raw_accent_enable = self.config.accent_enabled
+            && self.config.accent_snapshot.is_none()
+            && self.config.accent_last_written.is_none();
+        if initialize_raw_accent_enable {
+            self.config.accent_enabled = false;
+        }
+        self.initial_config_confirmation_pending = false;
+        self.accent_recompute_queued = false;
         self.coordination = hydration.coordination;
         self.catalogue = hydration.catalogue;
         // The same repair decision a rebuilt startup gets: the follower
@@ -1079,7 +1095,12 @@ impl Window {
             ColdStart::Done
         };
         self.leader_readiness = LeaderReadiness::Ready;
-        self.arm_leader_duties(hydration.live)
+        if initialize_raw_accent_enable {
+            let accent = self.set_accent_enabled(true);
+            self.arm_leader_duties_with_accent(hydration.live, accent)
+        } else {
+            self.arm_leader_duties(hydration.live)
+        }
     }
 
     /// Arm ordinary leader startup work. The startup thumbnail pass is the
@@ -1092,6 +1113,21 @@ impl Window {
     /// refresh sees `thumbnail_pass_pending` and writes no thumbnails of
     /// its own (the producer write interlock, [`Backfill::deferred`]).
     fn arm_leader_duties(&mut self, live: wallpaper::CurrentWallpaper) -> app::Task<Message> {
+        if !self.is_active_leader() {
+            return Task::none();
+        }
+        let accent = self.accent_compute_for_current();
+        self.arm_leader_duties_with_accent(live, accent)
+    }
+
+    /// Arm leader work after an accent lifecycle transition has already
+    /// supplied the one recompute task. This prevents a raw-enable takeover
+    /// from launching the same extraction twice.
+    fn arm_leader_duties_with_accent(
+        &mut self,
+        live: wallpaper::CurrentWallpaper,
+        accent: app::Task<Message>,
+    ) -> app::Task<Message> {
         if !self.is_active_leader() {
             return Task::none();
         }
@@ -1123,7 +1159,6 @@ impl Window {
         } else {
             Task::none()
         };
-        let accent = self.accent_compute_for_current();
         Task::batch([timer, shuffle, pass, refresh, accent])
     }
 
@@ -1514,6 +1549,12 @@ impl Window {
         let confirmed_same_accent_lifecycle = config.accent_enabled == self.config.accent_enabled
             && config.accent_snapshot == self.config.accent_snapshot
             && config.accent_last_written == self.config.accent_last_written;
+        let initialize_confirmed_raw_accent_enable = initial_config_confirmation
+            && self.accent_inflight.is_none()
+            && confirmed_same_accent_lifecycle
+            && config.accent_enabled
+            && config.accent_snapshot.is_none()
+            && config.accent_last_written.is_none();
         let adopt_persisted_accent_lifecycle = initial_config_confirmation
             && self.accent_inflight.is_none()
             && config.accent_snapshot.is_some()
@@ -1544,6 +1585,13 @@ impl Window {
             if self.config.accent_enabled {
                 tasks.push(self.accent_compute_for_current());
             }
+        } else if initialize_confirmed_raw_accent_enable {
+            // The construction-time load and fresh confirmation agree that
+            // only the raw enabled flag exists. Manufacture the missing flip
+            // in memory so the ordinary enable lifecycle snapshots the live
+            // user accents and persists a reversible state before computing.
+            self.config.accent_enabled = false;
+            tasks.push(self.set_accent_enabled(true));
         } else if let Some(enabled) = accent_flip {
             tasks.push(self.set_accent_enabled(enabled));
         }
@@ -5034,6 +5082,7 @@ mod tests {
             peer_refresh_write_pending: true,
             refresh_pending: true,
             peer_refresh_timeout_generation: 6,
+            initial_config_confirmation_pending: true,
             cold_start: ColdStart::Pending,
             ..Window::default()
         };
@@ -5052,6 +5101,10 @@ mod tests {
 
         assert!(window.is_active_leader());
         assert_eq!(window.config, config, "the complete accent trio is adopted");
+        assert!(
+            !window.initial_config_confirmation_pending,
+            "the fresh takeover snapshot resolves the follower's startup gate"
+        );
         assert_eq!(window.coordination, coordination);
         assert_eq!(window.current, Some(live_path));
         assert_eq!(window.catalogue.images.len(), 1);
@@ -5090,6 +5143,63 @@ mod tests {
             0,
             "an active leader drops takeover ticks"
         );
+    }
+
+    #[test]
+    fn raw_enabled_follower_takeover_runs_the_normal_accent_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = accent_window(&dir);
+        let source = PathBuf::from("/currently-applied.jpg");
+        let user = AccentSnapshot {
+            light: Some([10, 20, 30]),
+            dark: Some([40, 50, 60]),
+        };
+        accent::restore_accents(window.accent_handles.as_ref().unwrap(), user).unwrap();
+        window.leadership = Leadership::forced(true);
+        window.leader_readiness = LeaderReadiness::Hydrating;
+        window.initial_config_confirmation_pending = true;
+        window.accent_recompute_queued = true;
+
+        let config = AppletConfig {
+            accent_enabled: true,
+            accent_snapshot: None,
+            accent_last_written: None,
+            ..window.config.clone()
+        };
+        let duties = window.finish_leadership_hydration(
+            0,
+            0,
+            Ok(hydration(
+                config.clone(),
+                CoordinationConfig::default(),
+                wallpaper::CurrentWallpaper::File(source.clone()),
+            )),
+        );
+
+        assert!(window.is_active_leader());
+        assert!(
+            !window.initial_config_confirmation_pending,
+            "the fresh takeover read resolves the follower's startup gate"
+        );
+        assert!(!window.accent_recompute_queued);
+        assert!(window.config.accent_enabled);
+        assert_eq!(
+            window.config.accent_snapshot,
+            Some(user),
+            "takeover routes the follower's raw flag through normal enablement"
+        );
+        assert_eq!(window.config.accent_last_written, None);
+        assert_eq!(persisted_config(&window), window.config);
+        assert_eq!(
+            duties.units(),
+            3,
+            "timer, thumbnail pass, and accent recompute are armed"
+        );
+
+        let write = window.finish_accent_compute(source, Some(30.0));
+        assert_eq!(write.units(), 1, "accent completion is no longer deferred");
+        assert!(window.accent_inflight.is_some());
+        assert!(!window.accent_recompute_queued);
     }
 
     #[test]
@@ -13130,6 +13240,42 @@ source = "git+https://example.invalid/repo#abc""#;
         assert!(!window.config.accent_enabled);
         assert_eq!(window.config.accent_snapshot, Some(user), "snapshot kept");
         assert_eq!(window.config.accent_last_written, None);
+    }
+
+    #[test]
+    fn matching_raw_enabled_confirmation_runs_the_normal_enable_lifecycle() {
+        use cosmic_config::CosmicConfigEntry as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = accent_window(&dir);
+        window.initial_config_confirmation_pending = true;
+        let user = AccentSnapshot {
+            light: Some([10, 20, 30]),
+            dark: Some([40, 50, 60]),
+        };
+        accent::restore_accents(window.accent_handles.as_ref().unwrap(), user).unwrap();
+        window.config.accent_enabled = true;
+        window.config.accent_snapshot = None;
+        window.config.accent_last_written = None;
+        window
+            .config
+            .write_entry(window.config_context.as_ref().unwrap())
+            .unwrap();
+        window.config_confirmation_generation = 1;
+        let confirmed = window.config.clone();
+
+        let task = window.finish_config_confirmation(1, true, confirmed);
+
+        assert_eq!(task.units(), 0, "there is no current wallpaper to compute");
+        assert!(!window.initial_config_confirmation_pending);
+        assert!(window.config.accent_enabled);
+        assert_eq!(
+            window.config.accent_snapshot,
+            Some(user),
+            "the ordinary enable path captures the live user accents"
+        );
+        assert_eq!(window.config.accent_last_written, None);
+        assert_eq!(persisted_config(&window), window.config);
     }
 
     #[tokio::test]

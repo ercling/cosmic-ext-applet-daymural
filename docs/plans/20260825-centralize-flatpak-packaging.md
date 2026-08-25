@@ -96,6 +96,7 @@
 - [x] Add hermetic regression coverage for both recovery paths and rerun the repository and Flatpak validation gates.
 - [x] Reject a symlink at the ignored staged-manifest destination before atomic publication so local Flatpak recipes cannot overwrite its target.
 - [x] Defer every startup accent compute entry point until fresh config confirmation has repaired any independently defaulted lifecycle key.
+- [x] Resolve the startup confirmation gate from fresh takeover hydration, and route a confirmed matching raw enabled flag through the normal reversible enable lifecycle.
 
 ## Public Interfaces
 
