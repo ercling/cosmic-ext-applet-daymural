@@ -31,10 +31,10 @@ jobs:
           version: "0.12.1"
 
       - name: Test Git manifest traversal
-        run: python3 flatpak/test_git_manifest_scan.py
+        run: python3 packaging/flatpak/test_git_manifest_scan.py
 
       - name: Generate cargo-sources.json
-        run: flatpak/generate-cargo-sources.sh
+        run: packaging/flatpak/generate-cargo-sources.sh
 
       - name: Check Cargo.lock source coverage
         run: |
@@ -55,7 +55,7 @@ jobs:
 
           with open("Cargo.lock", "rb") as handle:
               packages = tomllib.load(handle)["package"]
-          with open("cargo-sources.json", encoding="utf-8") as handle:
+          with open("packaging/flatpak/cargo-sources.json", encoding="utf-8") as handle:
               generated = json.load(handle)
 
           archives = {entry.get("url") for entry in generated if entry.get("type") == "archive"}
@@ -80,7 +80,7 @@ jobs:
                       missing.append(source)
 
           if missing:
-              raise SystemExit("cargo-sources.json misses Cargo.lock entries:\n" + "\n".join(missing))
+              raise SystemExit("packaging/flatpak/cargo-sources.json misses Cargo.lock entries:\n" + "\n".join(missing))
           print(f"covered {sum('source' in package for package in packages)} Cargo.lock packages")
           PY
 
@@ -90,5 +90,5 @@ jobs:
       - name: Build and bundle the Flatpak
         uses: flatpak/flatpak-github-actions/flatpak-builder@401fe28a8384095fc1531b9d320b292f0ee45adb # v6
         with:
-          manifest-path: io.github.ercling.cosmic-applet-daymural.json
+          manifest-path: packaging/flatpak/io.github.ercling.cosmic-applet-daymural.json
           bundle: daymural.flatpak

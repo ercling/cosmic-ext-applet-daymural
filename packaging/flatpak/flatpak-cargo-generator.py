@@ -12,7 +12,7 @@
 #   repo:   https://github.com/flatpak/flatpak-builder-tools
 #   path:   cargo/flatpak-cargo-generator.py
 #   commit: f03a673abe6ce189cea1c2857e2b44af2dd79d1f
-# Run it via flatpak/generate-cargo-sources.sh (uv uses the adjacent lockfile).
+# Run it via packaging/flatpak/generate-cargo-sources.sh (uv uses the adjacent lockfile).
 
 __license__ = "MIT"
 import argparse

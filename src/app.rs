@@ -6417,7 +6417,8 @@ mod tests {
     const DESKTOP: &str = include_str!("../data/io.github.ercling.cosmic-applet-daymural.desktop");
     const METAINFO: &str =
         include_str!("../data/io.github.ercling.cosmic-applet-daymural.metainfo.xml");
-    const FLATPAK_MANIFEST: &str = include_str!("../io.github.ercling.cosmic-applet-daymural.json");
+    const FLATPAK_MANIFEST: &str =
+        include_str!("../packaging/flatpak/io.github.ercling.cosmic-applet-daymural.json");
     const JUSTFILE: &str = include_str!("../justfile");
     const README: &str = include_str!("../README.md");
     const SCREENSHOT_PROVENANCE: &str = include_str!("../resources/screenshots/README.md");
@@ -6426,14 +6427,20 @@ mod tests {
     const LEGACY_GUIDE: &str = include_str!("../CLAUDE.md");
     const ACTIVE_FLATPAK_PLAN: &str =
         include_str!("../docs/plans/20260820-flatpak-distribution.md");
-    const CARGO_SOURCES_SCRIPT: &str = include_str!("../flatpak/generate-cargo-sources.sh");
-    const CARGO_GENERATOR: &str = include_str!("../flatpak/flatpak-cargo-generator.py");
-    const GIT_MANIFEST_SCAN: &str = include_str!("../flatpak/git_manifest_scan.py");
-    const GIT_MANIFEST_SCAN_TEST: &str = include_str!("../flatpak/test_git_manifest_scan.py");
-    const CARGO_GENERATOR_LOCK: &str = include_str!("../flatpak/flatpak-cargo-generator.py.lock");
+    const CARGO_SOURCES_SCRIPT: &str =
+        include_str!("../packaging/flatpak/generate-cargo-sources.sh");
+    const CARGO_GENERATOR: &str = include_str!("../packaging/flatpak/flatpak-cargo-generator.py");
+    const GIT_MANIFEST_SCAN: &str = include_str!("../packaging/flatpak/git_manifest_scan.py");
+    const GIT_MANIFEST_SCAN_TEST: &str =
+        include_str!("../packaging/flatpak/test_git_manifest_scan.py");
+    const CARGO_GENERATOR_LOCK: &str =
+        include_str!("../packaging/flatpak/flatpak-cargo-generator.py.lock");
     const RUST_WORKFLOW: &str = include_str!("../.github/workflows/rust.yml");
     const FLATPAK_WORKFLOW: &str = include_str!("../.github/workflows/flatpak.yml");
-    const CARGO_SOURCES_FILENAME: &str = "cargo-sources.json";
+    const FLATPAK_MANIFEST_PATH: &str =
+        "packaging/flatpak/io.github.ercling.cosmic-applet-daymural.json";
+    const CARGO_SOURCES_MANIFEST_FILENAME: &str = "cargo-sources.json";
+    const CARGO_SOURCES_REPOSITORY_PATH: &str = "packaging/flatpak/cargo-sources.json";
     const CHECKOUT_ACTION: &str = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262";
     const RUST_TOOLCHAIN_ACTION: &str =
         "dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c";
@@ -6768,7 +6775,7 @@ mod tests {
         require(
             sources
                 .iter()
-                .any(|source| source.as_str() == Some(CARGO_SOURCES_FILENAME)),
+                .any(|source| source.as_str() == Some(CARGO_SOURCES_MANIFEST_FILENAME)),
             "generated Cargo source",
         )?;
         let directory = sources
@@ -6776,7 +6783,7 @@ mod tests {
             .find(|source| source["type"].as_str() == Some("dir"))
             .ok_or_else(|| "local directory source".to_owned())?;
         require(
-            directory["path"].as_str() == Some("./"),
+            directory["path"].as_str() == Some("../.."),
             "local source path",
         )?;
         let skip: Vec<&str> = directory["skip"]
@@ -6856,8 +6863,12 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         assert_eq!(
             FLATPAK_MANIFEST,
-            std::fs::read_to_string(root.join(format!("{APP_ID}.json")))
-                .expect("the repository root ships a manifest named for APP_ID")
+            std::fs::read_to_string(root.join(FLATPAK_MANIFEST_PATH))
+                .expect("the Flatpak packaging directory ships a manifest named for APP_ID")
+        );
+        assert!(
+            !root.join(format!("{APP_ID}.json")).exists(),
+            "the old repository-root manifest path must stay retired"
         );
         validate_flatpak_manifest(FLATPAK_MANIFEST, DESKTOP)
             .expect("the developer manifest must preserve the Flatpak contract");
@@ -7027,19 +7038,27 @@ mod tests {
             "missing-uv error must include an install hint",
         )?;
         require(
-            script.contains("flatpak/flatpak-cargo-generator.py"),
+            script.contains("$script_dir/flatpak-cargo-generator.py"),
             "vendoring script generator path",
+        )?;
+        require(
+            script.contains("script_dir=$(CDPATH= cd --")
+                && script.contains("repo_root=$(CDPATH= cd -- \"$script_dir/../..\"")
+                && script.contains("cd \"$repo_root\""),
+            "vendoring script must resolve its packaging directory and repository root",
         )?;
         require(
             script.contains("uv run --locked --script"),
             "vendoring script must enforce its script lockfile",
         )?;
         require(
-            script.contains(" Cargo.lock "),
+            script.contains("\"$repo_root/Cargo.lock\""),
             "vendoring script Cargo.lock input",
         )?;
         require(
-            script.contains(&format!("-o {CARGO_SOURCES_FILENAME}")),
+            script.contains(&format!(
+                "-o \"$script_dir/{CARGO_SOURCES_MANIFEST_FILENAME}\""
+            )),
             "vendoring output must match the manifest source name",
         )?;
 
@@ -7072,12 +7091,13 @@ mod tests {
                 &format!("{recipe} must use flatpak-builder-cmd"),
             )?;
             require(
-                body.contains("build-dir '{{appid}}.json'"),
+                body.contains("build-dir 'packaging/flatpak/{{appid}}.json'"),
                 &format!("{recipe} manifest path"),
             )?;
         }
         require(
-            just_recipe(justfile, "flatpak-sources").contains("flatpak/generate-cargo-sources.sh"),
+            just_recipe(justfile, "flatpak-sources")
+                .contains("packaging/flatpak/generate-cargo-sources.sh"),
             "flatpak-sources script path",
         )?;
         require(
@@ -7105,9 +7125,22 @@ mod tests {
             .expect("vendoring, manifest, and just recipes must agree");
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         assert!(
-            root.join("flatpak/flatpak-cargo-generator.py").is_file(),
+            root.join("packaging/flatpak/flatpak-cargo-generator.py")
+                .is_file(),
             "the wrapper's vendored generator must exist"
         );
+        for retired in [
+            format!("{APP_ID}.json"),
+            "flatpak/flatpak-cargo-generator.py".to_owned(),
+            "flatpak/generate-cargo-sources.sh".to_owned(),
+            "flatpak/git_manifest_scan.py".to_owned(),
+            "flatpak/test_git_manifest_scan.py".to_owned(),
+        ] {
+            assert!(
+                !root.join(&retired).exists(),
+                "old packaging path `{retired}` must stay retired"
+            );
+        }
         assert!(
             CARGO_GENERATOR.contains("https://github.com/flatpak/flatpak-builder-tools")
                 && CARGO_GENERATOR.contains("f03a673abe6ce189cea1c2857e2b44af2dd79d1f"),
@@ -7157,11 +7190,14 @@ mod tests {
     #[test]
     fn flatpak_tooling_checks_reject_path_and_offline_drift() {
         for script in [
-            CARGO_SOURCES_SCRIPT.replace(" Cargo.lock ", " Wrong.lock "),
-            CARGO_SOURCES_SCRIPT.replace("-o cargo-sources.json", "-o wrong.json"),
+            CARGO_SOURCES_SCRIPT.replace("$repo_root/Cargo.lock", "$repo_root/Wrong.lock"),
             CARGO_SOURCES_SCRIPT.replace(
-                "flatpak/flatpak-cargo-generator.py",
-                "flatpak/wrong-generator.py",
+                "$script_dir/cargo-sources.json",
+                "$repo_root/cargo-sources.json",
+            ),
+            CARGO_SOURCES_SCRIPT.replace(
+                "$script_dir/flatpak-cargo-generator.py",
+                "$repo_root/flatpak/flatpak-cargo-generator.py",
             ),
         ] {
             assert!(
@@ -7170,11 +7206,27 @@ mod tests {
             );
         }
 
-        let wrong_manifest_path = JUSTFILE.replace("'{{appid}}.json'", "'wrong.json'");
+        let wrong_manifest_path =
+            JUSTFILE.replace("'packaging/flatpak/{{appid}}.json'", "'{{appid}}.json'");
         assert!(
             validate_flatpak_tooling(FLATPAK_MANIFEST, CARGO_SOURCES_SCRIPT, &wrong_manifest_path,)
                 .is_err(),
             "recipes that build a different manifest unexpectedly passed"
+        );
+        let old_manifest_layout =
+            FLATPAK_MANIFEST.replace("\"path\": \"../..\"", "\"path\": \"./\"");
+        assert!(
+            validate_flatpak_tooling(&old_manifest_layout, CARGO_SOURCES_SCRIPT, JUSTFILE).is_err(),
+            "the old root-manifest source path unexpectedly passed"
+        );
+        let mixed_layout = JUSTFILE.replace(
+            "packaging/flatpak/generate-cargo-sources.sh",
+            "flatpak/generate-cargo-sources.sh",
+        );
+        assert!(
+            validate_flatpak_tooling(FLATPAK_MANIFEST, CARGO_SOURCES_SCRIPT, &mixed_layout)
+                .is_err(),
+            "mixed old/new packaging paths unexpectedly passed"
         );
         let no_offline_guard = JUSTFILE.replace(" --disable-download", "");
         assert!(
@@ -7188,8 +7240,8 @@ mod tests {
             "a vendoring wrapper that ignores its lockfile unexpectedly passed"
         );
         let unshared_build = JUSTFILE.replacen(
-            "{{flatpak-builder-cmd}} build-dir '{{appid}}.json'",
-            "flatpak-builder build-dir '{{appid}}.json'",
+            "{{flatpak-builder-cmd}} build-dir 'packaging/flatpak/{{appid}}.json'",
+            "flatpak-builder build-dir 'packaging/flatpak/{{appid}}.json'",
             1,
         );
         assert!(
@@ -7200,11 +7252,57 @@ mod tests {
     }
 
     #[test]
+    fn cargo_sources_script_resolves_paths_from_an_arbitrary_working_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir(&bin_dir).unwrap();
+        std::os::unix::fs::symlink("/usr/bin/dirname", bin_dir.join("dirname")).unwrap();
+        let uv = bin_dir.join("uv");
+        std::fs::write(
+            &uv,
+            b"#!/bin/sh\n{ pwd; printf '%s\\n' \"$@\"; } > \"$CAPTURE\"\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&uv).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&uv, permissions).unwrap();
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let script = root.join("packaging/flatpak/generate-cargo-sources.sh");
+        let capture = dir.path().join("uv-invocation");
+        let caller_dir = dir.path().join("caller");
+        std::fs::create_dir(&caller_dir).unwrap();
+        let output = std::process::Command::new("/bin/sh")
+            .arg(script)
+            .current_dir(&caller_dir)
+            .env_clear()
+            .env("PATH", &bin_dir)
+            .env("CAPTURE", &capture)
+            .output()
+            .expect("the vendoring wrapper must run with a fake uv");
+        assert!(
+            output.status.success(),
+            "wrapper failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let invocation = std::fs::read_to_string(capture).unwrap();
+        let expected = format!(
+            "{}\nrun\n--locked\n--script\n{}/packaging/flatpak/flatpak-cargo-generator.py\n{}/Cargo.lock\n-o\n{}/packaging/flatpak/cargo-sources.json\n",
+            root.display(),
+            root.display(),
+            root.display(),
+            root.display()
+        );
+        assert_eq!(invocation, expected);
+    }
+
+    #[test]
     fn cargo_sources_script_reports_a_missing_uv_with_an_install_hint() {
         let dir = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink("/usr/bin/dirname", dir.path().join("dirname")).unwrap();
-        let script =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("flatpak/generate-cargo-sources.sh");
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("packaging/flatpak/generate-cargo-sources.sh");
         let output = std::process::Command::new("/bin/sh")
             .arg(script)
             .env_clear()
@@ -7313,11 +7411,11 @@ mod tests {
             "flatpak.yml checkout must be commit-pinned without persisted credentials",
         )?;
         for required in [
-            format!("manifest-path: {APP_ID}.json"),
-            "flatpak/generate-cargo-sources.sh".to_owned(),
-            "python3 flatpak/test_git_manifest_scan.py".to_owned(),
+            format!("manifest-path: {FLATPAK_MANIFEST_PATH}"),
+            "packaging/flatpak/generate-cargo-sources.sh".to_owned(),
+            "python3 packaging/flatpak/test_git_manifest_scan.py".to_owned(),
             "Cargo.lock".to_owned(),
-            CARGO_SOURCES_FILENAME.to_owned(),
+            CARGO_SOURCES_REPOSITORY_PATH.to_owned(),
             "astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b".to_owned(),
             "version: \"0.12.1\"".to_owned(),
             "appstreamcli validate --pedantic --explain --strict --no-net --override cid-contains-uppercase-letter=error data/io.github.ercling.cosmic-applet-daymural.metainfo.xml".to_owned(),
@@ -7348,14 +7446,36 @@ mod tests {
         );
 
         let no_generation = FLATPAK_WORKFLOW.replace(
-            "run: flatpak/generate-cargo-sources.sh",
-            "# run: flatpak/generate-cargo-sources.sh",
+            "run: packaging/flatpak/generate-cargo-sources.sh",
+            "# run: packaging/flatpak/generate-cargo-sources.sh",
         );
         assert!(
             validate_ci_workflows(RUST_WORKFLOW, &no_generation, FLATPAK_MANIFEST, JUSTFILE)
                 .is_err(),
             "a commented-out source generation step unexpectedly passed"
         );
+        for old_or_wrong_path in [
+            FLATPAK_WORKFLOW.replace(
+                "python3 packaging/flatpak/test_git_manifest_scan.py",
+                "python3 flatpak/test_git_manifest_scan.py",
+            ),
+            FLATPAK_WORKFLOW.replace(
+                "manifest-path: packaging/flatpak/io.github.ercling.cosmic-applet-daymural.json",
+                "manifest-path: io.github.ercling.cosmic-applet-daymural.json",
+            ),
+            FLATPAK_WORKFLOW.replace("packaging/flatpak/cargo-sources.json", "cargo-sources.json"),
+        ] {
+            assert!(
+                validate_ci_workflows(
+                    RUST_WORKFLOW,
+                    &old_or_wrong_path,
+                    FLATPAK_MANIFEST,
+                    JUSTFILE
+                )
+                .is_err(),
+                "an old or wrong CI packaging path unexpectedly passed"
+            );
+        }
 
         for insecure_workflow in [
             FLATPAK_WORKFLOW.replace(
@@ -7577,6 +7697,7 @@ mod tests {
         }
         collect_files(&root.join("data"), &mut files)?;
         collect_files(&root.join("i18n"), &mut files)?;
+        collect_files(&root.join("packaging"), &mut files)?;
         Ok(files)
     }
 
@@ -7595,7 +7716,7 @@ mod tests {
         let inventory = identity_inventory(root).expect("repository identity inventory");
         assert!(!inventory_has_legacy_identity(&inventory));
         for expected in [
-            "io.github.ercling.cosmic-applet-daymural.json",
+            "packaging/flatpak/io.github.ercling.cosmic-applet-daymural.json",
             "data/io.github.ercling.cosmic-applet-daymural.desktop",
             "data/icons/io.github.ercling.cosmic-applet-daymural-symbolic.svg",
             "i18n/en/daymural.ftl",

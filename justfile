@@ -42,7 +42,7 @@ uninstall:
 # Generate the Cargo dependency sources consumed by the offline Flatpak build.
 # Requires `uv`; cargo-sources.json is deliberately gitignored.
 flatpak-sources:
-    flatpak/generate-cargo-sources.sh
+    packaging/flatpak/generate-cargo-sources.sh
 
 # All local Flatpak build modes share this invocation so cache, remote, and
 # force-clean behavior cannot drift between recipes. Flags follow the `build`
@@ -54,17 +54,17 @@ flatpak-builder-cmd := 'flatpak-builder --ccache --delete-build-dirs --force-cle
 # Fetch the runtime, SDK, and every manifest source into Flatpak's retained
 # download cache without compiling the applet.
 flatpak-prefetch:
-    {{flatpak-builder-cmd}} --download-only build-dir '{{appid}}.json'
+    {{flatpak-builder-cmd}} --download-only build-dir 'packaging/flatpak/{{appid}}.json'
 
 flatpak-build:
-    {{flatpak-builder-cmd}} build-dir '{{appid}}.json'
+    {{flatpak-builder-cmd}} build-dir 'packaging/flatpak/{{appid}}.json'
 
 # Prove the retained cache is complete: this build is forbidden from fetching.
 flatpak-build-offline:
-    {{flatpak-builder-cmd}} --disable-download build-dir '{{appid}}.json'
+    {{flatpak-builder-cmd}} --disable-download build-dir 'packaging/flatpak/{{appid}}.json'
 
 flatpak-install:
-    {{flatpak-builder-cmd}} --install build-dir '{{appid}}.json'
+    {{flatpak-builder-cmd}} --install build-dir 'packaging/flatpak/{{appid}}.json'
 
 flatpak-uninstall:
     flatpak uninstall -y --user '{{appid}}'

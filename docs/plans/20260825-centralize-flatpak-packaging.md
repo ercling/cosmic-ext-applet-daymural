@@ -53,18 +53,18 @@
 - Move: tracked files under `flatpak/` to `packaging/flatpak/`
 - Modify: relocated manifest and `generate-cargo-sources.sh`, `.gitignore`, `justfile`, `.github/workflows/flatpak.yml`, `src/app.rs`
 
-- [ ] Move only tracked packaging sources; leave existing ignored root `cargo-sources.json`, Python caches, `.flatpak-builder/`, and `build-dir/` untouched.
-- [ ] Change the manifest's directory source from `./` to `../..`, retaining the adjacent `"cargo-sources.json"` entry and all build, identity, and sandbox fields.
-- [ ] Make the wrapper derive an absolute script directory and repository root, read root `Cargo.lock`, invoke the adjacent pinned generator, and write adjacent `cargo-sources.json`.
-- [ ] Ignore `packaging/flatpak/cargo-sources.json` and its Python cache. Retain legacy ignores so existing generated files do not surface as unrelated changes.
-- [ ] Point every `just flatpak-*` builder recipe at `packaging/flatpak/<app-id>.json` and `flatpak-sources` at the relocated wrapper; preserve recipe names, the shared builder command, and root build directories.
-- [ ] Update CI's scanner command, generator command, generated-file validation path, and builder action manifest path without changing triggers, permissions, action/image pins, AppStream validation, or bundle identity.
-- [ ] Update all packaging `include_str!` paths, filesystem assertions, helper invocations, workflow expectations, and deliberate path-drift mutations in `src/app.rs`. Represent the manifest-local filename and repository-relative generated-file path separately.
-- [ ] Add a hermetic success test that invokes the wrapper from a `TempDir` with a fake `uv`, then asserts its working directory and arguments identify root `Cargo.lock`, the adjacent generator, and the adjacent output without network or real-user access.
-- [ ] Preserve the hermetic missing-`uv` failure test and the existing scanner tests for `.git` exclusion and directory-symlink exclusion.
-- [ ] Add or update negative contract cases rejecting the old root manifest, old `flatpak/` paths, mixed old/new layouts, and a wrong generated-output path.
-- [ ] Run `python3 packaging/flatpak/test_git_manifest_scan.py`.
-- [ ] Run focused Rust gates: `cargo test flatpak`, `cargo test cargo_sources_script`, and `cargo test ci_workflow` with the repository's required `PKG_CONFIG_PATH`; all must pass before Task 2.
+- [x] Move only tracked packaging sources; leave existing ignored root `cargo-sources.json`, Python caches, `.flatpak-builder/`, and `build-dir/` untouched.
+- [x] Change the manifest's directory source from `./` to `../..`, retaining the adjacent `"cargo-sources.json"` entry and all build, identity, and sandbox fields.
+- [x] Make the wrapper derive an absolute script directory and repository root, read root `Cargo.lock`, invoke the adjacent pinned generator, and write adjacent `cargo-sources.json`.
+- [x] Ignore `packaging/flatpak/cargo-sources.json` and its Python cache. Retain legacy ignores so existing generated files do not surface as unrelated changes.
+- [x] Point every `just flatpak-*` builder recipe at `packaging/flatpak/<app-id>.json` and `flatpak-sources` at the relocated wrapper; preserve recipe names, the shared builder command, and root build directories.
+- [x] Update CI's scanner command, generator command, generated-file validation path, and builder action manifest path without changing triggers, permissions, action/image pins, AppStream validation, or bundle identity.
+- [x] Update all packaging `include_str!` paths, filesystem assertions, helper invocations, workflow expectations, and deliberate path-drift mutations in `src/app.rs`. Represent the manifest-local filename and repository-relative generated-file path separately.
+- [x] Add a hermetic success test that invokes the wrapper from a `TempDir` with a fake `uv`, then asserts its working directory and arguments identify root `Cargo.lock`, the adjacent generator, and the adjacent output without network or real-user access.
+- [x] Preserve the hermetic missing-`uv` failure test and the existing scanner tests for `.git` exclusion and directory-symlink exclusion.
+- [x] Add or update negative contract cases rejecting the old root manifest, old `flatpak/` paths, mixed old/new layouts, and a wrong generated-output path.
+- [x] Run `python3 packaging/flatpak/test_git_manifest_scan.py`.
+- [x] Run focused Rust gates: `cargo test flatpak`, `cargo test cargo_sources_script`, and `cargo test ci_workflow` with the repository's required `PKG_CONFIG_PATH`; all must pass before Task 2.
 
 ### Task 2: Synchronize documentation and run the repository gate
 

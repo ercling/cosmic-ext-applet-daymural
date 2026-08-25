@@ -6,11 +6,14 @@
 # PEP-723 dependencies, which uv resolves reproducibly.
 set -eu
 
-cd "$(dirname "$0")/.."
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(CDPATH= cd -- "$script_dir/../.." && pwd)
+cd "$repo_root"
 
 if ! command -v uv >/dev/null 2>&1; then
     echo "error: 'uv' not found; install it from https://docs.astral.sh/uv/ or your package manager, then re-run" >&2
     exit 1
 fi
 
-exec uv run --locked --script flatpak/flatpak-cargo-generator.py Cargo.lock -o cargo-sources.json
+exec uv run --locked --script "$script_dir/flatpak-cargo-generator.py" \
+    "$repo_root/Cargo.lock" -o "$script_dir/cargo-sources.json"
