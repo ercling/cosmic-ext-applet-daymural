@@ -243,10 +243,11 @@ pub struct Window {
     /// watcher payloads.
     config_confirmation_generation: u64,
     /// One-shot provenance for the settings daemon's initial full config
-    /// confirmation. While pending, a confirmed complete enabled lifecycle
-    /// may replace a per-key partial startup load; any local accent transition
-    /// consumes the opportunity so a delayed pre-transition read cannot
-    /// resurrect state that was subsequently disarmed.
+    /// confirmation. While pending, accent computation is deferred and a
+    /// confirmed complete enabled lifecycle may replace a per-key partial
+    /// startup load; any local accent transition consumes the opportunity so
+    /// a delayed pre-transition read cannot resurrect state that was
+    /// subsequently disarmed.
     initial_config_confirmation_pending: bool,
     /// Injectable state root used by asynchronous accent extraction. In
     /// production this is [`state_dir`]; tests point it at a tempdir so task
@@ -360,9 +361,10 @@ pub struct Window {
     /// taken *before* its own persists and compared against the flight's
     /// spawn-time baseline ([`Self::accent_disk_enabled_at_spawn`]).
     accent_inflight: Option<AccentInflight>,
-    /// An accent result arrived while a theme task was in flight and was
-    /// dropped; the completion handler re-arms a fresh compute for the
-    /// then-current wallpaper.
+    /// Accent work was requested before initial config confirmation, or a
+    /// result arrived while a theme task was in flight and was dropped. The
+    /// confirmation/adoption path or task completion re-arms a fresh compute
+    /// for the then-current wallpaper.
     accent_recompute_queued: bool,
     /// A toggle requested while a theme task was in flight (rendered by the
     /// popup's toggler; also pinned onto the disk config so the completion's
@@ -1509,10 +1511,15 @@ impl Window {
         let pristine_in_memory_accent_lifecycle = !self.config.accent_enabled
             && self.config.accent_snapshot.is_none()
             && self.config.accent_last_written.is_none();
+        let confirmed_same_accent_lifecycle = config.accent_enabled == self.config.accent_enabled
+            && config.accent_snapshot == self.config.accent_snapshot
+            && config.accent_last_written == self.config.accent_last_written;
         let adopt_persisted_accent_lifecycle = initial_config_confirmation
             && self.accent_inflight.is_none()
             && config.accent_snapshot.is_some()
-            && (confirmed_enabled_accent_lifecycle || pristine_in_memory_accent_lifecycle);
+            && (confirmed_enabled_accent_lifecycle
+                || pristine_in_memory_accent_lifecycle
+                || confirmed_same_accent_lifecycle);
         let accent_flip = if self.accent_inflight.is_some() || confirmed_enabled_accent_lifecycle {
             None
         } else {
@@ -1533,6 +1540,7 @@ impl Window {
         }
         if adopt_persisted_accent_lifecycle {
             self.initial_config_confirmation_pending = false;
+            self.accent_recompute_queued = false;
             if self.config.accent_enabled {
                 tasks.push(self.accent_compute_for_current());
             }
@@ -2643,9 +2651,17 @@ impl Window {
     /// wallpaper, or the startup-restored current). Gated on the setting and
     /// on usable theme handles; finishes in [`Message::AccentComputed`],
     /// whose handler re-checks everything against live state.
-    fn start_accent_compute(&self, source: PathBuf) -> app::Task<Message> {
+    fn start_accent_compute(&mut self, source: PathBuf) -> app::Task<Message> {
         if !self.is_active_leader() || !self.config.accent_enabled || self.accent_handles.is_none()
         {
+            return Task::none();
+        }
+        if self.initial_config_confirmation_pending {
+            // `AppletConfig::load` degrades individual keys independently. Do
+            // not let a compute snapshot our already-written theme colours
+            // while a fresh confirmation can still restore the missing
+            // lifecycle key and its original user snapshot.
+            self.accent_recompute_queued = true;
             return Task::none();
         }
         let state_dir = self.accent_state_dir.clone();
@@ -2665,6 +2681,13 @@ impl Window {
     /// builder accents (read fresh here, right before the plan).
     fn finish_accent_compute(&mut self, source: PathBuf, hue: Option<f32>) -> app::Task<Message> {
         if !self.is_active_leader() {
+            return Task::none();
+        }
+        if self.initial_config_confirmation_pending {
+            // A task armed from the construction-time partial load may finish
+            // after the deferral rule became active. Keep its answer out of
+            // the lifecycle until the fresh disk confirmation is authoritative.
+            self.accent_recompute_queued = true;
             return Task::none();
         }
         if self.current.as_deref() != Some(source.as_path()) {
@@ -3077,7 +3100,10 @@ impl Window {
     /// toggler to render, pinned onto the disk config, and routed through
     /// this same dispatcher by the completion's fresh-disk-read reconcile.
     fn set_accent_enabled(&mut self, enabled: bool) -> app::Task<Message> {
-        self.initial_config_confirmation_pending = false;
+        if self.initial_config_confirmation_pending {
+            self.initial_config_confirmation_pending = false;
+            self.accent_recompute_queued = false;
+        }
         if !self.is_active_leader() {
             return self.set_non_leader_accent_enabled(enabled);
         }
@@ -3311,7 +3337,7 @@ impl Window {
     /// The accent recompute for the tracked current wallpaper, or nothing
     /// when none is tracked. (Gating on the setting and the handles happens
     /// inside [`Window::start_accent_compute`].)
-    fn accent_compute_for_current(&self) -> app::Task<Message> {
+    fn accent_compute_for_current(&mut self) -> app::Task<Message> {
         match self.current.clone() {
             Some(current) => self.start_accent_compute(current),
             None => Task::none(),
@@ -7191,8 +7217,10 @@ mod tests {
                 && FLATPAK_STAGE_SCRIPT.contains(
                     "sources[sources.index(\"cargo-sources.json\")] = \"packaging/flatpak/cargo-sources.json\"",
                 )
+                && FLATPAK_STAGE_SCRIPT.contains("destination.lstat()")
+                && FLATPAK_STAGE_SCRIPT.contains("stat.S_ISLNK")
                 && FLATPAK_STAGE_SCRIPT.contains("os.replace(temporary_name, destination)"),
-            "the local-build staging script must rewrite only source paths and publish atomically"
+            "the local-build staging script must rewrite only source paths and publish atomically without following a destination symlink"
         );
         assert!(
             CARGO_GENERATOR.contains("aiohttp==3.12.15")
@@ -7336,6 +7364,30 @@ mod tests {
         let actual: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(staged).unwrap()).unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn flatpak_build_manifest_rejects_a_symlink_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("outside.json");
+        let original = b"user-owned data\n";
+        std::fs::write(&target, original).unwrap();
+        let staged = dir.path().join(FLATPAK_BUILD_MANIFEST_PATH);
+        std::os::unix::fs::symlink(&target, &staged).unwrap();
+
+        let status = std::process::Command::new("python3")
+            .arg(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("packaging/flatpak/stage-build-manifest.py"),
+            )
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(FLATPAK_MANIFEST_PATH))
+            .arg(&staged)
+            .status()
+            .unwrap();
+
+        assert!(!status.success());
+        assert_eq!(std::fs::read(&target).unwrap(), original);
+        assert!(staged.symlink_metadata().unwrap().file_type().is_symlink());
     }
 
     #[test]
@@ -13267,6 +13319,73 @@ source = "git+https://example.invalid/repo#abc""#;
         }
     }
 
+    #[test]
+    fn startup_compute_waits_for_missing_snapshot_confirmation() {
+        use cosmic::Application as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = accent_window(&dir);
+        window.initial_config_confirmation_pending = true;
+        let source = PathBuf::from("/images/20260808-Foo_ROW1_UHD.jpg");
+        window.current = Some(source.clone());
+        let user = AccentSnapshot {
+            light: Some([10, 20, 30]),
+            dark: Some([40, 50, 60]),
+        };
+        let ours = AccentPair {
+            light: [70, 80, 90],
+            dark: [100, 110, 120],
+        };
+        window.config.accent_enabled = true;
+        window.config.accent_snapshot = None;
+        window.config.accent_last_written = Some(ours);
+        accent::restore_accents(
+            window.accent_handles.as_ref().unwrap(),
+            AccentSnapshot {
+                light: Some(ours.light),
+                dark: Some(ours.dark),
+            },
+        )
+        .unwrap();
+
+        let startup = window.accent_compute_for_current();
+        assert_eq!(startup.units(), 0, "startup compute is deferred");
+        assert!(window.accent_recompute_queued);
+
+        // Even an already-produced completion cannot enter the write path
+        // before confirmation repairs the independently defaulted snapshot.
+        let premature = window.update(Message::AccentComputed {
+            source,
+            hue: Some(30.0),
+        });
+        assert_eq!(premature.units(), 0);
+        assert!(window.accent_inflight.is_none());
+        assert_eq!(window.config.accent_snapshot, None);
+        assert_eq!(
+            current_accents(&window),
+            (Some(ours.light), Some(ours.dark))
+        );
+
+        let confirmed = AppletConfig {
+            accent_enabled: true,
+            accent_snapshot: Some(user),
+            accent_last_written: Some(ours),
+            ..window.config.clone()
+        };
+        window.config_confirmation_generation = 1;
+        let task = window.finish_config_confirmation(1, true, confirmed);
+
+        assert_eq!(task.units(), 1, "confirmation arms the deferred compute");
+        assert!(!window.initial_config_confirmation_pending);
+        assert!(!window.accent_recompute_queued);
+        assert_eq!(window.config.accent_snapshot, Some(user));
+        assert_eq!(window.config.accent_last_written, Some(ours));
+        assert_eq!(
+            current_accents(&window),
+            (Some(ours.light), Some(ours.dark))
+        );
+    }
+
     #[tokio::test]
     async fn initial_confirmation_adopts_write_record_crash_state() {
         use cosmic_config::CosmicConfigEntry as _;
@@ -13364,7 +13483,9 @@ source = "git+https://example.invalid/repo#abc""#;
 
         let dir = tempfile::tempdir().unwrap();
         let mut window = accent_window(&dir);
-        window.initial_config_confirmation_pending = true;
+        // The initial confirmation already allowed computation; the captured
+        // entry below is a now-stale read that completed after disarm.
+        window.initial_config_confirmation_pending = false;
         let source = PathBuf::from("/imgs/20260808-Foo_ROW1_UHD.jpg");
         window.current = Some(source.clone());
         let user = AccentSnapshot {
@@ -13395,7 +13516,7 @@ source = "git+https://example.invalid/repo#abc""#;
 
         // This full entry was read before the local disarm but completed
         // afterwards. Its recorded lifecycle is not a raw external enable,
-        // and the one startup adoption opportunity has been invalidated.
+        // and initial startup adoption has already finished.
         window.config_confirmation_generation = 1;
         let task = window.finish_config_confirmation(1, true, delayed);
         assert_eq!(task.units(), 0);

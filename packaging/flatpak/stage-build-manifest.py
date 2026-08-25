@@ -9,11 +9,24 @@ local builds use this root-level generated view with root-relative sources.
 import json
 import os
 import pathlib
+import stat
 import sys
 import tempfile
 
 
 def stage(source: pathlib.Path, destination: pathlib.Path) -> None:
+    # Resolve only the parent. Resolving the complete destination would follow
+    # an existing generated-manifest symlink and make os.replace publish over
+    # its target rather than over the lexical destination entry.
+    destination = destination.parent.resolve() / destination.name
+    try:
+        destination_mode = destination.lstat().st_mode
+    except FileNotFoundError:
+        pass
+    else:
+        if stat.S_ISLNK(destination_mode):
+            raise ValueError("staged manifest destination must not be a symlink")
+
     manifest = json.loads(source.read_text(encoding="utf-8"))
     sources = manifest["modules"][0]["sources"]
 
@@ -46,4 +59,4 @@ def stage(source: pathlib.Path, destination: pathlib.Path) -> None:
 if __name__ == "__main__":
     if len(sys.argv) != 3:
         raise SystemExit(f"usage: {sys.argv[0]} CANONICAL_MANIFEST STAGED_MANIFEST")
-    stage(pathlib.Path(sys.argv[1]).resolve(), pathlib.Path(sys.argv[2]).resolve())
+    stage(pathlib.Path(sys.argv[1]).resolve(), pathlib.Path(sys.argv[2]))

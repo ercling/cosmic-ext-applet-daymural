@@ -470,7 +470,8 @@ do not duplicate `appstreamcli` or desktop-file syntax validation in Rust.
     task), and the plan's builders travel into the task — no re-read TOCTOU.
   - **Write guard** (`accent_inflight` + generation counter, stale
     completions ignored): at most one theme task ever runs, and while one
-    does (a) `AccentComputed` results are dropped-and-rearmed
+    does (a) startup computation waits for the fresh initial config
+    confirmation, and `AccentComputed` results are dropped-and-rearmed
     (`accent_recompute_queued`), (b) no `ConfigUpdated` flip is routed, and
     (c) toggles are recorded (`accent_flip_requested`, rendered by the
     toggler via `accent_toggler_state`, pinned to disk raw).

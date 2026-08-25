@@ -94,6 +94,8 @@
 - [x] Let a complete initial accent lifecycle repair any independently defaulted accent key before startup confirmation, preserving disable-time restoration.
 - [x] Restore `flatpak-builder --sandbox` for every local build recipe by atomically staging a root-relative manifest view from the canonical `packaging/flatpak/` manifest.
 - [x] Add hermetic regression coverage for both recovery paths and rerun the repository and Flatpak validation gates.
+- [x] Reject a symlink at the ignored staged-manifest destination before atomic publication so local Flatpak recipes cannot overwrite its target.
+- [x] Defer every startup accent compute entry point until fresh config confirmation has repaired any independently defaulted lifecycle key.
 
 ## Public Interfaces
 
