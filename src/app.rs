@@ -248,6 +248,10 @@ pub struct Window {
     /// transition consumes the opportunity so a delayed pre-transition read
     /// cannot resurrect state that was subsequently disarmed.
     initial_config_confirmation_pending: bool,
+    /// Injectable state root used by asynchronous accent extraction. In
+    /// production this is [`state_dir`]; tests point it at a tempdir so task
+    /// delivery never reads a real user's thumbnail cache.
+    accent_state_dir: PathBuf,
     /// Injectable directory containing the short-lived coordination lock.
     /// Production uses [`state_dir`]; tests always provide a tempdir.
     coordination_state_dir: PathBuf,
@@ -1482,29 +1486,31 @@ impl Window {
             return Task::none();
         }
 
-        let initial_config_confirmation =
-            std::mem::take(&mut self.initial_config_confirmation_pending);
+        let initial_config_confirmation = self.initial_config_confirmation_pending;
         let confirmed_enabled_accent_lifecycle = config.accent_enabled
             && config.accent_snapshot.is_some()
             && config.accent_last_written.is_some();
         // A just-started process can receive the settings daemon's initial
         // snapshot after constructing from defaults. When that fresh disk
-        // entry already carries a completed enabled lifecycle, treating the
+        // entry already carries an enabled lifecycle, treating the
         // `false -> true` difference as a new toggle would snapshot our own
         // theme accents and clear the don't-clobber record before startup
-        // reconciliation can inspect it. Adopt that lifecycle only from the
-        // pristine in-memory shape; a genuine raw external enable has no
-        // `last_written` and must still run the normal enable lifecycle.
+        // reconciliation can inspect it. A snapshot is the durable proof
+        // that enablement already began; `last_written` may legitimately be
+        // absent after a crash between the theme write and its record.
+        // Adopt only from the pristine in-memory shape; a genuine raw
+        // external enable has no snapshot and must still run the normal
+        // enable lifecycle. An unrelated/default confirmation does not
+        // consume this one startup opportunity because the daemon may
+        // deliver the enabled lifecycle in a later confirmation.
         let adopt_enabled_accent_lifecycle = initial_config_confirmation
             && self.accent_inflight.is_none()
             && !self.config.accent_enabled
             && self.config.accent_snapshot.is_none()
             && self.config.accent_last_written.is_none()
-            && confirmed_enabled_accent_lifecycle;
-        let accent_flip = if self.accent_inflight.is_some()
-            || adopt_enabled_accent_lifecycle
-            || confirmed_enabled_accent_lifecycle
-        {
+            && config.accent_enabled
+            && config.accent_snapshot.is_some();
+        let accent_flip = if self.accent_inflight.is_some() || confirmed_enabled_accent_lifecycle {
             None
         } else {
             (config.accent_enabled != self.config.accent_enabled).then_some(config.accent_enabled)
@@ -1523,6 +1529,7 @@ impl Window {
             tasks.push(self.sync_shuffle(true));
         }
         if adopt_enabled_accent_lifecycle {
+            self.initial_config_confirmation_pending = false;
             tasks.push(self.accent_compute_for_current());
         } else if let Some(enabled) = accent_flip {
             tasks.push(self.set_accent_enabled(enabled));
@@ -2636,8 +2643,9 @@ impl Window {
         {
             return Task::none();
         }
+        let state_dir = self.accent_state_dir.clone();
         cosmic::task::future(async move {
-            match extract_accent_hue(&source, state_dir()).await {
+            match extract_accent_hue(&source, &state_dir).await {
                 Some(hue) => cosmic::Action::App(Message::AccentComputed { source, hue }),
                 // Failure paths (no thumbnail, decode error) change nothing:
                 // they were logged in the task and produce no message.
@@ -4054,6 +4062,7 @@ impl cosmic::Application for Window {
             setting_write_inflight: false,
             config_confirmation_generation: 0,
             initial_config_confirmation_pending: true,
+            accent_state_dir: state_dir().to_path_buf(),
             coordination_state_dir: state_dir().to_path_buf(),
             peer_refresh_request: None,
             peer_refresh_covered,
@@ -6523,13 +6532,17 @@ mod tests {
     }
 
     fn active_workflow_step_containing(workflow: &str, needle: &str) -> bool {
+        active_workflow_step_index(workflow, needle).is_some()
+    }
+
+    fn active_workflow_step_index(workflow: &str, needle: &str) -> Option<usize> {
         let workflow = sans_comments(workflow);
         let lines: Vec<&str> = workflow.lines().collect();
         lines
             .iter()
             .enumerate()
             .filter(|(_, line)| line.starts_with("      - "))
-            .any(|(start, _)| {
+            .find_map(|(start, _)| {
                 let end = lines[start + 1..]
                     .iter()
                     .position(|line| line.starts_with("      - "))
@@ -6543,7 +6556,7 @@ mod tests {
                         )
                     })
                 });
-                !disabled && step.iter().any(|line| line.contains(needle))
+                (!disabled && step.iter().any(|line| line.contains(needle))).then_some(start)
             })
     }
 
@@ -7070,6 +7083,10 @@ mod tests {
             just_var(justfile, "appid") == manifest["id"].as_str(),
             "justfile appid must match the manifest id",
         )?;
+        require(
+            just_var(justfile, "flatpak-manifest") == Some(FLATPAK_MANIFEST_PATH),
+            "shared flatpak manifest path",
+        )?;
         let builder = just_var(justfile, "flatpak-builder-cmd")
             .ok_or_else(|| "shared flatpak-builder-cmd".to_owned())?;
         require(
@@ -7092,8 +7109,8 @@ mod tests {
                 &format!("{recipe} must use flatpak-builder-cmd"),
             )?;
             require(
-                body.contains("build-dir 'packaging/flatpak/{{appid}}.json'"),
-                &format!("{recipe} manifest path"),
+                body.contains("build-dir '{{flatpak-manifest}}'"),
+                &format!("{recipe} must use flatpak-manifest"),
             )?;
         }
         require(
@@ -7207,8 +7224,10 @@ mod tests {
             );
         }
 
-        let wrong_manifest_path =
-            JUSTFILE.replace("'packaging/flatpak/{{appid}}.json'", "'{{appid}}.json'");
+        let wrong_manifest_path = JUSTFILE.replace(
+            "flatpak-manifest := 'packaging/flatpak/io.github.ercling.cosmic-applet-daymural.json'",
+            "flatpak-manifest := 'io.github.ercling.cosmic-applet-daymural.json'",
+        );
         assert!(
             validate_flatpak_tooling(FLATPAK_MANIFEST, CARGO_SOURCES_SCRIPT, &wrong_manifest_path,)
                 .is_err(),
@@ -7254,8 +7273,8 @@ mod tests {
             "a vendoring wrapper that ignores its lockfile unexpectedly passed"
         );
         let unshared_build = JUSTFILE.replacen(
-            "{{flatpak-builder-cmd}} build-dir 'packaging/flatpak/{{appid}}.json'",
-            "flatpak-builder build-dir 'packaging/flatpak/{{appid}}.json'",
+            "{{flatpak-builder-cmd}} build-dir '{{flatpak-manifest}}'",
+            "flatpak-builder build-dir '{{flatpak-manifest}}'",
             1,
         );
         assert!(
@@ -7441,6 +7460,20 @@ mod tests {
                 &format!("flatpak.yml missing `{required}`"),
             )?;
         }
+        let generation =
+            active_workflow_step_index(&flatpak, "packaging/flatpak/generate-cargo-sources.sh")
+                .ok_or_else(|| "flatpak.yml missing source generation step".to_owned())?;
+        for (needle, label) in [
+            ("Cargo.lock", "Cargo.lock source coverage"),
+            (FLATPAK_BUILDER_ACTION, "Flatpak build"),
+        ] {
+            let consumer = active_workflow_step_index(&flatpak, needle)
+                .ok_or_else(|| format!("flatpak.yml missing {label} step"))?;
+            require(
+                generation < consumer,
+                &format!("flatpak.yml must generate Cargo sources before {label}"),
+            )?;
+        }
         Ok(())
     }
 
@@ -7467,6 +7500,24 @@ mod tests {
             validate_ci_workflows(RUST_WORKFLOW, &no_generation, FLATPAK_MANIFEST, JUSTFILE)
                 .is_err(),
             "a commented-out source generation step unexpectedly passed"
+        );
+        let generation_step = concat!(
+            "      - name: Generate cargo-sources.json\n",
+            "        run: packaging/flatpak/generate-cargo-sources.sh\n\n",
+        );
+        let reordered_generation = format!(
+            "{}\n{generation_step}",
+            FLATPAK_WORKFLOW.replace(generation_step, "")
+        );
+        assert!(
+            validate_ci_workflows(
+                RUST_WORKFLOW,
+                &reordered_generation,
+                FLATPAK_MANIFEST,
+                JUSTFILE
+            )
+            .is_err(),
+            "source generation after coverage and build unexpectedly passed"
         );
         for old_or_wrong_path in [
             FLATPAK_WORKFLOW.replace(
@@ -11729,6 +11780,7 @@ source = "git+https://example.invalid/repo#abc""#;
 
         let mut window = Window {
             accent_handles: Some(accent::ThemeHandles::sandboxed(dir.path()).unwrap()),
+            accent_state_dir: dir.path().join("state"),
             config_context: Some(
                 cosmic_config::Config::with_custom_path(
                     APP_ID,
@@ -12974,16 +13026,21 @@ source = "git+https://example.invalid/repo#abc""#;
         assert_eq!(window.config.accent_last_written, None);
     }
 
-    #[test]
-    fn initial_confirmation_adopts_an_enabled_lifecycle_before_recompute() {
-        use cosmic::Application as _;
+    #[tokio::test]
+    async fn initial_confirmation_adopts_an_enabled_lifecycle_before_recompute() {
         use cosmic_config::CosmicConfigEntry as _;
 
         let dir = tempfile::tempdir().unwrap();
         let mut window = accent_window(&dir);
         start_disabled(&mut window);
         window.initial_config_confirmation_pending = true;
-        let source = PathBuf::from("/imgs/20260808-Foo_ROW1_UHD.jpg");
+        let images = dir.path().join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        let source = images.join("20260808-Foo_ROW1_UHD.jpg");
+        image::RgbImage::from_pixel(64, 36, image::Rgb([200, 30, 40]))
+            .save(&source)
+            .unwrap();
+        thumbs::ensure_thumbnail(&source, &window.accent_state_dir).unwrap();
         window.current = Some(source.clone());
 
         let user = AccentSnapshot {
@@ -13024,16 +13081,104 @@ source = "git+https://example.invalid/repo#abc""#;
         assert_eq!(window.config.accent_last_written, Some(ours));
         assert_eq!(current_accents(&window), (picked.light, picked.dark));
 
-        // The queued normal recompute compares the live builders with the
+        // Deliver the actual cached-thumbnail extraction returned by startup
+        // adoption. Its normal recompute compares the live builders with the
         // adopted record and disarms without replacing the external choice.
-        drop(window.update(Message::AccentComputed {
-            source,
-            hue: Some(30.0),
-        }));
+        deliver_app_task(&mut window, task).await;
         assert!(!window.config.accent_enabled);
         assert_eq!(window.config.accent_snapshot, None);
         assert_eq!(window.config.accent_last_written, None);
         assert_eq!(current_accents(&window), (picked.light, picked.dark));
+        assert_eq!(persisted_config(&window), window.config);
+    }
+
+    #[tokio::test]
+    async fn unrelated_confirmation_does_not_consume_startup_accent_adoption() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = accent_window(&dir);
+        start_disabled(&mut window);
+        window.initial_config_confirmation_pending = true;
+
+        let mut unrelated = window.config.clone();
+        unrelated.retention_days = 30;
+        window.config_confirmation_generation = 1;
+        drop(window.finish_config_confirmation(1, true, unrelated));
+        assert!(window.initial_config_confirmation_pending);
+        assert_eq!(window.config.retention_days, 30);
+
+        let source = dir.path().join("images/20260808-Foo_ROW1_UHD.jpg");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        image::RgbImage::from_pixel(64, 36, image::Rgb([200, 30, 40]))
+            .save(&source)
+            .unwrap();
+        thumbs::ensure_thumbnail(&source, &window.accent_state_dir).unwrap();
+        window.current = Some(source);
+        let user = AccentSnapshot {
+            light: Some([10, 20, 30]),
+            dark: Some([40, 50, 60]),
+        };
+        let ours = AccentPair {
+            light: [70, 80, 90],
+            dark: [100, 110, 120],
+        };
+        let mut enabled = window.config.clone();
+        enabled.accent_enabled = true;
+        enabled.accent_snapshot = Some(user);
+        enabled.accent_last_written = Some(ours);
+        window.config_confirmation_generation = 2;
+        let task = window.finish_config_confirmation(2, true, enabled);
+
+        assert!(!window.initial_config_confirmation_pending);
+        assert!(window.config.accent_enabled);
+        assert_eq!(window.config.accent_snapshot, Some(user));
+        assert_eq!(window.config.accent_last_written, Some(ours));
+        assert_eq!(task.units(), 1);
+    }
+
+    #[tokio::test]
+    async fn initial_confirmation_adopts_write_record_crash_state() {
+        use cosmic_config::CosmicConfigEntry as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = accent_window(&dir);
+        start_disabled(&mut window);
+        window.initial_config_confirmation_pending = true;
+        let source = dir.path().join("images/20260808-Foo_ROW1_UHD.jpg");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        image::RgbImage::from_pixel(64, 36, image::Rgb([200, 30, 40]))
+            .save(&source)
+            .unwrap();
+        thumbs::ensure_thumbnail(&source, &window.accent_state_dir).unwrap();
+        window.current = Some(source);
+
+        let user = AccentSnapshot {
+            light: Some([10, 20, 30]),
+            dark: Some([40, 50, 60]),
+        };
+        let ours = AccentSnapshot {
+            light: Some([70, 80, 90]),
+            dark: Some([100, 110, 120]),
+        };
+        accent::restore_accents(window.accent_handles.as_ref().unwrap(), ours).unwrap();
+        let mut crashed = window.config.clone();
+        crashed.accent_enabled = true;
+        crashed.accent_snapshot = Some(user);
+        crashed.accent_last_written = None;
+        crashed
+            .write_entry(window.config_context.as_ref().unwrap())
+            .unwrap();
+        window.config_confirmation_generation = 1;
+
+        let task = window.finish_config_confirmation(1, true, crashed);
+        assert!(window.config.accent_enabled);
+        assert_eq!(window.config.accent_snapshot, Some(user));
+        assert_eq!(window.config.accent_last_written, None);
+        deliver_app_task(&mut window, task).await;
+
+        assert!(!window.config.accent_enabled, "ambiguous gap disarms");
+        assert_eq!(window.config.accent_snapshot, Some(user), "snapshot kept");
+        assert_eq!(window.config.accent_last_written, None);
+        assert_eq!(current_accents(&window), (ours.light, ours.dark));
         assert_eq!(persisted_config(&window), window.config);
     }
 

@@ -8,7 +8,7 @@
 
 ## Context
 
-- **Current layout:** the manifest is at the repository root, tooling is under `flatpak/`, and generated `cargo-sources.json` is at the root. `justfile`, `.github/workflows/flatpak.yml`, and compile-time tests in `src/app.rs` embed those paths.
+- **Pre-change layout (before 2026-08-25):** the manifest was at the repository root, tooling was under `flatpak/`, and generated `cargo-sources.json` was at the root. `justfile`, `.github/workflows/flatpak.yml`, and compile-time tests in `src/app.rs` embedded those paths.
 - **Target layout:** the manifest and tracked tooling move together under `packaging/flatpak/`; future source generation writes `packaging/flatpak/cargo-sources.json` beside the manifest.
 - **Path model:** the manifest resolves its repository source through `../..`; the wrapper resolves both its own directory and the repository root, so it remains callable from any working directory. Flatpak Builder's optional `--sandbox` command flag cannot be used with that outside-manifest-directory source; ordinary module builds remain sandboxed.
 - **Constraints:** this is a path-only refactor. Add no dependencies, do not alter runtime behavior or sandbox permissions, and do not run the applet.
