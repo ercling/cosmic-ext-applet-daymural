@@ -10,7 +10,7 @@
 
 - **Pre-change layout (before 2026-08-25):** the manifest was at the repository root, tooling was under `flatpak/`, and generated `cargo-sources.json` was at the root. `justfile`, `.github/workflows/flatpak.yml`, and compile-time tests in `src/app.rs` embedded those paths.
 - **Target layout:** the manifest and tracked tooling move together under `packaging/flatpak/`; future source generation writes `packaging/flatpak/cargo-sources.json` beside the manifest.
-- **Path model:** the manifest resolves its repository source through `../..`; the wrapper resolves both its own directory and the repository root, so it remains callable from any working directory. Flatpak Builder's optional `--sandbox` command flag cannot be used with that outside-manifest-directory source; ordinary module builds remain sandboxed.
+- **Path model:** the canonical manifest resolves its repository source through `../..`; the vendoring wrapper resolves both its own directory and the repository root, so it remains callable from any working directory. Local recipes generate an ignored root-level manifest view whose two source paths are root-relative, allowing Flatpak Builder's `--sandbox` hardening to remain enforced without duplicating the canonical manifest.
 - **Constraints:** this is a path-only refactor. Add no dependencies, do not alter runtime behavior or sandbox permissions, and do not run the applet.
 
 ## Development Approach
@@ -88,6 +88,12 @@
 - [x] Inspect `git status` and confirm generated artifacts remain ignored and no unrelated files changed.
 - [x] Mark this plan complete (archive deferred to the orchestrator; plan intentionally left in place).
 
+### Review corrections
+
+- [x] Preserve a disabled persisted accent snapshot during initial config confirmation so a later enable can retry the deferred restore without replacing the user's original accents.
+- [x] Restore `flatpak-builder --sandbox` for every local build recipe by atomically staging a root-relative manifest view from the canonical `packaging/flatpak/` manifest.
+- [x] Add hermetic regression coverage for both recovery paths and rerun the repository and Flatpak validation gates.
+
 ## Public Interfaces
 
 - No Rust API, configuration schema, application behavior, or user-facing command changes.
@@ -97,6 +103,7 @@
 
 - Existing ignored root packaging artifacts may remain locally but are inert and are not deleted by this refactor.
 - Root `.flatpak-builder/` and `build-dir/` locations remain unchanged.
+- The ignored root `.daymural-flatpak-manifest.json` is generated for local builds only; the canonical source and direct-consumer interface remain under `packaging/flatpak/`.
 - The selected code-then-tests approach is intentional; the atomic first task prevents an unbuildable handoff between tasks.
 - No live COSMIC panel test is required because application behavior and the sandbox contract do not change.
 

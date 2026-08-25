@@ -1,6 +1,7 @@
 name := 'daymural'
 appid := 'io.github.ercling.cosmic-applet-daymural'
 flatpak-manifest := 'packaging/flatpak/io.github.ercling.cosmic-applet-daymural.json'
+flatpak-build-manifest := '.daymural-flatpak-manifest.json'
 
 # Default to a per-user install (no sudo needed); override with e.g.
 # `just prefix=/usr/local install` or `just rootdir=$PKGDIR prefix=/usr install`.
@@ -49,24 +50,30 @@ flatpak-sources:
 # force-clean behavior cannot drift between recipes. Flags follow the `build`
 # target of pop-os/cosmic-flatpak's justfile (ccache and delete-build-dirs)
 # minus its repo/GPG handling, which only applies to their OSTree publishing.
-# Do not add flatpak-builder's --sandbox flag: that flag forbids the relocated
-# manifest's local ../.. directory source. Module builds remain sandboxed.
-flatpak-builder-cmd := 'flatpak-builder --ccache --delete-build-dirs --force-clean --install-deps-from=flathub --user'
+# --sandbox prevents manifest build-args from weakening module isolation. A
+# generated root-level view makes the canonical manifest's sources available
+# without granting access outside the staged manifest directory.
+flatpak-builder-cmd := 'flatpak-builder --ccache --delete-build-dirs --force-clean --install-deps-from=flathub --sandbox --user'
+flatpak-stage-manifest-cmd := 'python3 packaging/flatpak/stage-build-manifest.py packaging/flatpak/io.github.ercling.cosmic-applet-daymural.json .daymural-flatpak-manifest.json'
 
 # Fetch the runtime, SDK, and every manifest source into Flatpak's retained
 # download cache without compiling the applet.
 flatpak-prefetch:
-    {{flatpak-builder-cmd}} --download-only build-dir '{{flatpak-manifest}}'
+    {{flatpak-stage-manifest-cmd}}
+    {{flatpak-builder-cmd}} --download-only build-dir '{{flatpak-build-manifest}}'
 
 flatpak-build:
-    {{flatpak-builder-cmd}} build-dir '{{flatpak-manifest}}'
+    {{flatpak-stage-manifest-cmd}}
+    {{flatpak-builder-cmd}} build-dir '{{flatpak-build-manifest}}'
 
 # Prove the retained cache is complete: this build is forbidden from fetching.
 flatpak-build-offline:
-    {{flatpak-builder-cmd}} --disable-download build-dir '{{flatpak-manifest}}'
+    {{flatpak-stage-manifest-cmd}}
+    {{flatpak-builder-cmd}} --disable-download build-dir '{{flatpak-build-manifest}}'
 
 flatpak-install:
-    {{flatpak-builder-cmd}} --install build-dir '{{flatpak-manifest}}'
+    {{flatpak-stage-manifest-cmd}}
+    {{flatpak-builder-cmd}} --install build-dir '{{flatpak-build-manifest}}'
 
 flatpak-uninstall:
     flatpak uninstall -y --user '{{appid}}'

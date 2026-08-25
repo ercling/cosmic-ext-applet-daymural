@@ -62,7 +62,10 @@ Freedesktop 25.08 sandbox contract grants only the wallpaper directory, COSMIC
 config/state, Settings Daemon notifications, logind, Wayland/DRI, and network.
 The same `packaging/flatpak/` directory holds the pinned upstream Cargo source
 generator, its `uv` wrapper, and helper tests; `packaging/flatpak/cargo-sources.json`
-is generated and ignored. `.github/workflows/rust.yml` runs the native checks
+is generated and ignored. Local `just flatpak-*` builds also atomically generate
+an ignored root `.daymural-flatpak-manifest.json` whose sources are root-relative,
+preserving Flatpak Builder's `--sandbox` guard while the canonical manifest stays
+under `packaging/flatpak/`. `.github/workflows/rust.yml` runs the native checks
 without generated sources, while
 `.github/workflows/flatpak.yml` generates them and emits the Flatpak bundle.
 

@@ -1492,30 +1492,29 @@ impl Window {
             && config.accent_last_written.is_some();
         // A just-started process can receive the settings daemon's initial
         // snapshot after constructing from defaults. When that fresh disk
-        // entry already carries an enabled lifecycle, treating the
-        // `false -> true` difference as a new toggle would snapshot our own
-        // theme accents and clear the don't-clobber record before startup
-        // reconciliation can inspect it. A snapshot is the durable proof
-        // that enablement already began; `last_written` may legitimately be
-        // absent after a crash between the theme write and its record.
+        // entry already carries a lifecycle snapshot, treating a later
+        // `false -> true` difference as a fresh toggle could snapshot our own
+        // theme accents and clear the don't-clobber record. A disabled entry
+        // can legitimately retain its snapshot after a failed restore, and
+        // `last_written` may be absent after a crash between a theme write and
+        // its record. Adopt either recovery shape before handling new toggles.
         // Adopt only from the pristine in-memory shape; a genuine raw
         // external enable has no snapshot and must still run the normal
         // enable lifecycle. An unrelated/default confirmation does not
         // consume this one startup opportunity because the daemon may
         // deliver the enabled lifecycle in a later confirmation.
-        let adopt_enabled_accent_lifecycle = initial_config_confirmation
+        let adopt_persisted_accent_lifecycle = initial_config_confirmation
             && self.accent_inflight.is_none()
             && !self.config.accent_enabled
             && self.config.accent_snapshot.is_none()
             && self.config.accent_last_written.is_none()
-            && config.accent_enabled
             && config.accent_snapshot.is_some();
         let accent_flip = if self.accent_inflight.is_some() || confirmed_enabled_accent_lifecycle {
             None
         } else {
             (config.accent_enabled != self.config.accent_enabled).then_some(config.accent_enabled)
         };
-        if !adopt_enabled_accent_lifecycle {
+        if !adopt_persisted_accent_lifecycle {
             config.accent_enabled = self.config.accent_enabled;
             config.accent_snapshot = self.config.accent_snapshot;
             config.accent_last_written = self.config.accent_last_written;
@@ -1528,9 +1527,11 @@ impl Window {
         if shuffle_changed {
             tasks.push(self.sync_shuffle(true));
         }
-        if adopt_enabled_accent_lifecycle {
+        if adopt_persisted_accent_lifecycle {
             self.initial_config_confirmation_pending = false;
-            tasks.push(self.accent_compute_for_current());
+            if self.config.accent_enabled {
+                tasks.push(self.accent_compute_for_current());
+            }
         } else if let Some(enabled) = accent_flip {
             tasks.push(self.set_accent_enabled(enabled));
         }
@@ -6438,6 +6439,7 @@ mod tests {
         include_str!("../docs/plans/20260820-flatpak-distribution.md");
     const CARGO_SOURCES_SCRIPT: &str =
         include_str!("../packaging/flatpak/generate-cargo-sources.sh");
+    const FLATPAK_STAGE_SCRIPT: &str = include_str!("../packaging/flatpak/stage-build-manifest.py");
     const CARGO_GENERATOR: &str = include_str!("../packaging/flatpak/flatpak-cargo-generator.py");
     const GIT_MANIFEST_SCAN: &str = include_str!("../packaging/flatpak/git_manifest_scan.py");
     const GIT_MANIFEST_SCAN_TEST: &str =
@@ -6448,6 +6450,7 @@ mod tests {
     const FLATPAK_WORKFLOW: &str = include_str!("../.github/workflows/flatpak.yml");
     const FLATPAK_MANIFEST_PATH: &str =
         "packaging/flatpak/io.github.ercling.cosmic-applet-daymural.json";
+    const FLATPAK_BUILD_MANIFEST_PATH: &str = ".daymural-flatpak-manifest.json";
     const CARGO_SOURCES_MANIFEST_FILENAME: &str = "cargo-sources.json";
     const CARGO_SOURCES_REPOSITORY_PATH: &str = "packaging/flatpak/cargo-sources.json";
     const CHECKOUT_ACTION: &str = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262";
@@ -7087,6 +7090,10 @@ mod tests {
             just_var(justfile, "flatpak-manifest") == Some(FLATPAK_MANIFEST_PATH),
             "shared flatpak manifest path",
         )?;
+        require(
+            just_var(justfile, "flatpak-build-manifest") == Some(FLATPAK_BUILD_MANIFEST_PATH),
+            "shared staged Flatpak manifest path",
+        )?;
         let builder = just_var(justfile, "flatpak-builder-cmd")
             .ok_or_else(|| "shared flatpak-builder-cmd".to_owned())?;
         require(
@@ -7094,8 +7101,15 @@ mod tests {
                 && builder.contains("--user")
                 && builder.contains("--install-deps-from=flathub")
                 && builder.contains("--force-clean")
-                && !builder.contains("--sandbox"),
+                && builder.contains("--sandbox"),
             "shared flatpak-builder invocation",
+        )?;
+        require(
+            just_var(justfile, "flatpak-stage-manifest-cmd")
+                == Some(
+                    "python3 packaging/flatpak/stage-build-manifest.py packaging/flatpak/io.github.ercling.cosmic-applet-daymural.json .daymural-flatpak-manifest.json",
+                ),
+            "shared root-manifest staging command",
         )?;
         for recipe in [
             "flatpak-prefetch",
@@ -7109,8 +7123,12 @@ mod tests {
                 &format!("{recipe} must use flatpak-builder-cmd"),
             )?;
             require(
-                body.contains("build-dir '{{flatpak-manifest}}'"),
-                &format!("{recipe} must use flatpak-manifest"),
+                body.contains("{{flatpak-stage-manifest-cmd}}"),
+                &format!("{recipe} must stage the canonical manifest"),
+            )?;
+            require(
+                body.contains("build-dir '{{flatpak-build-manifest}}'"),
+                &format!("{recipe} must use the root-relative staged manifest"),
             )?;
         }
         require(
@@ -7163,6 +7181,14 @@ mod tests {
             CARGO_GENERATOR.contains("https://github.com/flatpak/flatpak-builder-tools")
                 && CARGO_GENERATOR.contains("f03a673abe6ce189cea1c2857e2b44af2dd79d1f"),
             "the vendored generator must document its exact upstream commit"
+        );
+        assert!(
+            FLATPAK_STAGE_SCRIPT.contains("directory[\"path\"] = \".\"")
+                && FLATPAK_STAGE_SCRIPT.contains(
+                    "sources[sources.index(\"cargo-sources.json\")] = \"packaging/flatpak/cargo-sources.json\"",
+                )
+                && FLATPAK_STAGE_SCRIPT.contains("os.replace(temporary_name, destination)"),
+            "the local-build staging script must rewrite only source paths and publish atomically"
         );
         assert!(
             CARGO_GENERATOR.contains("aiohttp==3.12.15")
@@ -7254,18 +7280,11 @@ mod tests {
                 .is_err(),
             "an offline recipe without --disable-download unexpectedly passed"
         );
-        let incompatible_source_sandbox = JUSTFILE.replace(
-            "--install-deps-from=flathub --user",
-            "--install-deps-from=flathub --sandbox --user",
-        );
+        let weakened_builder = JUSTFILE.replace(" --sandbox", "");
         assert!(
-            validate_flatpak_tooling(
-                FLATPAK_MANIFEST,
-                CARGO_SOURCES_SCRIPT,
-                &incompatible_source_sandbox,
-            )
-            .is_err(),
-            "--sandbox cannot read the relocated manifest's ../.. directory source"
+            validate_flatpak_tooling(FLATPAK_MANIFEST, CARGO_SOURCES_SCRIPT, &weakened_builder,)
+                .is_err(),
+            "local Flatpak builds without --sandbox unexpectedly passed"
         );
         let unlocked_script = CARGO_SOURCES_SCRIPT.replace(" run --locked", " run");
         assert!(
@@ -7273,8 +7292,8 @@ mod tests {
             "a vendoring wrapper that ignores its lockfile unexpectedly passed"
         );
         let unshared_build = JUSTFILE.replacen(
-            "{{flatpak-builder-cmd}} build-dir '{{flatpak-manifest}}'",
-            "flatpak-builder build-dir '{{flatpak-manifest}}'",
+            "{{flatpak-builder-cmd}} build-dir '{{flatpak-build-manifest}}'",
+            "flatpak-builder build-dir '{{flatpak-build-manifest}}'",
             1,
         );
         assert!(
@@ -7282,6 +7301,37 @@ mod tests {
                 .is_err(),
             "a Flatpak recipe bypassing the shared builder command unexpectedly passed"
         );
+    }
+
+    #[test]
+    fn flatpak_build_manifest_is_staged_root_relative_without_contract_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join(FLATPAK_BUILD_MANIFEST_PATH);
+        let status = std::process::Command::new("python3")
+            .arg(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("packaging/flatpak/stage-build-manifest.py"),
+            )
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(FLATPAK_MANIFEST_PATH))
+            .arg(&staged)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let canonical: serde_json::Value = serde_json::from_str(FLATPAK_MANIFEST).unwrap();
+        let mut expected = canonical.clone();
+        let sources = expected["modules"][0]["sources"].as_array_mut().unwrap();
+        sources
+            .iter_mut()
+            .find(|source| source["type"].as_str() == Some("dir"))
+            .unwrap()["path"] = serde_json::Value::String(".".to_owned());
+        *sources
+            .iter_mut()
+            .find(|source| source.as_str() == Some(CARGO_SOURCES_MANIFEST_FILENAME))
+            .unwrap() = serde_json::Value::String(CARGO_SOURCES_REPOSITORY_PATH.to_owned());
+        let actual: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(staged).unwrap()).unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -13179,6 +13229,50 @@ source = "git+https://example.invalid/repo#abc""#;
         assert_eq!(window.config.accent_snapshot, Some(user), "snapshot kept");
         assert_eq!(window.config.accent_last_written, None);
         assert_eq!(current_accents(&window), (ours.light, ours.dark));
+        assert_eq!(persisted_config(&window), window.config);
+    }
+
+    #[test]
+    fn initial_confirmation_preserves_disabled_restore_recovery_for_reenable() {
+        use cosmic::Application as _;
+        use cosmic_config::CosmicConfigEntry as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = accent_window(&dir);
+        start_disabled(&mut window);
+        window.initial_config_confirmation_pending = true;
+
+        let user = AccentSnapshot {
+            light: Some([10, 20, 30]),
+            dark: Some([40, 50, 60]),
+        };
+        let ours = AccentSnapshot {
+            light: Some([70, 80, 90]),
+            dark: Some([100, 110, 120]),
+        };
+        accent::restore_accents(window.accent_handles.as_ref().unwrap(), ours).unwrap();
+        let mut failed_restore = window.config.clone();
+        failed_restore.accent_enabled = false;
+        failed_restore.accent_snapshot = Some(user);
+        failed_restore.accent_last_written = None;
+        failed_restore
+            .write_entry(window.config_context.as_ref().unwrap())
+            .unwrap();
+        window.config_confirmation_generation = 1;
+
+        let task = window.finish_config_confirmation(1, true, failed_restore);
+        assert_eq!(task.units(), 0, "disabled recovery must not recompute");
+        assert!(!window.initial_config_confirmation_pending);
+        assert!(!window.config.accent_enabled);
+        assert_eq!(window.config.accent_snapshot, Some(user));
+        assert_eq!(current_accents(&window), (ours.light, ours.dark));
+
+        drop(window.update(Message::SetAccentEnabled(true)));
+        settle_accent_tasks(&mut window);
+        assert!(window.config.accent_enabled);
+        assert_eq!(window.config.accent_snapshot, Some(user));
+        assert_eq!(window.config.accent_last_written, None);
+        assert_eq!(current_accents(&window), (user.light, user.dark));
         assert_eq!(persisted_config(&window), window.config);
     }
 

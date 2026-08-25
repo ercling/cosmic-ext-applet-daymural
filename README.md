@@ -213,6 +213,10 @@ Generate the offline Cargo sources before building. The recipes use
 gitignored `packaging/flatpak/cargo-sources.json` beside it, and retain the root
 `build-dir` cache:
 
+Local build recipes stage an ignored root-relative manifest view and invoke
+Flatpak Builder with `--sandbox`, so manifest build arguments cannot weaken the
+build sandbox.
+
 ```bash
 just flatpak-sources        # generate packaging/flatpak/cargo-sources.json with uv
 just flatpak-prefetch       # fetch the runtime, SDK, and declared sources

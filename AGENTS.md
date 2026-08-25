@@ -80,8 +80,9 @@ needed.
 - `data/`: desktop entry and app-ID icon installed by both packaging routes,
   plus AppStream metainfo installed by Flatpak packaging.
 - `packaging/flatpak/`: developer manifest and authoritative scoped sandbox
-  contract, pinned Cargo source generator and its `uv` wrapper, helper tests,
-  and the deliberately ignored generated `cargo-sources.json`.
+  contract, pinned Cargo source generator and its `uv` wrapper, root-relative
+  local-build manifest staging helper, helper tests, and the deliberately
+  ignored generated `cargo-sources.json`.
 - `.github/workflows/`: native Rust checks and the Freedesktop 25.08 Flatpak
   build/bundle job.
 - `tests/fixtures/`: hermetic external-data fixtures.
