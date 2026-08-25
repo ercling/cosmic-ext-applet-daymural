@@ -337,11 +337,9 @@ Post-Completion; that warning is accepted.
 - Modify as needed: `README.md`
 - Modify as needed: `docs/plans/20260820-flatpak-distribution.md`
 
-- [ ] precondition: native copy uninstalled (`just uninstall`); Flatpak is the only install
-      (not yet run; requires an intentional live COSMIC acceptance session)
-- [ ] install the built Flatpak intentionally in a live COSMIC session; confirm Panel discovers
+- [x] precondition: native copy uninstalled (`just uninstall`); Flatpak is the only install
+- [x] install the built Flatpak intentionally in a live COSMIC session; confirm Panel discovers
       it and the exported desktop command starts `/app/bin/daymural`
-      (not yet run)
 - [ ] confirm the panel button, prev/next/newest/refresh, and empty-catalogue placeholder icons
       all render (host passthrough); if not, apply the bundling contingency
       (not yet run)
@@ -357,12 +355,35 @@ Post-Completion; that warning is accepted.
       cosmic-bg state poke lands as a **changed value**; greeter healing is best-effort here
       (GDM is this machine's DM); treat a missing poke as release-blocking
       (not yet run)
-- [ ] audit `flatpak info --show-permissions`, `flatpak run --log-session-bus`, filesystem access,
+- [x] audit `flatpak info --show-permissions`, `flatpak run --log-session-bus`, filesystem access,
       and `flatpak run --log-system-bus`; reject denied required calls or unexpected services,
       reading flatpak's auto-added read-only filesystems as expected
-      (not yet run)
 - [ ] record results and any verified channel differences; every live gate must pass before
       Task 7
+
+Task 6 partial live acceptance (2026-08-25, COSMIC Wayland session 2): `just uninstall`
+removed the Daymural native files, and the legacy `CosmicBingWallpaper` Flatpak was also
+uninstalled so the new Flatpak is the sole installed identity. The retained panel entry was
+changed from the legacy app ID to the new app ID (the non-interactive equivalent of re-adding
+the applet) and `cosmic-panel` was restarted. It launched one Daymural Flatpak instance per
+active output; `flatpak enter` showed PID 2 in each observed instance was
+`/app/bin/daymural`, matching the exported `Exec=daymural`.
+
+An intentional debug launch rebuilt the Flatpak-private catalogue from eight retained JPEGs,
+resolved Bing metadata to the exact `~/Pictures/BingWallpaper` paths, and generated all eight
+private thumbnails plus source-identity sidecars. This proves refresh metadata, shared-folder
+access, retained-image catalogue rebuilding, and thumbnail generation, but does not by itself
+prove the combined browsing/shuffle/retention/application/`xdg-open` checkbox, which remains
+open for attended interaction. The session-bus audit showed only COSMIC Settings Daemon and
+default portal traffic; the system-bus audit showed the expected failed
+`GetSessionByPID(PID 2)` followed by successful `GetSession(XDG_SESSION_ID)` and a connected
+login1 watch. Filesystem inspection confirmed the exact wallpaper mount and cosmic state mount
+are writable, app state is private, broad home paths are absent, and Flatpak's automatically
+added GTK config mount is read-only. `flatpak info --show-permissions` matched the manifest and
+showed no unexpected service. No denied required call appeared. Lock/resume signals and the
+changed-value state poke were not triggered, so that gate remains open. Icon rendering,
+interactive controls, both `xdg-open` actions, live theme changes, and accent state-machine
+behavior were not visually exercised and remain release blockers.
 
 ### Task 7: Final acceptance and plan state
 
