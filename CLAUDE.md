@@ -488,7 +488,10 @@ do not duplicate `appstreamcli` or desktop-file syntax validation in Rust.
     memory. This is an already-armed lifecycle, not a new external enable.
     A confirmed matching raw enable (`true` with neither lifecycle record) is
     instead routed through the normal leader enable path so the live user
-    accents are snapshotted before computation. Only the one-shot initial
+    accents are snapshotted before computation. A pure three-way startup
+    classifier (`Preserve | AdoptPersisted | InitializeRawEnable`) owns this
+    distinction and is shared by watcher confirmation and takeover hydration.
+    Only the one-shot initial
     confirmation may make either decision, and any local toggle or non-skip
     accent action consumes that opportunity so a delayed pre-disarm read
     cannot resurrect the lifecycle. Adoption immediately recomputes so the

@@ -54,25 +54,23 @@ flatpak-sources:
 # generated root-level view makes the canonical manifest's sources available
 # without granting access outside the staged manifest directory.
 flatpak-builder-cmd := 'flatpak-builder --ccache --delete-build-dirs --force-clean --install-deps-from=flathub --sandbox --user'
-flatpak-stage-manifest-cmd := 'python3 packaging/flatpak/stage-build-manifest.py packaging/flatpak/io.github.ercling.cosmic-applet-daymural.json .daymural-flatpak-manifest.json'
+
+_flatpak-stage-manifest:
+    python3 packaging/flatpak/stage-build-manifest.py '{{flatpak-manifest}}' '{{flatpak-build-manifest}}'
 
 # Fetch the runtime, SDK, and every manifest source into Flatpak's retained
 # download cache without compiling the applet.
-flatpak-prefetch:
-    {{flatpak-stage-manifest-cmd}}
+flatpak-prefetch: _flatpak-stage-manifest
     {{flatpak-builder-cmd}} --download-only build-dir '{{flatpak-build-manifest}}'
 
-flatpak-build:
-    {{flatpak-stage-manifest-cmd}}
+flatpak-build: _flatpak-stage-manifest
     {{flatpak-builder-cmd}} build-dir '{{flatpak-build-manifest}}'
 
 # Prove the retained cache is complete: this build is forbidden from fetching.
-flatpak-build-offline:
-    {{flatpak-stage-manifest-cmd}}
+flatpak-build-offline: _flatpak-stage-manifest
     {{flatpak-builder-cmd}} --disable-download build-dir '{{flatpak-build-manifest}}'
 
-flatpak-install:
-    {{flatpak-stage-manifest-cmd}}
+flatpak-install: _flatpak-stage-manifest
     {{flatpak-builder-cmd}} --install build-dir '{{flatpak-build-manifest}}'
 
 flatpak-uninstall:

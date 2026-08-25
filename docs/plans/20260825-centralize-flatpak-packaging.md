@@ -97,6 +97,8 @@
 - [x] Reject a symlink at the ignored staged-manifest destination before atomic publication so local Flatpak recipes cannot overwrite its target.
 - [x] Defer every startup accent compute entry point until fresh config confirmation has repaired any independently defaulted lifecycle key.
 - [x] Resolve the startup confirmation gate from fresh takeover hydration, and route a confirmed matching raw enabled flag through the normal reversible enable lifecycle.
+- [x] Centralize startup accent recovery in a table-tested pure classifier shared by config confirmation and takeover hydration.
+- [x] Make local manifest staging consume the shared canonical and staged manifest path variables directly.
 
 ## Public Interfaces
 

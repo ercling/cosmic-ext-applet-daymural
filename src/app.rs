@@ -412,6 +412,57 @@ enum LeaderReadiness {
     Hydrating,
 }
 
+/// How a fresh, startup-era config snapshot should affect the in-memory
+/// accent lifecycle. Keeping this policy pure makes the watcher-confirmation
+/// and follower-takeover paths agree on which persisted shapes are lifecycle
+/// state and which one is an uninitialized enable request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupAccentRecovery {
+    Preserve,
+    AdoptPersisted,
+    InitializeRawEnable,
+}
+
+fn complete_enabled_accent_lifecycle(config: &AppletConfig) -> bool {
+    config.accent_enabled
+        && config.accent_snapshot.is_some()
+        && config.accent_last_written.is_some()
+}
+
+fn startup_accent_recovery(
+    confirmation_pending: bool,
+    accent_inflight: bool,
+    current: &AppletConfig,
+    confirmed: &AppletConfig,
+) -> StartupAccentRecovery {
+    if !confirmation_pending || accent_inflight {
+        return StartupAccentRecovery::Preserve;
+    }
+
+    let same_lifecycle = confirmed.accent_enabled == current.accent_enabled
+        && confirmed.accent_snapshot == current.accent_snapshot
+        && confirmed.accent_last_written == current.accent_last_written;
+    if same_lifecycle
+        && confirmed.accent_enabled
+        && confirmed.accent_snapshot.is_none()
+        && confirmed.accent_last_written.is_none()
+    {
+        return StartupAccentRecovery::InitializeRawEnable;
+    }
+
+    let complete_enabled_lifecycle = complete_enabled_accent_lifecycle(confirmed);
+    let pristine_current = !current.accent_enabled
+        && current.accent_snapshot.is_none()
+        && current.accent_last_written.is_none();
+    if confirmed.accent_snapshot.is_some()
+        && (complete_enabled_lifecycle || pristine_current || same_lifecycle)
+    {
+        StartupAccentRecovery::AdoptPersisted
+    } else {
+        StartupAccentRecovery::Preserve
+    }
+}
+
 /// One entry of [`Window::closing_popups`]: a popup of ours whose destroy has
 /// been requested and whose `PopupClosed` is still outstanding, plus the menu
 /// closes that teardown still owes.
@@ -1044,6 +1095,12 @@ impl Window {
         if let Some(context) = hydration.coordination_context {
             self.coordination_context = Some(context);
         }
+        // Takeover hydration is itself the follower's authoritative startup
+        // confirmation. Compare the snapshot with itself so the shared pure
+        // classifier distinguishes its raw enabled-only shape from every
+        // persisted lifecycle shape.
+        let accent_recovery =
+            startup_accent_recovery(true, false, &hydration.config, &hydration.config);
         self.config = hydration.config;
         // This blocking snapshot is the follower's fresh, authoritative
         // config read. Followers deliberately leave the startup confirmation
@@ -1053,9 +1110,8 @@ impl Window {
         // with no lifecycle records is a request that has not yet passed
         // through the leader-owned enable path; temporarily expose it as a
         // flip below so that path captures and persists the user snapshot.
-        let initialize_raw_accent_enable = self.config.accent_enabled
-            && self.config.accent_snapshot.is_none()
-            && self.config.accent_last_written.is_none();
+        let initialize_raw_accent_enable =
+            accent_recovery == StartupAccentRecovery::InitializeRawEnable;
         if initialize_raw_accent_enable {
             self.config.accent_enabled = false;
         }
@@ -1523,10 +1579,6 @@ impl Window {
             return Task::none();
         }
 
-        let initial_config_confirmation = self.initial_config_confirmation_pending;
-        let confirmed_enabled_accent_lifecycle = config.accent_enabled
-            && config.accent_snapshot.is_some()
-            && config.accent_last_written.is_some();
         // A just-started process can receive the settings daemon's initial
         // snapshot after constructing from defaults. When that fresh disk
         // entry already carries a lifecycle snapshot, treating a later
@@ -1543,30 +1595,21 @@ impl Window {
         // must still run the normal enable lifecycle. An unrelated/default
         // confirmation does not consume this one startup opportunity because
         // the daemon may deliver the lifecycle in a later confirmation.
-        let pristine_in_memory_accent_lifecycle = !self.config.accent_enabled
-            && self.config.accent_snapshot.is_none()
-            && self.config.accent_last_written.is_none();
-        let confirmed_same_accent_lifecycle = config.accent_enabled == self.config.accent_enabled
-            && config.accent_snapshot == self.config.accent_snapshot
-            && config.accent_last_written == self.config.accent_last_written;
-        let initialize_confirmed_raw_accent_enable = initial_config_confirmation
-            && self.accent_inflight.is_none()
-            && confirmed_same_accent_lifecycle
-            && config.accent_enabled
-            && config.accent_snapshot.is_none()
-            && config.accent_last_written.is_none();
-        let adopt_persisted_accent_lifecycle = initial_config_confirmation
-            && self.accent_inflight.is_none()
-            && config.accent_snapshot.is_some()
-            && (confirmed_enabled_accent_lifecycle
-                || pristine_in_memory_accent_lifecycle
-                || confirmed_same_accent_lifecycle);
-        let accent_flip = if self.accent_inflight.is_some() || confirmed_enabled_accent_lifecycle {
+        let accent_recovery = startup_accent_recovery(
+            self.initial_config_confirmation_pending,
+            self.accent_inflight.is_some(),
+            &self.config,
+            &config,
+        );
+        let accent_flip = if self.accent_inflight.is_some()
+            || accent_recovery == StartupAccentRecovery::AdoptPersisted
+            || complete_enabled_accent_lifecycle(&config)
+        {
             None
         } else {
             (config.accent_enabled != self.config.accent_enabled).then_some(config.accent_enabled)
         };
-        if !adopt_persisted_accent_lifecycle {
+        if accent_recovery != StartupAccentRecovery::AdoptPersisted {
             config.accent_enabled = self.config.accent_enabled;
             config.accent_snapshot = self.config.accent_snapshot;
             config.accent_last_written = self.config.accent_last_written;
@@ -1579,13 +1622,13 @@ impl Window {
         if shuffle_changed {
             tasks.push(self.sync_shuffle(true));
         }
-        if adopt_persisted_accent_lifecycle {
+        if accent_recovery == StartupAccentRecovery::AdoptPersisted {
             self.initial_config_confirmation_pending = false;
             self.accent_recompute_queued = false;
             if self.config.accent_enabled {
                 tasks.push(self.accent_compute_for_current());
             }
-        } else if initialize_confirmed_raw_accent_enable {
+        } else if accent_recovery == StartupAccentRecovery::InitializeRawEnable {
             // The construction-time load and fresh confirmation agree that
             // only the raw enabled flag exists. Manufacture the missing flip
             // in memory so the ordinary enable lifecycle snapshots the live
@@ -5039,6 +5082,113 @@ mod tests {
     }
 
     #[test]
+    fn startup_accent_recovery_classifies_lifecycle_shapes() {
+        let snapshot = AccentSnapshot {
+            light: Some([1, 2, 3]),
+            dark: None,
+        };
+        let written = AccentPair {
+            light: [4, 5, 6],
+            dark: [7, 8, 9],
+        };
+        let lifecycle = |enabled: bool, saved: bool, last_written: bool| AppletConfig {
+            accent_enabled: enabled,
+            accent_snapshot: saved.then_some(snapshot),
+            accent_last_written: last_written.then_some(written),
+            ..AppletConfig::default()
+        };
+        let pristine = lifecycle(false, false, false);
+        let raw_enabled = lifecycle(true, false, false);
+        let complete = lifecycle(true, true, true);
+        let write_record_crash = lifecycle(true, true, false);
+        let failed_restore = lifecycle(false, true, false);
+        let partial_loaded = lifecycle(true, false, true);
+
+        let cases = [
+            (
+                "confirmation no longer pending",
+                false,
+                false,
+                &raw_enabled,
+                &raw_enabled,
+                StartupAccentRecovery::Preserve,
+            ),
+            (
+                "accent transition in flight",
+                true,
+                true,
+                &raw_enabled,
+                &raw_enabled,
+                StartupAccentRecovery::Preserve,
+            ),
+            (
+                "matching raw enable",
+                true,
+                false,
+                &raw_enabled,
+                &raw_enabled,
+                StartupAccentRecovery::InitializeRawEnable,
+            ),
+            (
+                "complete lifecycle repairs partial load",
+                true,
+                false,
+                &partial_loaded,
+                &complete,
+                StartupAccentRecovery::AdoptPersisted,
+            ),
+            (
+                "write-to-record crash over pristine load",
+                true,
+                false,
+                &pristine,
+                &write_record_crash,
+                StartupAccentRecovery::AdoptPersisted,
+            ),
+            (
+                "failed restore over pristine load",
+                true,
+                false,
+                &pristine,
+                &failed_restore,
+                StartupAccentRecovery::AdoptPersisted,
+            ),
+            (
+                "matching failed restore",
+                true,
+                false,
+                &failed_restore,
+                &failed_restore,
+                StartupAccentRecovery::AdoptPersisted,
+            ),
+            (
+                "incomplete lifecycle cannot replace partial load",
+                true,
+                false,
+                &partial_loaded,
+                &write_record_crash,
+                StartupAccentRecovery::Preserve,
+            ),
+            (
+                "unrelated pristine confirmation",
+                true,
+                false,
+                &pristine,
+                &pristine,
+                StartupAccentRecovery::Preserve,
+            ),
+        ];
+
+        for (name, pending, inflight, current, confirmed, expected) in cases {
+            assert_eq!(
+                startup_accent_recovery(pending, inflight, current, confirmed),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn takeover_adopts_full_disk_state_and_recovers_outstanding_request_once() {
         use cosmic::Application as _;
 
@@ -7244,12 +7394,12 @@ mod tests {
                 && builder.contains("--sandbox"),
             "shared flatpak-builder invocation",
         )?;
+        let staging = just_recipe(justfile, "_flatpak-stage-manifest");
         require(
-            just_var(justfile, "flatpak-stage-manifest-cmd")
-                == Some(
-                    "python3 packaging/flatpak/stage-build-manifest.py packaging/flatpak/io.github.ercling.cosmic-applet-daymural.json .daymural-flatpak-manifest.json",
-                ),
-            "shared root-manifest staging command",
+            staging.contains("python3 packaging/flatpak/stage-build-manifest.py")
+                && staging.contains("'{{flatpak-manifest}}'")
+                && staging.contains("'{{flatpak-build-manifest}}'"),
+            "root-manifest staging must consume both shared path variables",
         )?;
         for recipe in [
             "flatpak-prefetch",
@@ -7263,8 +7413,8 @@ mod tests {
                 &format!("{recipe} must use flatpak-builder-cmd"),
             )?;
             require(
-                body.contains("{{flatpak-stage-manifest-cmd}}"),
-                &format!("{recipe} must stage the canonical manifest"),
+                justfile.contains(&format!("{recipe}: _flatpak-stage-manifest")),
+                &format!("{recipe} must depend on shared manifest staging"),
             )?;
             require(
                 body.contains("build-dir '{{flatpak-build-manifest}}'"),
