@@ -242,6 +242,12 @@ pub struct Window {
     /// Generation guarding blocking fresh-config confirmations triggered by
     /// watcher payloads.
     config_confirmation_generation: u64,
+    /// One-shot provenance for the settings daemon's initial full config
+    /// confirmation. Only that completion may adopt an enabled accent
+    /// lifecycle loaded after this process was constructed; any local accent
+    /// transition consumes the opportunity so a delayed pre-transition read
+    /// cannot resurrect state that was subsequently disarmed.
+    initial_config_confirmation_pending: bool,
     /// Injectable directory containing the short-lived coordination lock.
     /// Production uses [`state_dir`]; tests always provide a tempdir.
     coordination_state_dir: PathBuf,
@@ -1476,14 +1482,38 @@ impl Window {
             return Task::none();
         }
 
-        let accent_flip = if self.accent_inflight.is_some() {
+        let initial_config_confirmation =
+            std::mem::take(&mut self.initial_config_confirmation_pending);
+        let confirmed_enabled_accent_lifecycle = config.accent_enabled
+            && config.accent_snapshot.is_some()
+            && config.accent_last_written.is_some();
+        // A just-started process can receive the settings daemon's initial
+        // snapshot after constructing from defaults. When that fresh disk
+        // entry already carries a completed enabled lifecycle, treating the
+        // `false -> true` difference as a new toggle would snapshot our own
+        // theme accents and clear the don't-clobber record before startup
+        // reconciliation can inspect it. Adopt that lifecycle only from the
+        // pristine in-memory shape; a genuine raw external enable has no
+        // `last_written` and must still run the normal enable lifecycle.
+        let adopt_enabled_accent_lifecycle = initial_config_confirmation
+            && self.accent_inflight.is_none()
+            && !self.config.accent_enabled
+            && self.config.accent_snapshot.is_none()
+            && self.config.accent_last_written.is_none()
+            && confirmed_enabled_accent_lifecycle;
+        let accent_flip = if self.accent_inflight.is_some()
+            || adopt_enabled_accent_lifecycle
+            || confirmed_enabled_accent_lifecycle
+        {
             None
         } else {
             (config.accent_enabled != self.config.accent_enabled).then_some(config.accent_enabled)
         };
-        config.accent_enabled = self.config.accent_enabled;
-        config.accent_snapshot = self.config.accent_snapshot;
-        config.accent_last_written = self.config.accent_last_written;
+        if !adopt_enabled_accent_lifecycle {
+            config.accent_enabled = self.config.accent_enabled;
+            config.accent_snapshot = self.config.accent_snapshot;
+            config.accent_last_written = self.config.accent_last_written;
+        }
         self.config = config;
         let mut tasks = Vec::new();
         if retention_reduced {
@@ -1492,7 +1522,9 @@ impl Window {
         if shuffle_changed {
             tasks.push(self.sync_shuffle(true));
         }
-        if let Some(enabled) = accent_flip {
+        if adopt_enabled_accent_lifecycle {
+            tasks.push(self.accent_compute_for_current());
+        } else if let Some(enabled) = accent_flip {
             tasks.push(self.set_accent_enabled(enabled));
         }
         Task::batch(tasks)
@@ -2668,6 +2700,9 @@ impl Window {
         action: accent::AccentAction,
         builders: accent::Builders,
     ) -> app::Task<Message> {
+        if !matches!(action, accent::AccentAction::Skip) {
+            self.initial_config_confirmation_pending = false;
+        }
         match action {
             accent::AccentAction::Write {
                 light,
@@ -3029,6 +3064,7 @@ impl Window {
     /// toggler to render, pinned onto the disk config, and routed through
     /// this same dispatcher by the completion's fresh-disk-read reconcile.
     fn set_accent_enabled(&mut self, enabled: bool) -> app::Task<Message> {
+        self.initial_config_confirmation_pending = false;
         if !self.is_active_leader() {
             return self.set_non_leader_accent_enabled(enabled);
         }
@@ -4017,6 +4053,7 @@ impl cosmic::Application for Window {
             setting_write_queue: VecDeque::new(),
             setting_write_inflight: false,
             config_confirmation_generation: 0,
+            initial_config_confirmation_pending: true,
             coordination_state_dir: state_dir().to_path_buf(),
             peer_refresh_request: None,
             peer_refresh_covered,
@@ -12802,6 +12839,117 @@ source = "git+https://example.invalid/repo#abc""#;
         assert_eq!(window.config.accent_last_written, None);
     }
 
+    #[test]
+    fn initial_confirmation_adopts_an_enabled_lifecycle_before_recompute() {
+        use cosmic::Application as _;
+        use cosmic_config::CosmicConfigEntry as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = accent_window(&dir);
+        start_disabled(&mut window);
+        window.initial_config_confirmation_pending = true;
+        let source = PathBuf::from("/imgs/20260808-Foo_ROW1_UHD.jpg");
+        window.current = Some(source.clone());
+
+        let user = AccentSnapshot {
+            light: Some([10, 20, 30]),
+            dark: Some([40, 50, 60]),
+        };
+        let ours = AccentPair {
+            light: [70, 80, 90],
+            dark: [100, 110, 120],
+        };
+        let picked = AccentSnapshot {
+            light: Some([200, 190, 180]),
+            dark: Some(ours.dark),
+        };
+        accent::restore_accents(window.accent_handles.as_ref().unwrap(), picked).unwrap();
+
+        // The initial settings-daemon confirmation arrives after this fresh
+        // process was constructed from defaults. Disk already describes a
+        // completed enabled lifecycle from the preceding process.
+        let mut disk = window.config.clone();
+        disk.accent_enabled = true;
+        disk.accent_snapshot = Some(user);
+        disk.accent_last_written = Some(ours);
+        disk.write_entry(window.config_context.as_ref().unwrap())
+            .unwrap();
+        let confirmed = persisted_config(&window);
+        window.config_confirmation_generation = 1;
+
+        let task = window.finish_config_confirmation(1, true, confirmed);
+
+        assert_eq!(
+            task.units(),
+            1,
+            "the adopted lifecycle queues reconciliation"
+        );
+        assert!(window.config.accent_enabled);
+        assert_eq!(window.config.accent_snapshot, Some(user));
+        assert_eq!(window.config.accent_last_written, Some(ours));
+        assert_eq!(current_accents(&window), (picked.light, picked.dark));
+
+        // The queued normal recompute compares the live builders with the
+        // adopted record and disarms without replacing the external choice.
+        drop(window.update(Message::AccentComputed {
+            source,
+            hue: Some(30.0),
+        }));
+        assert!(!window.config.accent_enabled);
+        assert_eq!(window.config.accent_snapshot, None);
+        assert_eq!(window.config.accent_last_written, None);
+        assert_eq!(current_accents(&window), (picked.light, picked.dark));
+        assert_eq!(persisted_config(&window), window.config);
+    }
+
+    #[test]
+    fn delayed_pre_disarm_confirmation_cannot_resurrect_the_lifecycle() {
+        use cosmic::Application as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = accent_window(&dir);
+        window.initial_config_confirmation_pending = true;
+        let source = PathBuf::from("/imgs/20260808-Foo_ROW1_UHD.jpg");
+        window.current = Some(source.clone());
+        let user = AccentSnapshot {
+            light: Some([10, 20, 30]),
+            dark: Some([40, 50, 60]),
+        };
+        let ours = AccentPair {
+            light: [70, 80, 90],
+            dark: [100, 110, 120],
+        };
+        window.config.accent_snapshot = Some(user);
+        window.config.accent_last_written = Some(ours);
+        let delayed = window.config.clone();
+
+        let picked = AccentSnapshot {
+            light: Some([200, 190, 180]),
+            dark: Some(ours.dark),
+        };
+        accent::restore_accents(window.accent_handles.as_ref().unwrap(), picked).unwrap();
+        drop(window.update(Message::AccentComputed {
+            source,
+            hue: Some(30.0),
+        }));
+        assert!(!window.initial_config_confirmation_pending);
+        assert!(!window.config.accent_enabled);
+        assert_eq!(window.config.accent_snapshot, None);
+        assert_eq!(window.config.accent_last_written, None);
+
+        // This full entry was read before the local disarm but completed
+        // afterwards. Its recorded lifecycle is not a raw external enable,
+        // and the one startup adoption opportunity has been invalidated.
+        window.config_confirmation_generation = 1;
+        let task = window.finish_config_confirmation(1, true, delayed);
+        assert_eq!(task.units(), 0);
+        assert!(!window.config.accent_enabled);
+        assert_eq!(window.config.accent_snapshot, None);
+        assert_eq!(window.config.accent_last_written, None);
+        assert_eq!(current_accents(&window), (picked.light, picked.dark));
+        assert_eq!(persisted_config(&window), window.config);
+    }
+
     #[tokio::test]
     async fn config_updated_accent_flips_run_the_toggle_lifecycle() {
         use cosmic::Application as _;
@@ -12826,6 +12974,7 @@ source = "git+https://example.invalid/repo#abc""#;
         // External enable: snapshot taken from the live accents.
         let mut external = window.config.clone();
         external.accent_enabled = true;
+        assert_eq!(external.accent_last_written, None, "raw external enable");
         external
             .write_entry(window.config_context.as_ref().unwrap())
             .unwrap();

@@ -347,9 +347,8 @@ Post-Completion; that warning is accepted.
       cosmic-bg application, and both `xdg-open` actions (not yet run)
 - [ ] change system light/dark mode and accent while the popup is open; verify all popup controls,
       dropdowns, and tooltips follow COSMIC colors without restart (not yet run)
-- [ ] enable accent matching and verify both theme modes update; verify disable restores the
+- [x] enable accent matching and verify both theme modes update; verify disable restores the
       snapshot and an external accent change disarms without being overwritten
-      (not yet run)
 - [ ] with `RUST_LOG=daymural=debug`: confirm `resolved_via` is the
       `XDG_SESSION_ID` path, login1 lock and resume signals cross `xdg-dbus-proxy`, and the
       cosmic-bg state poke lands as a **changed value**; greeter healing is best-effort here
@@ -402,6 +401,24 @@ not disarm matching. The restarted leader overwrote the external light accent wi
 contract, so the combined accent checkbox remains open. After observation, all affected app/theme
 directories were restored byte-for-byte from the pre-test backup and the three temporary Daymural
 accent keys were removed; recursive diffs against the backup were clean.
+
+Accent restart-fix retest (2026-08-25, installed Flatpak commit
+`b90a0a687218a5af7365958fbedece953ebed0d36c81a49bcf9ceb9b36d9d5ed`): the five
+affected config/theme trees first matched the authoritative pre-test backup recursively. Six
+leftover Daymural sandboxes were stopped with `flatpak kill`; COSMIC Panel was not restarted and
+normally respawned its two configured instances. Starting from the empty Daymural config, the
+builder accents were swapped to `light=(207,198,100)` and `dark=(79,73,0)` and matching was enabled
+with one direct atomic watched-config write. Daymural saved that pair as its snapshot and wrote
+`light=(79,73,0)`, `dark=(207,198,100)`, recording the same pair as last-written. The light builder
+was then changed externally to `(207,198,100)`; after a 20-second watcher window the persisted
+lifecycle was unchanged. Restarting only Daymural with `flatpak kill` caused the replacement leader
+to disarm (`accent_enabled=false`, snapshot and last-written both `None`) without overwriting the
+external light choice; both builders remained `(207,198,100)`. A separate normal enable/disable
+cycle again saved the swapped pair, wrote both computed accents, restored exactly
+`light=(207,198,100)`, `dark=(79,73,0)` on disable, and cleared both lifecycle records. All five
+directories were then restored exactly from `/tmp/daymural-accent-fix.64OQ19`; recursive diffs were
+clean immediately and after a 10-second watcher-settling interval. This passes the combined accent
+gate while leaving the unrelated live visual/theme/lock gates open.
 
 ### Task 7: Final acceptance and plan state
 

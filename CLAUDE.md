@@ -476,7 +476,16 @@ do not duplicate `appstreamcli` or desktop-file syntax validation in Rust.
     mid-flight state (adopting its `last_written: None` disarms spuriously
     on the next recompute — the oscillation class); the active leader's
     in-memory accent state is authoritative, and a not-in-flight
-    payload flip is only routed after a **fresh disk read** confirms it.
+    payload flip is only routed after a **fresh disk read** confirms it. The
+    narrow restart exception is a pristine/default in-memory accent state plus
+    a freshly confirmed enabled disk lifecycle with both its snapshot and
+    `last_written`: this is an already-armed lifecycle, not a new external
+    enable. Only the one-shot initial confirmation may adopt it, and any local
+    toggle or non-skip accent action consumes that opportunity so a delayed
+    pre-disarm read cannot resurrect the lifecycle. Adoption immediately
+    recomputes so the normal builder comparison can skip or disarm before any
+    write; treating it as a new enable would replace the saved snapshot and
+    overwrite a user accent chosen while the applet was stopped.
     A follower is the explicit exception: it never owns the accent lifecycle,
     adopts only a freshly confirmed `accent_enabled` value for display, and
     preserves its in-memory snapshot/last-written fields until a takeover
