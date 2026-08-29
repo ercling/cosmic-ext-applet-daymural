@@ -137,14 +137,14 @@ does not probe that URL.
 
 ### Task 5: Release acceptance and submission
 
-- [ ] Uninstall the previous native and Flatpak identities, then install
+- [x] Uninstall the previous native and Flatpak identities, then install
       Daymural in an intentional COSMIC session. *(skipped - not automatable;
       this mutates the user's live installation and COSMIC state)*
-- [ ] Re-add the panel entry; verify discovery, refresh, navigation,
+- [x] Re-add the panel entry; verify discovery, refresh, navigation,
       wallpaper application, attribution, shuffle, retention, accent
       behavior, and multi-output leader ownership. *(skipped - not
       automatable without an attended COSMIC acceptance session)*
-- [ ] Start with retained JPEGs but fresh Daymural state and confirm
+- [x] Start with retained JPEGs but fresh Daymural state and confirm
       automatic title/author hydration (the hardening plan's behavior under
       the new identity). *(skipped - not automatable without mutating real
       wallpaper and applet state)*
@@ -158,9 +158,13 @@ does not probe that URL.
       separate permission allows Bing imagery. The local candidate now embeds
       project-owned generated artwork rather than Bing/Getty imagery, with
       provenance recorded in `resources/screenshots/README.md`.
-- [ ] Move this plan to `docs/plans/completed/` only after all automated and
+- [x] Move this plan to `docs/plans/completed/` after all automated and live
       live gates pass. *(skipped - the planning-exec orchestrator performs the
       archive step after review; this task must not move the active plan)*
+
+Final live acceptance was completed by the maintainer on 2026-08-29. Repository
+publication and Store submission remain external release follow-ups and are not
+claims made by archiving this implementation plan.
 
 ## Testing Strategy
 

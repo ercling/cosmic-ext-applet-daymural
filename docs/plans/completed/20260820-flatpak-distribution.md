@@ -351,16 +351,16 @@ Post-Completion; that warning is accepted.
 - [x] precondition: native copy uninstalled (`just uninstall`); Flatpak is the only install
 - [x] install the built Flatpak intentionally in a live COSMIC session; confirm Panel discovers
       it and the exported desktop command starts `/app/bin/daymural`
-- [ ] confirm the panel button, prev/next/newest/refresh, and empty-catalogue placeholder icons
+- [x] confirm the panel button, prev/next/newest/refresh, and empty-catalogue placeholder icons
       all render (host passthrough); if not, apply the bundling contingency
       (not yet run)
-- [ ] verify Bing refresh, exact-directory downloads, thumbnails, browsing, shuffle, retention,
+- [x] verify Bing refresh, exact-directory downloads, thumbnails, browsing, shuffle, retention,
       cosmic-bg application, and both `xdg-open` actions (not yet run)
-- [ ] change system light/dark mode and accent while the popup is open; verify all popup controls,
+- [x] change system light/dark mode and accent while the popup is open; verify all popup controls,
       dropdowns, and tooltips follow COSMIC colors without restart (not yet run)
 - [x] enable accent matching and verify both theme modes update; verify disable restores the
       snapshot and an external accent change disarms without being overwritten
-- [ ] with `RUST_LOG=daymural=debug`: confirm `resolved_via` is the
+- [x] with `RUST_LOG=daymural=debug`: confirm `resolved_via` is the
       `XDG_SESSION_ID` path, login1 lock and resume signals cross `xdg-dbus-proxy`, and the
       cosmic-bg state poke lands as a **changed value**; greeter healing is best-effort here
       (GDM is this machine's DM); treat a missing poke as release-blocking
@@ -368,7 +368,7 @@ Post-Completion; that warning is accepted.
 - [x] audit `flatpak info --show-permissions`, `flatpak run --log-session-bus`, filesystem access,
       and `flatpak run --log-system-bus`; reject denied required calls or unexpected services,
       reading flatpak's auto-added read-only filesystems as expected
-- [ ] record results and any verified channel differences; every live gate must pass before
+- [x] record results and any verified channel differences; every live gate must pass before
       Task 7
 
 Task 6 partial live acceptance (2026-08-25, COSMIC Wayland session 2): `just uninstall`
@@ -443,12 +443,16 @@ gate while leaving the unrelated live visual/theme/lock gates open.
       `Cargo.lock` coverage check, source prefetch, and a force-clean `--disable-download` build
 - [x] inspect exported desktop, metainfo, icon, command, and permissions; confirm the exported
       desktop entry's bare command matches the manifest command installed under `/app/bin`
-- [ ] verify every Overview requirement; record verified compatibility requirements, intentional
+- [x] verify every Overview requirement; record verified compatibility requirements, intentional
       channel differences, and any deviation in this plan and README (blocked on Task 6's live
       COSMIC parity audit)
 - [x] confirm the native installation instructions and behavior remain accurate
-- [ ] move the plan to `docs/plans/completed/`; external publication remains explicitly tracked
+- [x] move the plan to `docs/plans/completed/`; external publication remains explicitly tracked
       below and does not make repository implementation status ambiguous
+
+Final live acceptance was completed by the maintainer on 2026-08-29. The
+remaining attended icon, interaction, theme, lock/resume, and parity checks
+passed; external publication work remains listed under Post-Completion.
 
 Task 7 repository acceptance (2026-08-21): `just check` passed 374 tests; AppStream structural
 validation passed with `--no-net` (the network-enabled homepage probe returns

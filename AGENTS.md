@@ -91,11 +91,11 @@ needed.
 - `examples/`: ignored, independent reference clones. Do not modify or expect
   the parent repository to track them.
 
-`README.md` is the user-facing behavior and installation contract.
-`CLAUDE.md` is a detailed legacy architecture handoff. It contains valuable
-historical investigation and exact upstream source references, but this file
-is the active repository instruction source for Codex. Keep durable design
-detail in `docs/plans/` and keep this guide concise.
+`README.md` is the user-facing behavior and installation contract. This file
+is the single shared instruction source for coding agents; `CLAUDE.md` imports
+it rather than duplicating it. Put shared operational rules here, keep durable
+design detail and upstream investigation in `docs/plans/`, and keep this guide
+concise.
 
 ## Dependency and Compatibility Rules
 
@@ -171,16 +171,16 @@ protocol-sensitive.
   close proves a mapped popup disappeared.
 - The remaining crash when the compositor dismisses an open dropdown chain is
   a pinned-libcosmic ancestor-first destroy-order bug. Read
-  `docs/plans/completed/20260810-popup-destroy-order-crash.md` and the popup
-  section of `CLAUDE.md` before changing this ledger.
+  `docs/plans/completed/20260810-popup-destroy-order-crash.md` before changing
+  this ledger.
 - Disabled icon buttons require explicit inner-icon opacity; the theme's
   disabled `Button::Icon` styling does not visibly dim these SVGs.
 
 ### Accent state machine
 
 Accent matching is opt-in and must preserve a user's theme choice. Before
-changing it, read the accent section of `CLAUDE.md` and
-`docs/plans/completed/20260808-accent-from-wallpaper.md`.
+changing it, read
+`docs/plans/completed/20260808-accent-from-wallpaper.md` and its notes file.
 
 - The wallpaper contributes hue only. Tone/chroma come from each mode's own
   builder palette, followed by fixed-hue gamut mapping and a contrast guard.

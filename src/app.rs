@@ -84,8 +84,8 @@ pub struct Window {
     /// parent surface of its menu popup).
     pub(crate) popup: Option<window::Id>,
     /// How many dropdown menu popups are believed to be mapped — the whole
-    /// popup ledger (see "UI conventions → Popup stack" in `CLAUDE.md`), read
-    /// through [`Window::dropdown_open`].
+    /// popup ledger (see the popup-stack rules in `AGENTS.md` and the completed
+    /// popup destroy-order plan), read through [`Window::dropdown_open`].
     ///
     /// A *count*, not a bool, because the ledger has no ids to work with: a
     /// menu's window id is minted inside the widget and is never visible here,
@@ -6727,12 +6727,13 @@ mod tests {
         include_str!("../packaging/flatpak/io.github.ercling.cosmic-applet-daymural.json");
     const JUSTFILE: &str = include_str!("../justfile");
     const README: &str = include_str!("../README.md");
+    const INSTALLATION_GUIDE: &str = include_str!("../docs/installation.md");
     const SCREENSHOT_PROVENANCE: &str = include_str!("../resources/screenshots/README.md");
     const STORE_SCREENSHOT: &[u8] = include_bytes!("../resources/screenshots/screenshot-main.png");
     const AGENT_GUIDE: &str = include_str!("../AGENTS.md");
-    const LEGACY_GUIDE: &str = include_str!("../CLAUDE.md");
-    const ACTIVE_FLATPAK_PLAN: &str =
-        include_str!("../docs/plans/20260820-flatpak-distribution.md");
+    const CLAUDE_GUIDE: &str = include_str!("../CLAUDE.md");
+    const COMPLETED_FLATPAK_PLAN: &str =
+        include_str!("../docs/plans/completed/20260820-flatpak-distribution.md");
     const CARGO_SOURCES_SCRIPT: &str =
         include_str!("../packaging/flatpak/generate-cargo-sources.sh");
     const FLATPAK_STAGE_SCRIPT: &str = include_str!("../packaging/flatpak/stage-build-manifest.py");
@@ -8046,27 +8047,27 @@ mod tests {
         const LEGACY_APP_ID: &str = "io.github.ercling.CosmicBingWallpaper";
         const LEGACY_BINARY: &str = "cosmic-bing-wallpaper";
 
-        let uninstall_heading = "## Uninstall the previous identity before upgrading";
-        let uninstall_start = README
+        let uninstall_heading = "## Upgrading from the previous applet identity";
+        let uninstall_start = INSTALLATION_GUIDE
             .find(uninstall_heading)
-            .expect("README must retain the legacy uninstall section");
-        let uninstall_tail = &README[uninstall_start..];
+            .expect("installation guide must retain the legacy uninstall section");
+        let uninstall_tail = &INSTALLATION_GUIDE[uninstall_start..];
         let uninstall_end = uninstall_tail[uninstall_heading.len()..]
             .find("\n## ")
-            .map_or(README.len(), |end| {
+            .map_or(INSTALLATION_GUIDE.len(), |end| {
                 uninstall_start + uninstall_heading.len() + end
             });
-        let uninstall_section = &README[uninstall_start..uninstall_end];
+        let uninstall_section = &INSTALLATION_GUIDE[uninstall_start..uninstall_end];
         assert!(
             uninstall_section
                 .contains("flatpak uninstall --user io.github.ercling.CosmicBingWallpaper")
                 && uninstall_section.contains("$HOME/.local/bin/cosmic-bing-wallpaper")
                 && uninstall_section
-                    .contains("Old settings, catalogue state, thumbnails, leadership locks")
-                && uninstall_section.contains("coordination mailbox are not migrated")
-                && uninstall_section.contains("~/Pictures/BingWallpaper` image folder is\nkept")
-                && uninstall_section.contains("COSMIC Settings →\nDesktop → Panel"),
-            "README must retain the complete legacy uninstall and migration warning"
+                    .contains("Old settings,\ncatalogue state, thumbnails, leadership locks")
+                && uninstall_section.contains("coordination mailbox are\nnot migrated")
+                && uninstall_section.contains("`~/Pictures/BingWallpaper` image folder is kept")
+                && uninstall_section.contains("COSMIC Settings → Desktop → Panel"),
+            "installation guide must retain the complete legacy uninstall and migration warning"
         );
 
         for (name, text) in [
@@ -8076,16 +8077,18 @@ mod tests {
             ("justfile", JUSTFILE),
             ("Rust workflow", RUST_WORKFLOW),
             ("Flatpak workflow", FLATPAK_WORKFLOW),
+            ("README", README),
             (
-                "README before explicit uninstall instructions",
-                &README[..uninstall_start],
+                "installation guide before explicit uninstall instructions",
+                &INSTALLATION_GUIDE[..uninstall_start],
             ),
             (
-                "README after explicit uninstall instructions",
-                &README[uninstall_end..],
+                "installation guide after explicit uninstall instructions",
+                &INSTALLATION_GUIDE[uninstall_end..],
             ),
             ("AGENTS.md", AGENT_GUIDE),
-            ("active Flatpak plan", ACTIVE_FLATPAK_PLAN),
+            ("CLAUDE.md", CLAUDE_GUIDE),
+            ("completed Flatpak plan", COMPLETED_FLATPAK_PLAN),
         ] {
             for legacy in [
                 LEGACY_APP_ID,
@@ -8099,13 +8102,9 @@ mod tests {
                 );
             }
         }
-        assert!(
-            LEGACY_GUIDE.contains("20260807-cosmic-bing-wallpaper-applet.md")
-                && LEGACY_GUIDE.matches("cosmic-bing-wallpaper").count() == 1
-                && !LEGACY_GUIDE.contains("io.github.ercling.CosmicBingWallpaper")
-                && !LEGACY_GUIDE.contains("cosmic_bing_wallpaper")
-                && !LEGACY_GUIDE.contains("https://github.com/ercling/cosmic-wallpaper-applet"),
-            "CLAUDE.md may retain the old name only in a completed historical plan filename"
+        assert_eq!(
+            CLAUDE_GUIDE, "# Claude Code\n\n@AGENTS.md\n",
+            "CLAUDE.md must remain a thin loader for the shared agent guide"
         );
     }
 

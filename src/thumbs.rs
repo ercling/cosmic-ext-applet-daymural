@@ -236,7 +236,7 @@ fn slot(thumb: &Path, source: &Path) -> Slot {
 ///
 /// Shares [`fsutil::temp_sibling`]'s "same path plus a suffix" mechanic —
 /// this sibling is permanent rather than temporary, but the crate keeps one
-/// implementation of it (see CLAUDE.md).
+/// implementation of it (see the file and thumbnail rules in `AGENTS.md`).
 fn sidecar_path(thumb: &Path) -> PathBuf {
     fsutil::temp_sibling(thumb, SIDECAR_SUFFIX)
 }
