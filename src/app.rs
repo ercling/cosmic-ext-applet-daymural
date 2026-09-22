@@ -33,8 +33,12 @@ use crate::leader::Leadership;
 // popup (`view.rs`). The panel contributes an icon and nothing else.
 use crate::{accent, bing, lockwatch, schedule, thumbs, tooltip, view, wallpaper};
 
-/// One name everywhere: cosmic-config app ID, state dir, desktop entry.
+/// Public application/Wayland identity and installed desktop entry.
 pub const APP_ID: &str = "io.github.ercling.cosmic-applet-daymural";
+
+/// Stable namespace for settings, coordination, and durable state. Public
+/// integration renames must preserve this value to retain existing user data.
+pub const STORAGE_ID: &str = "io.github.ercling.cosmic-applet-daymural";
 
 /// Symbolic icon shown in the panel.
 const PANEL_ICON: &str = "preferences-desktop-wallpaper-symbolic";
@@ -51,7 +55,7 @@ pub fn run() -> cosmic::iced::Result {
     cosmic::applet::run::<Window>(())
 }
 
-/// The applet's state dir (`~/.local/state/<APP_ID>/`): catalogue JSON +
+/// The applet's state dir (`~/.local/state/<STORAGE_ID>/`): catalogue JSON +
 /// cached thumbnails. Resolved once — the view asks for it on every
 /// re-render and must not repeat env/home lookups per frame.
 ///
@@ -62,14 +66,17 @@ pub fn run() -> cosmic::iced::Result {
 /// working directory).
 pub fn state_dir() -> &'static Path {
     static STATE_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
-        dirs::state_dir()
-            .unwrap_or_else(|| {
-                tracing::warn!("no home directory: keeping applet state in the temp dir");
-                std::env::temp_dir()
-            })
-            .join(APP_ID)
+        state_path(&dirs::state_dir().unwrap_or_else(|| {
+            tracing::warn!("no home directory: keeping applet state in the temp dir");
+            std::env::temp_dir()
+        }))
     });
     &STATE_DIR
+}
+
+/// Append the stable namespace to an injected, already resolved state root.
+fn state_path(root: &Path) -> PathBuf {
+    root.join(STORAGE_ID)
 }
 
 /// Where the catalogue JSON is persisted.
@@ -4579,10 +4586,10 @@ impl cosmic::Application for Window {
             // Keep `self.config` in sync with on-disk changes (our own setter
             // writes echo back through here too, which is harmless).
             self.core
-                .watch_config::<AppletConfig>(APP_ID)
+                .watch_config::<AppletConfig>(STORAGE_ID)
                 .map(|update| Message::ConfigUpdated(update.config)),
             self.core
-                .watch_config::<CoordinationConfig>(APP_ID)
+                .watch_config::<CoordinationConfig>(STORAGE_ID)
                 .map(|update| Message::CoordinationUpdated(update.config)),
             // logind lock/resume events → the poke ladder (the
             // cosmic-greeter#511 workaround; rationale in `lockwatch.rs`).
@@ -4910,7 +4917,7 @@ mod tests {
 
     fn takeover_contexts(root: &Path) -> (cosmic_config::Config, cosmic_config::Config) {
         let config = cosmic_config::Config::with_custom_path(
-            APP_ID,
+            STORAGE_ID,
             AppletConfig::VERSION,
             root.to_path_buf(),
         )
@@ -5497,13 +5504,74 @@ mod tests {
     }
 
     #[test]
-    fn state_paths_live_under_the_app_id() {
-        // No self-skip: `state_dir` falls back to the temp dir when there is
-        // no home, so it is absolute in every environment.
-        let state = state_dir();
-        assert!(state.ends_with(APP_ID));
-        assert!(state.is_absolute());
-        assert_eq!(state_dir().join("catalogue.json"), catalogue_path());
+    fn state_paths_live_under_the_storage_id() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(STORAGE_ID, "io.github.ercling.cosmic-applet-daymural");
+        assert_eq!(state_path(root.path()), root.path().join(STORAGE_ID));
+    }
+
+    fn storage_identity_contract(config: &str, app: &str) -> bool {
+        // Scope to production code so test fixtures cannot satisfy the guards.
+        let config = config.split("#[cfg(test)]").next().unwrap();
+        let app = app.split("#[cfg(test)]\nmod tests").next().unwrap();
+        config
+            .matches("Config::new(STORAGE_ID, Self::VERSION)")
+            .count()
+            == 2
+            && !config.contains("Config::new(APP_ID")
+            && app.contains("watch_config::<AppletConfig>(STORAGE_ID)")
+            && app.contains("watch_config::<CoordinationConfig>(STORAGE_ID)")
+            && !app.contains("watch_config::<AppletConfig>(APP_ID)")
+            && !app.contains("watch_config::<CoordinationConfig>(APP_ID)")
+            && app.contains("root.join(STORAGE_ID)")
+    }
+
+    #[test]
+    fn persistence_factories_and_watchers_use_storage_identity() {
+        let config = include_str!("config.rs");
+        let app = include_str!("app.rs");
+        assert!(storage_identity_contract(config, app));
+        for occurrence in 0..2 {
+            let needle = "Config::new(STORAGE_ID, Self::VERSION)";
+            let offset = config.match_indices(needle).nth(occurrence).unwrap().0;
+            let mut drift = config.to_owned();
+            drift.replace_range(
+                offset..offset + needle.len(),
+                "Config::new(APP_ID, Self::VERSION)",
+            );
+            assert!(!storage_identity_contract(&drift, app));
+        }
+        for entry in ["AppletConfig", "CoordinationConfig"] {
+            let drift = app.replacen(
+                &format!("watch_config::<{entry}>(STORAGE_ID)"),
+                &format!("watch_config::<{entry}>(APP_ID)"),
+                1,
+            );
+            assert!(!storage_identity_contract(config, &drift));
+        }
+    }
+
+    #[test]
+    fn retained_state_namespace_reopens_catalogue_and_thumbnail_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let images = root.path().join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        let old_state = root.path().join("io.github.ercling.cosmic-applet-daymural");
+        let kept = entry_on_disk(&images, "20260807", "Kept_ROW1");
+        std::fs::write(&kept.filename, crate::testutil::tiny_jpeg(64, 36)).unwrap();
+        let catalogue = Catalogue {
+            images: vec![kept.clone()],
+        };
+        catalogue
+            .save(&old_state.join(catalogue::CATALOGUE_FILENAME))
+            .unwrap();
+        thumbs::ensure_thumbnail(&kept.filename, &old_state).unwrap();
+        let state = state_path(root.path());
+        assert!(thumbs::is_cached(&kept.filename, &state));
+        let restored =
+            restore_catalogue(&state.join(catalogue::CATALOGUE_FILENAME), &images, &state);
+        assert_eq!(restored.catalogue, catalogue);
+        assert!(thumbs::is_cached(&kept.filename, &state));
     }
 
     #[test]
@@ -8628,7 +8696,7 @@ source = "git+https://example.invalid/repo#abc""#;
 
     fn follower_with_mailbox(dir: &Path) -> Window {
         let context = cosmic_config::Config::with_custom_path(
-            APP_ID,
+            STORAGE_ID,
             AppletConfig::VERSION,
             dir.join("config"),
         )
@@ -9273,7 +9341,7 @@ source = "git+https://example.invalid/repo#abc""#;
         assert!(!window.refresh_pending);
 
         let context = cosmic_config::Config::with_custom_path(
-            APP_ID,
+            STORAGE_ID,
             AppletConfig::VERSION,
             dir.path().join("config"),
         )
@@ -9314,7 +9382,7 @@ source = "git+https://example.invalid/repo#abc""#;
     fn request_reserved_during_live_read_is_acknowledged_by_intervening_refresh() {
         let dir = tempfile::tempdir().unwrap();
         let context = cosmic_config::Config::with_custom_path(
-            APP_ID,
+            STORAGE_ID,
             AppletConfig::VERSION,
             dir.path().join("config"),
         )
@@ -9515,7 +9583,7 @@ source = "git+https://example.invalid/repo#abc""#;
         let dir = tempfile::tempdir().unwrap();
         let config_root = dir.path().join("config");
         let context =
-            cosmic_config::Config::with_custom_path(APP_ID, AppletConfig::VERSION, config_root)
+            cosmic_config::Config::with_custom_path(STORAGE_ID, AppletConfig::VERSION, config_root)
                 .unwrap();
         let invalid_state = dir.path().join("not-a-directory");
         std::fs::write(&invalid_state, b"file").unwrap();
@@ -9542,7 +9610,7 @@ source = "git+https://example.invalid/repo#abc""#;
 
         let dir = tempfile::tempdir().unwrap();
         let context = cosmic_config::Config::with_custom_path(
-            APP_ID,
+            STORAGE_ID,
             AppletConfig::VERSION,
             dir.path().join("config"),
         )
@@ -9575,7 +9643,7 @@ source = "git+https://example.invalid/repo#abc""#;
 
         let dir = tempfile::tempdir().unwrap();
         let context = cosmic_config::Config::with_custom_path(
-            APP_ID,
+            STORAGE_ID,
             AppletConfig::VERSION,
             dir.path().join("config"),
         )
@@ -9618,7 +9686,7 @@ source = "git+https://example.invalid/repo#abc""#;
 
         let dir = tempfile::tempdir().unwrap();
         let context = cosmic_config::Config::with_custom_path(
-            APP_ID,
+            STORAGE_ID,
             AppletConfig::VERSION,
             dir.path().join("config"),
         )
@@ -9691,9 +9759,12 @@ source = "git+https://example.invalid/repo#abc""#;
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("config");
-        let context =
-            cosmic_config::Config::with_custom_path(APP_ID, AppletConfig::VERSION, root.clone())
-                .unwrap();
+        let context = cosmic_config::Config::with_custom_path(
+            STORAGE_ID,
+            AppletConfig::VERSION,
+            root.clone(),
+        )
+        .unwrap();
         let snapshot = AccentSnapshot {
             light: Some([1, 2, 3]),
             dark: None,
@@ -9709,7 +9780,7 @@ source = "git+https://example.invalid/repo#abc""#;
             ..Default::default()
         };
         seeded.write_entry(&context).unwrap();
-        let version_dir = root.join("cosmic").join(APP_ID).join("v1");
+        let version_dir = root.join("cosmic").join(STORAGE_ID).join("v1");
         let snapshot_path = version_dir.join("accent_snapshot");
         let last_written_path = version_dir.join("accent_last_written");
         let accent_bytes = || {
@@ -9767,11 +9838,14 @@ source = "git+https://example.invalid/repo#abc""#;
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("config");
-        let context =
-            cosmic_config::Config::with_custom_path(APP_ID, AppletConfig::VERSION, root.clone())
-                .unwrap();
+        let context = cosmic_config::Config::with_custom_path(
+            STORAGE_ID,
+            AppletConfig::VERSION,
+            root.clone(),
+        )
+        .unwrap();
         AppletConfig::default().write_entry(&context).unwrap();
-        let version_dir = root.join("cosmic").join(APP_ID).join("v1");
+        let version_dir = root.join("cosmic").join(STORAGE_ID).join("v1");
         std::fs::remove_dir_all(&version_dir).unwrap();
         std::fs::write(&version_dir, b"not a directory").unwrap();
         let mut failing = Window {
@@ -12100,7 +12174,7 @@ source = "git+https://example.invalid/repo#abc""#;
 
         let dir = tempfile::tempdir().unwrap();
         let context = cosmic_config::Config::with_custom_path(
-            APP_ID,
+            STORAGE_ID,
             AppletConfig::VERSION,
             dir.path().to_path_buf(),
         )
@@ -12154,7 +12228,7 @@ source = "git+https://example.invalid/repo#abc""#;
             accent_state_dir: dir.path().join("state"),
             config_context: Some(
                 cosmic_config::Config::with_custom_path(
-                    APP_ID,
+                    STORAGE_ID,
                     AppletConfig::VERSION,
                     dir.path().join("applet-config"),
                 )
@@ -12240,11 +12314,14 @@ source = "git+https://example.invalid/repo#abc""#;
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("config");
-        let context =
-            cosmic_config::Config::with_custom_path(APP_ID, AppletConfig::VERSION, root.clone())
-                .unwrap();
+        let context = cosmic_config::Config::with_custom_path(
+            STORAGE_ID,
+            AppletConfig::VERSION,
+            root.clone(),
+        )
+        .unwrap();
         AppletConfig::default().write_entry(&context).unwrap();
-        let version_dir = root.join("cosmic").join(APP_ID).join("v1");
+        let version_dir = root.join("cosmic").join(STORAGE_ID).join("v1");
         std::fs::remove_dir_all(&version_dir).unwrap();
         std::fs::write(&version_dir, b"not a directory").unwrap();
         let mut failing = Window {
@@ -12304,7 +12381,7 @@ source = "git+https://example.invalid/repo#abc""#;
 
         let dir = tempfile::tempdir().unwrap();
         let context = cosmic_config::Config::with_custom_path(
-            APP_ID,
+            STORAGE_ID,
             AppletConfig::VERSION,
             dir.path().join("config"),
         )
@@ -12355,7 +12432,7 @@ source = "git+https://example.invalid/repo#abc""#;
 
         let dir = tempfile::tempdir().unwrap();
         let context = cosmic_config::Config::with_custom_path(
-            APP_ID,
+            STORAGE_ID,
             AppletConfig::VERSION,
             dir.path().join("config"),
         )
@@ -12443,7 +12520,7 @@ source = "git+https://example.invalid/repo#abc""#;
         leader.current = Some(old.clone());
 
         let coordination_context = cosmic_config::Config::with_custom_path(
-            APP_ID,
+            STORAGE_ID,
             AppletConfig::VERSION,
             dir.path().join("coordination-config"),
         )

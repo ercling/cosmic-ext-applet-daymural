@@ -147,27 +147,43 @@ Old/new sandboxes do not share leadership merely because their suffix matches.
 `src/leader.rs` tests. Keep the public ID unchanged in this task so the
 existing packaging contract remains green.
 
-- [ ] Introduce `STORAGE_ID` with the current ID; route config contexts, both
+- [x] Introduce `STORAGE_ID` with the current ID; route config contexts, both
       watchers, and state-path construction through it. Keep path decisions
       pure and injectable rather than changing global environment in tests.
-- [ ] Use the same storage-ID accessor/constant in production and injected
+- [x] Use the same storage-ID accessor/constant in production and injected
       test contexts. Add source-contract guards over the two config factories
       and both subscription sites to reject use of APP_ID for persistence or
       watching; test deliberate APP_ID substitutions so guards can fail.
       Assert STORAGE_ID's exact old value. Defer `APP_ID != STORAGE_ID` until
       Task 2, since the two intentionally remain equal during Task 1.
-- [ ] Audit all runtime APP_ID consumers against the locked libcosmic source;
+- [x] Audit all runtime APP_ID consumers against the locked libcosmic source;
       explicitly distinguish runtime/application identity from durable storage.
-- [ ] Success tests: populate old settings and state under TempDir; verify
+- [x] Success tests: populate old settings and state under TempDir; verify
       settings, catalogue, thumbnail identity, accent snapshot/last-written
       fields and mailbox remain accessible without reinitialization. Run the
       existing `one_leader_wins_and_loser_takes_over_once` test rather than
       duplicate it.
-- [ ] Failure tests: missing/corrupt config retains established per-key behavior;
+- [x] Failure tests: missing/corrupt config retains established per-key behavior;
       retain the deterministic file-as-directory tests for existing fail-open
       lock behavior. Identity guards reject public-ID storage consumers and
       tests never fall back to real user paths.
-- [ ] Test gate: `just check` must pass before Task 2.
+- [x] Test gate: `just check` must pass before Task 2.
+
+Task 1 validation: `just check` passed (449 tests; formatting and clippy clean).
+The installed Flatpak SDK Rust 1.98.1 bin directory was prepended to PATH
+because the local rustfmt/clippy binaries still target the removed 1.97.1
+driver. `CC=/usr/bin/gcc CXX=/usr/bin/g++` bypassed read-only ccache; the
+check ran outside the filesystem/network sandbox to permit loopback mock
+servers. No dependencies or machine configuration were changed.
+
+Task 1 audit evidence: locked libcosmic `8a017a1` routes
+`cosmic::applet::run` through `iced_settings`, which uses the application's
+`APP_ID` for `iced.id` and the Linux platform application ID
+(`src/app/mod.rs:67-70`). Its separate `run_single_instance` D-Bus identity
+path is not used by this applet. Remaining runtime public-ID consumers are
+`Window::APP_ID` and the startup log in `src/main.rs`. Both explicit config
+watchers, both config factories, injected config contexts, and the state-root
+suffix now use `STORAGE_ID`; no leader or accent state-machine behavior changes.
 
 ### Task 2: Rename the public integration and its packaging atomically
 
