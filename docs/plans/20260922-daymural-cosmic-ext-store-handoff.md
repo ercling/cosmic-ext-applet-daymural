@@ -18,7 +18,10 @@ for the private Flatpak catalogue/thumbnail transfer and panel re-addition.
 Hermetic tests verify retained settings, accent recovery fields, mailbox,
 catalogue and thumbnail identity, both config factories/watchers, shared
 leadership, and mixed-identity rejection. `just check` passed with 452 tests,
-formatting and clippy clean. Direct comparison against the PR's upstream base
+formatting and clippy clean. `just flatpak-sources`, `just flatpak-prefetch`,
+and `just flatpak-build-offline` passed; offline release compilation took
+2m02s, AppStream compose succeeded, and the new-ID desktop/icon/metainfo were
+exported. Nothing was installed or launched. Direct comparison against the PR's upstream base
 `291b967b9b96c210ec364fa5cf3bfce896696057` confirmed Cargo.lock, runtime/SDK
 pins, manifest permissions/build options, and wallpaper, leader, accent, and
 thumbnail implementations unchanged. `~/Pictures/BingWallpaper` is unchanged.
@@ -90,7 +93,9 @@ and verify both URLs against a real published commit before updating the PR.
 
 Retain existing `cargo-sources.json` only after verifying consistency with the
 final upstream Cargo.lock and generator inputs. This rename does not change
-them; generator formatting/cache differences alone are not dependency changes.
+them; regenerated sources parsed exactly equal to PR #298's current file
+(1,496 entries each) during Task 4. Generator formatting/cache differences
+alone are not dependency changes.
 Check that the regenerated patch applies cleanly to the pinned source, run
 `just check` on that patched disposable checkout, run desktop-file and strict
 no-network AppStream validation, and run the store repository's required checks

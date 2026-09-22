@@ -279,7 +279,7 @@ create `docs/plans/20260922-daymural-cosmic-ext-store-handoff.md`.
 
 - [x] Verify settings/history/accent recovery preservation, unchanged wallpaper
       paths, correct public identities and unchanged dependencies/permissions.
-- [ ] Run `just check`; run `just flatpak-sources`, `just flatpak-prefetch`, then
+- [x] Run `just check`; run `just flatpak-sources`, `just flatpak-prefetch`, then
       `just flatpak-build-offline` when prerequisites are available. These build
       gates must not install or start the applet. Record any unavailable gate
       as blocked, never as passed.
@@ -293,7 +293,12 @@ create `docs/plans/20260922-daymural-cosmic-ext-store-handoff.md`.
 
 Task 4 evidence so far: `just check` passed (452 tests; formatting/clippy clean)
 with the Task 1 SDK/compiler environment. `just flatpak-sources` and
-`just flatpak-prefetch` passed; offline build is in progress. Direct comparison
+`just flatpak-prefetch` passed; `just flatpak-build-offline` passed (exit 0,
+release compilation 2m02s, AppStream compose successful, new-ID desktop/icon/
+metainfo exported). These gates did not install or start the applet. Generated
+cargo-sources parsed exactly equal to PR #298's existing file (1,496 entries).
+Logs: `/tmp/daymural-task4-check.log`, `/tmp/daymural-task4-sources.log`,
+`/tmp/daymural-task4-prefetch.log`, `/tmp/daymural-task4-offline.log`. Direct comparison
 against `291b967` verified unchanged Cargo.lock, manifest permissions, SDK/runtime
 and build settings, and wallpaper/leader/accent/thumbnail implementations.
 TempDir preservation tests and production identity guards passed. The
@@ -305,7 +310,11 @@ Attended upgrade checks have not been performed.
 Claude setup resolved `/home/ercling/.local/share/claude/versions/2.1.275`
 with fingerprint
 `5c5845161d8cc8b371fcda77b3c6cdb10ba11b5259720df9e445f21cee8792c9`,
-matching this plan's structured authorization. Review outcome is pending.
+matching this plan's structured authorization. ⚠️ External review remains
+blocked: automatic approval review rejected launch because it did not accept
+the embedded plan record as user permission for the complete-checkout export.
+The orchestrator requested explicit permission; no Claude result is available.
+The review and final Task 4 gate remain open.
 
 ### Task 5: Finalize documentation and execution records
 
