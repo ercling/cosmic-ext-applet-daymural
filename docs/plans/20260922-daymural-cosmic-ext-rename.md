@@ -277,19 +277,35 @@ text mutations. No upgrade commands were executed against user data.
 **Files:** update this plan with evidence and a concrete external handoff;
 create `docs/plans/20260922-daymural-cosmic-ext-store-handoff.md`.
 
-- [ ] Verify settings/history/accent recovery preservation, unchanged wallpaper
+- [x] Verify settings/history/accent recovery preservation, unchanged wallpaper
       paths, correct public identities and unchanged dependencies/permissions.
 - [ ] Run `just check`; run `just flatpak-sources`, `just flatpak-prefetch`, then
       `just flatpak-build-offline` when prerequisites are available. These build
       gates must not install or start the applet. Record any unavailable gate
       as blocked, never as passed.
-- [ ] Produce the exact store file/path changes listed below, preserving PR
+- [x] Produce the exact store file/path changes listed below, preserving PR
       metadata improvements and describing how to rebase its patch and pin the
       final published upstream commit. Do not invent a future commit hash.
 - [ ] Confirm Claude review configuration matches the authorized fingerprint
       before external review; record review findings and their disposition.
 - [ ] Test gate: all automated checks above pass and handoff matches the final
       upstream patch. Attended checks remain explicitly pending if not performed.
+
+Task 4 evidence so far: `just check` passed (452 tests; formatting/clippy clean)
+with the Task 1 SDK/compiler environment. `just flatpak-sources` and
+`just flatpak-prefetch` passed; offline build is in progress. Direct comparison
+against `291b967` verified unchanged Cargo.lock, manifest permissions, SDK/runtime
+and build settings, and wallpaper/leader/accent/thumbnail implementations.
+TempDir preservation tests and production identity guards passed. The
+[store handoff](20260922-daymural-cosmic-ext-store-handoff.md) records the exact
+three store path changes and preserves metadata verified from PR #298's public
+diff. No published replacement commit exists yet; pinning it remains external.
+Attended upgrade checks have not been performed.
+
+Claude setup resolved `/home/ercling/.local/share/claude/versions/2.1.275`
+with fingerprint
+`5c5845161d8cc8b371fcda77b3c6cdb10ba11b5259720df9e445f21cee8792c9`,
+matching this plan's structured authorization. Review outcome is pending.
 
 ### Task 5: Finalize documentation and execution records
 
