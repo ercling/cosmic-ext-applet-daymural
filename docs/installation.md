@@ -113,7 +113,9 @@ This upgrade preserves data; the separate historical rename below does not.
 
 ### Flatpak upgrade
 
-Perform these steps on the host, offline, before the new applet's first launch.
+Perform these steps on the host before the new applet's first launch. Keep all
+applet instances stopped during the state transfer. The build and installation
+commands in step 5 may need network access to download build inputs.
 Do not run old and new instances together: their private state roots have
 separate leadership locks even though the storage suffix is unchanged.
 
