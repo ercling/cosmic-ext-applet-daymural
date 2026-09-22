@@ -19,6 +19,13 @@ Daymural is not published in the COSMIC Store yet. From a source checkout, you
 can build and install the Flatpak locally. This is the recommended installation
 method.
 
+Existing users: follow [the data-preserving cosmic-ext upgrade](docs/installation.md#upgrading-to-the-cosmic-ext-identity)
+before installing. The public ID is `io.github.ercling.cosmic-ext-applet-daymural`;
+the retained storage ID is `io.github.ercling.cosmic-applet-daymural`. Native data
+stays in place; Flatpak private history and thumbnails need a host-side transfer
+before first launch. Shared settings and accent recovery records need no transfer.
+Remove the old panel entry and re-add Daymural after installation.
+
 ### Build and install locally with Flatpak
 
 You need `flatpak-builder`, [`uv`](https://docs.astral.sh/uv/), `appstreamcli`,

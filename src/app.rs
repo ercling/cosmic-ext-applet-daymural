@@ -8180,6 +8180,156 @@ mod tests {
         );
     }
 
+    fn upgrade_documentation_contract(guide: &str) -> bool {
+        let Some((_, upgrade)) = guide.split_once("## Upgrading to the cosmic-ext identity") else {
+            return false;
+        };
+        let Some((upgrade, _)) =
+            upgrade.split_once("## Upgrading from the previous applet identity")
+        else {
+            return false;
+        };
+        let normalized = upgrade.split_whitespace().collect::<Vec<_>>().join(" ");
+        let required = [
+            "public App ID is now `io.github.ercling.cosmic-ext-applet-daymural`",
+            "storage ID remains `io.github.ercling.cosmic-applet-daymural`",
+            "Native data needs no transfer.",
+            "The new `just uninstall` does not remove old-ID assets.",
+            "Do not remove the unchanged `daymural` binary after installing its replacement.",
+            "Shared COSMIC settings, accent snapshots/last-written records and the coordination mailbox need no transfer.",
+            "Never copy sandbox-local configuration over host settings or accent records.",
+            "Old: `~/.var/app/io.github.ercling.cosmic-applet-daymural/.local/state/io.github.ercling.cosmic-applet-daymural/`",
+            "New: `~/.var/app/io.github.ercling.cosmic-ext-applet-daymural/.local/state/io.github.ercling.cosmic-applet-daymural/`",
+            "Respect effective XDG overrides",
+            "`HOST_XDG_CONFIG_HOME`",
+            "Transfer only `catalogue.json` and `thumbs/`",
+            "Include every thumbnail sidecar and failed-decode record within `thumbs/`.",
+            "Stop on any destination conflict; never overwrite or merge existing destination entries.",
+            "Do not copy `config/` or lock files.",
+            "Stop on a failed transfer; do not launch against partially transferred state.",
+            "Verify both copied entries against their sources before proceeding.",
+            "Keep the old data and backups after the upgrade.",
+            "without `--delete-data`",
+            "Keep `~/Pictures/BingWallpaper` and the applied wallpaper unchanged.",
+            "### Rollback",
+            "re-add **Daymural**",
+        ];
+        if !required.iter().all(|part| normalized.contains(part)) {
+            return false;
+        }
+        // Validate order within each route, so earlier installation examples
+        // elsewhere in the guide cannot satisfy an upgrade ordering assertion.
+        let ordered = |steps: &[&str]| {
+            let mut remainder = normalized.as_str();
+            for step in steps {
+                let Some((_, tail)) = remainder.split_once(step) else {
+                    return false;
+                };
+                remainder = tail;
+            }
+            true
+        };
+        ordered(&[
+            "### Native upgrade",
+            "stop its processes",
+            "Back up",
+            "rm -f \"$HOME/.local/share/applications/io.github.ercling.cosmic-applet-daymural.desktop\"",
+            "\"$HOME/.local/share/icons/hicolor/scalable/apps/io.github.ercling.cosmic-applet-daymural-symbolic.svg\"",
+            "run `just install`",
+            "re-add **Daymural**",
+        ]) && ordered(&[
+            "### Flatpak upgrade",
+            "1. Stop all old and new Daymural instances.",
+            "2. Back up the old private state and shared configuration before making changes.",
+            "3. Inspect these exact default private state roots",
+            "4. Transfer only `catalogue.json` and `thumbs/`",
+            "5. Keep the old data and backups after the upgrade.",
+            "6. Launch only after the transfer is complete.",
+            "re-add **Daymural**",
+        ])
+    }
+
+    #[test]
+    fn upgrade_documentation_preserves_native_and_flatpak_data() {
+        assert!(upgrade_documentation_contract(INSTALLATION_GUIDE));
+        let locations = INSTALLATION_GUIDE
+            .split_once("## Data locations")
+            .unwrap()
+            .1;
+        for path in [
+            "~/.config/cosmic/io.github.ercling.cosmic-applet-daymural/",
+            "~/.local/state/io.github.ercling.cosmic-applet-daymural/",
+            "~/.var/app/io.github.ercling.cosmic-ext-applet-daymural/.local/state/io.github.ercling.cosmic-applet-daymural/",
+            "~/Pictures/BingWallpaper",
+        ] {
+            assert!(locations.contains(path), "missing data location: {path}");
+        }
+        assert!(README.contains("docs/installation.md#upgrading-to-the-cosmic-ext-identity"));
+        assert!(README.contains(APP_ID));
+        assert!(README.contains(STORAGE_ID));
+        assert!(
+            AGENT_GUIDE.contains(
+                "`APP_ID` names public integration. `STORAGE_ID` names applet/coordination"
+            )
+        );
+        assert!(AGENT_GUIDE.contains("silently change durable storage identity"));
+    }
+
+    #[test]
+    fn upgrade_documentation_rejects_unsafe_transfer_mutations() {
+        // Text-only tests: never execute documentation commands or resolve
+        // their real user paths, even on an isolated build machine.
+        for (before, after) in [
+            (
+                "Stop on any destination conflict; never overwrite",
+                "Ignore any destination conflict; overwrite",
+            ),
+            (
+                "or merge existing destination entries.",
+                "existing destination entries.",
+            ),
+            (
+                "Do not copy `config/` or lock files.",
+                "Copy `config/` and lock files.",
+            ),
+            (
+                "Transfer only `catalogue.json` and `thumbs/`",
+                "Transfer `catalogue.json`, `thumbs/`, `config/` and locks",
+            ),
+            (
+                "Keep the old data and backups after the upgrade.",
+                "Delete the old data and backups after the upgrade.",
+            ),
+            (
+                "Stop on a failed transfer; do not launch against partially transferred state.",
+                "Launch even if the transfer failed.",
+            ),
+            (
+                "$HOME/.local/share/applications/io.github.ercling.cosmic-applet-daymural.desktop",
+                "$HOME/.local/share/applications/io.github.ercling.cosmic-ext-applet-daymural.desktop",
+            ),
+            ("Never copy sandbox-local", "Copy sandbox-local"),
+        ] {
+            let mutated = INSTALLATION_GUIDE.replace(before, after);
+            assert_ne!(
+                mutated, INSTALLATION_GUIDE,
+                "missing mutation target: {before}"
+            );
+            assert!(
+                !upgrade_documentation_contract(&mutated),
+                "accepted mutation: {before}"
+            );
+        }
+        let start = INSTALLATION_GUIDE.find("4. Transfer only").unwrap();
+        let launch = INSTALLATION_GUIDE.find("6. Launch only after").unwrap();
+        let end = INSTALLATION_GUIDE[launch..].find("\n### Rollback").unwrap() + launch;
+        let mut reordered = INSTALLATION_GUIDE.to_owned();
+        let launch_step = reordered[launch..end].to_owned();
+        reordered.replace_range(launch..end, "");
+        reordered.insert_str(start, &launch_step);
+        assert!(!upgrade_documentation_contract(&reordered));
+    }
+
     // These inputs describe public exports only. Persistent compatibility is
     // checked separately against the exact STORAGE_ID in the storage tests.
     fn public_identity_has_no_storage_namespace(text: &str) -> bool {

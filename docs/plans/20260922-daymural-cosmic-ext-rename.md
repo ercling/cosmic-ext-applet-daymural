@@ -236,35 +236,41 @@ Fluent domain, module/build paths, and the storage namespace are unchanged.
 **Files:** modify `README.md`, `docs/installation.md`, `AGENTS.md`, and
 documentation-contract tests in `src/app.rs`.
 
-- [ ] Document public/storage identity separation, retained native data, old
+- [x] Document public/storage identity separation, retained native data, old
       desktop/icon removal, new install commands, panel re-addition, and rollback.
-- [ ] Add a new sibling upgrade section; preserve the historical
+- [x] Add a new sibling upgrade section; preserve the historical
       `Upgrading from the previous applet identity` section and its guarded
       warning about the older CosmicBingWallpaper rename. Its no-migration
       behavior does not apply to this rename.
-- [ ] Before native installation, explicitly remove the old
+- [x] Before native installation, explicitly remove the old
       `$HOME/.local/share/applications/io.github.ercling.cosmic-applet-daymural.desktop`
       and `$HOME/.local/share/icons/hicolor/scalable/apps/io.github.ercling.cosmic-applet-daymural-symbolic.svg`.
       Do not rely on the new `just uninstall` to remove old-ID assets, and do
       not remove the unchanged `daymural` binary after installing its replacement.
-- [ ] Document the concrete shared/private paths in Technical Details. Native
+- [x] Document the concrete shared/private paths in Technical Details. Native
       data and shared COSMIC configuration need no transfer. Explicitly forbid
       copying sandbox-local configuration over host settings or accent records.
-- [ ] Add an AGENTS.md invariant: APP_ID names public integration; STORAGE_ID
+- [x] Add an AGENTS.md invariant: APP_ID names public integration; STORAGE_ID
       names applet/coordination config, watchers and applet state. Future public
       renames must not silently change durable storage identity.
-- [ ] Provide ordered Flatpak upgrade steps with old/new instances stopped,
+- [x] Provide ordered Flatpak upgrade steps with old/new instances stopped,
       backup before changes, transfer of private durable state before first
       launch, explicit conflict handling, and retention of the backup/old data.
       Transfer only catalogue.json and thumbs/; exclude locks and config.
-- [ ] Success tests: documentation contracts verify exact old/new paths,
+- [x] Success tests: documentation contracts verify exact old/new paths,
       stop/back-up/transfer/launch ordering, the transfer allowlist, unchanged
       shared settings, explicit old native asset removal and retained backups.
-- [ ] Failure tests: deliberate documentation mutations omitting the conflict
+- [x] Failure tests: deliberate documentation mutations omitting the conflict
       stop/non-clobber safeguards, admitting config or lock copying, deleting
       backups, or reversing launch/transfer ordering fail the contracts. Test
       the documentation strings, not shell commands or coreutils failures.
-- [ ] Test gate: documentation-contract tests and `just check` must pass before Task 4.
+- [x] Test gate: documentation-contract tests and `just check` must pass before Task 4.
+
+Task 3 validation: `just check` passed (452 tests; formatting and clippy clean),
+using the SDK toolchain/compiler environment recorded for Task 1. Two hermetic
+documentation tests cover exact paths, ordered native cleanup and Flatpak
+transfer, retained settings/backups, rollback guidance, and deliberate unsafe
+text mutations. No upgrade commands were executed against user data.
 
 ### Task 4: Verify acceptance and prepare the store handoff
 

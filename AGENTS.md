@@ -113,6 +113,12 @@ unless the underlying dependency facts have been re-verified.
 
 ## Core Behavioral Invariants
 
+### Public and persistent identity
+
+- `APP_ID` names public integration. `STORAGE_ID` names applet/coordination
+  config, their watchers, and applet state. Future public renames must not
+  silently change durable storage identity.
+
 ### Refresh, catalogue, and timers
 
 - Keep network/download/thumbnail work off the UI thread.
