@@ -34,7 +34,7 @@ use crate::leader::Leadership;
 use crate::{accent, bing, lockwatch, schedule, thumbs, tooltip, view, wallpaper};
 
 /// Public application/Wayland identity and installed desktop entry.
-pub const APP_ID: &str = "io.github.ercling.cosmic-applet-daymural";
+pub const APP_ID: &str = "io.github.ercling.cosmic-ext-applet-daymural";
 
 /// Stable namespace for settings, coordination, and durable state. Public
 /// integration renames must preserve this value to retain existing user data.
@@ -5480,14 +5480,14 @@ mod tests {
 
     #[test]
     fn app_id_is_reverse_dns() {
-        assert_eq!(APP_ID, "io.github.ercling.cosmic-applet-daymural");
+        assert_eq!(APP_ID, "io.github.ercling.cosmic-ext-applet-daymural");
         assert_eq!(<Window as cosmic::Application>::APP_ID, APP_ID);
         assert!(APP_ID.split('.').count() >= 3);
     }
 
     #[test]
     fn cargo_identity_is_daymural() {
-        const PROJECT_URL: &str = "https://github.com/ercling/cosmic-applet-daymural";
+        const PROJECT_URL: &str = "https://github.com/ercling/cosmic-ext-applet-daymural";
 
         assert_eq!(env!("CARGO_PKG_NAME"), "daymural");
         assert_eq!(env!("CARGO_PKG_REPOSITORY"), PROJECT_URL);
@@ -5507,6 +5507,7 @@ mod tests {
     fn state_paths_live_under_the_storage_id() {
         let root = tempfile::tempdir().unwrap();
         assert_eq!(STORAGE_ID, "io.github.ercling.cosmic-applet-daymural");
+        assert_ne!(APP_ID, STORAGE_ID);
         assert_eq!(state_path(root.path()), root.path().join(STORAGE_ID));
     }
 
@@ -6788,13 +6789,15 @@ mod tests {
         assert_eq!(web_url(""), None);
     }
 
-    const DESKTOP: &str = include_str!("../data/io.github.ercling.cosmic-applet-daymural.desktop");
+    const DESKTOP: &str =
+        include_str!("../data/io.github.ercling.cosmic-ext-applet-daymural.desktop");
     const METAINFO: &str =
-        include_str!("../data/io.github.ercling.cosmic-applet-daymural.metainfo.xml");
+        include_str!("../data/io.github.ercling.cosmic-ext-applet-daymural.metainfo.xml");
     const FLATPAK_MANIFEST: &str =
-        include_str!("../packaging/flatpak/io.github.ercling.cosmic-applet-daymural.json");
+        include_str!("../packaging/flatpak/io.github.ercling.cosmic-ext-applet-daymural.json");
     const JUSTFILE: &str = include_str!("../justfile");
     const README: &str = include_str!("../README.md");
+    const PACKAGING_GUIDE: &str = include_str!("../docs/packaging.md");
     const INSTALLATION_GUIDE: &str = include_str!("../docs/installation.md");
     const SCREENSHOT_PROVENANCE: &str = include_str!("../resources/screenshots/README.md");
     const STORE_SCREENSHOT: &[u8] = include_bytes!("../resources/screenshots/screenshot-main.png");
@@ -6814,7 +6817,7 @@ mod tests {
     const RUST_WORKFLOW: &str = include_str!("../.github/workflows/rust.yml");
     const FLATPAK_WORKFLOW: &str = include_str!("../.github/workflows/flatpak.yml");
     const FLATPAK_MANIFEST_PATH: &str =
-        "packaging/flatpak/io.github.ercling.cosmic-applet-daymural.json";
+        "packaging/flatpak/io.github.ercling.cosmic-ext-applet-daymural.json";
     const FLATPAK_BUILD_MANIFEST_PATH: &str = ".daymural-flatpak-manifest.json";
     const CARGO_SOURCES_MANIFEST_FILENAME: &str = "cargo-sources.json";
     const CARGO_SOURCES_REPOSITORY_PATH: &str = "packaging/flatpak/cargo-sources.json";
@@ -7269,7 +7272,7 @@ mod tests {
     #[test]
     fn flatpak_manifest_rejects_an_uppercase_application_id() {
         let uppercase = FLATPAK_MANIFEST.replace(
-            "io.github.ercling.cosmic-applet-daymural",
+            "io.github.ercling.cosmic-ext-applet-daymural",
             "io.github.ercling.CosmicAppletDaymural",
         );
         assert!(
@@ -7379,8 +7382,8 @@ mod tests {
                 "echo cargo --offline fetch --locked --manifest-path Cargo.toml --verbose",
             ),
             (
-                "install -Dm644 data/io.github.ercling.cosmic-applet-daymural.metainfo.xml /app/share/metainfo/io.github.ercling.cosmic-applet-daymural.metainfo.xml",
-                "echo install -Dm644 data/io.github.ercling.cosmic-applet-daymural.metainfo.xml /app/share/metainfo/io.github.ercling.cosmic-applet-daymural.metainfo.xml",
+                "install -Dm644 data/io.github.ercling.cosmic-ext-applet-daymural.metainfo.xml /app/share/metainfo/io.github.ercling.cosmic-ext-applet-daymural.metainfo.xml",
+                "echo install -Dm644 data/io.github.ercling.cosmic-ext-applet-daymural.metainfo.xml /app/share/metainfo/io.github.ercling.cosmic-ext-applet-daymural.metainfo.xml",
             ),
             (
                 "cargo --offline build --release --locked --verbose",
@@ -7618,8 +7621,8 @@ mod tests {
         }
 
         let wrong_manifest_path = JUSTFILE.replace(
-            "flatpak-manifest := 'packaging/flatpak/io.github.ercling.cosmic-applet-daymural.json'",
-            "flatpak-manifest := 'io.github.ercling.cosmic-applet-daymural.json'",
+            "flatpak-manifest := 'packaging/flatpak/io.github.ercling.cosmic-ext-applet-daymural.json'",
+            "flatpak-manifest := 'io.github.ercling.cosmic-ext-applet-daymural.json'",
         );
         assert!(
             validate_flatpak_tooling(FLATPAK_MANIFEST, CARGO_SOURCES_SCRIPT, &wrong_manifest_path,)
@@ -7892,7 +7895,7 @@ mod tests {
             CARGO_SOURCES_REPOSITORY_PATH.to_owned(),
             "astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b".to_owned(),
             "version: \"0.12.1\"".to_owned(),
-            "appstreamcli validate --pedantic --explain --strict --no-net --override cid-contains-uppercase-letter=error data/io.github.ercling.cosmic-applet-daymural.metainfo.xml".to_owned(),
+            "appstreamcli validate --pedantic --explain --strict --no-net --override cid-contains-uppercase-letter=error data/io.github.ercling.cosmic-ext-applet-daymural.metainfo.xml".to_owned(),
             FLATPAK_BUILDER_ACTION.to_owned(),
             format!("bundle: {}.flatpak", env!("CARGO_PKG_NAME")),
         ] {
@@ -7966,8 +7969,8 @@ mod tests {
                 "python3 flatpak/test_git_manifest_scan.py",
             ),
             FLATPAK_WORKFLOW.replace(
-                "manifest-path: packaging/flatpak/io.github.ercling.cosmic-applet-daymural.json",
-                "manifest-path: io.github.ercling.cosmic-applet-daymural.json",
+                "manifest-path: packaging/flatpak/io.github.ercling.cosmic-ext-applet-daymural.json",
+                "manifest-path: io.github.ercling.cosmic-ext-applet-daymural.json",
             ),
             FLATPAK_WORKFLOW.replace("packaging/flatpak/cargo-sources.json", "cargo-sources.json"),
         ] {
@@ -8146,6 +8149,7 @@ mod tests {
             ("Rust workflow", RUST_WORKFLOW),
             ("Flatpak workflow", FLATPAK_WORKFLOW),
             ("README", README),
+            ("packaging guide", PACKAGING_GUIDE),
             (
                 "installation guide before explicit uninstall instructions",
                 &INSTALLATION_GUIDE[..uninstall_start],
@@ -8174,6 +8178,33 @@ mod tests {
             CLAUDE_GUIDE, "# Claude Code\n\n@AGENTS.md\n",
             "CLAUDE.md must remain a thin loader for the shared agent guide"
         );
+    }
+
+    // These inputs describe public exports only. Persistent compatibility is
+    // checked separately against the exact STORAGE_ID in the storage tests.
+    fn public_identity_has_no_storage_namespace(text: &str) -> bool {
+        !text.contains(STORAGE_ID)
+            && !text.contains("https://github.com/ercling/cosmic-applet-daymural")
+    }
+
+    #[test]
+    fn public_packaging_rejects_mixed_old_and_new_identities() {
+        for (name, text) in [
+            ("desktop", DESKTOP),
+            ("metainfo", METAINFO),
+            ("manifest", FLATPAK_MANIFEST),
+            ("native install", JUSTFILE),
+            ("workflow", FLATPAK_WORKFLOW),
+            ("packaging guide", PACKAGING_GUIDE),
+            ("Cargo metadata", include_str!("../Cargo.toml")),
+        ] {
+            assert!(public_identity_has_no_storage_namespace(text), "{name}");
+            // Mutate just one occurrence: mixed identities must fail even when
+            // other fields still carry the correct public ID.
+            let drift = text.replacen("cosmic-ext-applet-daymural", "cosmic-applet-daymural", 1);
+            assert_ne!(drift, text, "{name} must expose a public identity");
+            assert!(!public_identity_has_no_storage_namespace(&drift), "{name}");
+        }
     }
 
     fn identity_inventory(root: &Path) -> std::io::Result<Vec<PathBuf>> {
@@ -8209,6 +8240,7 @@ mod tests {
         paths.iter().any(|path| {
             let path = path.to_string_lossy();
             path.contains("io.github.ercling.CosmicBingWallpaper")
+                || path.contains("io.github.ercling.cosmic-applet-daymural")
                 || path.contains("cosmic-bing-wallpaper")
                 || path.contains("cosmic_bing_wallpaper")
         })
@@ -8220,9 +8252,9 @@ mod tests {
         let inventory = identity_inventory(root).expect("repository identity inventory");
         assert!(!inventory_has_legacy_identity(&inventory));
         for expected in [
-            "packaging/flatpak/io.github.ercling.cosmic-applet-daymural.json",
-            "data/io.github.ercling.cosmic-applet-daymural.desktop",
-            "data/icons/io.github.ercling.cosmic-applet-daymural-symbolic.svg",
+            "packaging/flatpak/io.github.ercling.cosmic-ext-applet-daymural.json",
+            "data/io.github.ercling.cosmic-ext-applet-daymural.desktop",
+            "data/icons/io.github.ercling.cosmic-ext-applet-daymural-symbolic.svg",
             "i18n/en/daymural.ftl",
         ] {
             assert!(
@@ -8232,6 +8264,10 @@ mod tests {
         }
 
         for relative in [
+            "io.github.ercling.cosmic-applet-daymural.json",
+            "data/io.github.ercling.cosmic-applet-daymural.desktop",
+            "data/io.github.ercling.cosmic-applet-daymural.metainfo.xml",
+            "data/icons/io.github.ercling.cosmic-applet-daymural-symbolic.svg",
             "io.github.ercling.CosmicBingWallpaper.json",
             "data/io.github.ercling.CosmicBingWallpaper.desktop",
             "data/icons/io.github.ercling.CosmicBingWallpaper-symbolic.svg",
@@ -8302,11 +8338,11 @@ mod tests {
 
         let mismatches = [
             (
-                "<id>io.github.ercling.cosmic-applet-daymural</id>",
+                "<id>io.github.ercling.cosmic-ext-applet-daymural</id>",
                 "<id>wrong.id</id>",
             ),
             (
-                "io.github.ercling.cosmic-applet-daymural.desktop",
+                "io.github.ercling.cosmic-ext-applet-daymural.desktop",
                 "wrong.id.desktop",
             ),
             ("<binary>daymural</binary>", "<binary>wrong</binary>"),
@@ -8342,7 +8378,7 @@ mod tests {
             "a metainfo filename that does not match APP_ID must fail"
         );
         let desktop = DESKTOP.replace(
-            "Icon=io.github.ercling.cosmic-applet-daymural-symbolic",
+            "Icon=io.github.ercling.cosmic-ext-applet-daymural-symbolic",
             "Icon=wrong-symbolic",
         );
         assert!(

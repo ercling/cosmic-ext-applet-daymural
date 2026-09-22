@@ -202,26 +202,34 @@ uses the retained storage namespace. Rename and update:
 - `packaging/flatpak/io.github.ercling.cosmic-applet-daymural.json` to
   `packaging/flatpak/io.github.ercling.cosmic-ext-applet-daymural.json`
 
-- [ ] Set public APP_ID to the new identifier; retain STORAGE_ID unchanged.
+- [x] Set public APP_ID to the new identifier; retain STORAGE_ID unchanged.
       Update every installed identity, filename, embedded include, install
       command, workflow artifact, homepage expectation and active URL consumer
       in the same task. Do not rename `daymural` or its Fluent resources.
-- [ ] Preserve all manifest permissions, runtime/SDK pins, generated-source
+- [x] Preserve all manifest permissions, runtime/SDK pins, generated-source
       layout, module name, CARGO_HOME, and dependency lockfile contents.
-- [ ] Success tests: coherent new public identity passes native and Flatpak
+- [x] Success tests: coherent new public identity passes native and Flatpak
       contracts while old storage remains readable after the public ID changes.
       Assert `APP_ID != STORAGE_ID`; run Task 1's production-site guards under
       the now-distinct IDs. Add `docs/packaging.md` to documentation identity
       coverage, including a deliberate stale-ID mutation.
-- [ ] Failure tests: reject mixed old/new desktop, icon, manifest, workflow,
+- [x] Failure tests: reject mixed old/new desktop, icon, manifest, workflow,
       metainfo and install identities; ensure retained storage references are
       explicitly distinguished from accidental public-identity leftovers.
       Use narrowly scoped compatibility sections/constant assertions rather
       than exempting whole files from identity checks.
-- [ ] Test gate: `just check`, `python3 packaging/flatpak/test_git_manifest_scan.py`,
+- [x] Test gate: `just check`, `python3 packaging/flatpak/test_git_manifest_scan.py`,
       `desktop-file-validate data/io.github.ercling.cosmic-ext-applet-daymural.desktop`,
       and `appstreamcli validate --pedantic --explain --strict --no-net --override cid-contains-uppercase-letter=error data/io.github.ercling.cosmic-ext-applet-daymural.metainfo.xml`
       must pass before Task 3.
+
+Task 2 validation: `just check` passed (450 tests; formatting and clippy clean),
+using the same SDK toolchain and compiler environment recorded for Task 1.
+The packaging Python helper test, desktop-file validator, and strict no-network
+AppStream validator passed. Desktop validation emitted only the existing
+COSMIC category hint. Public assets and active repository URLs now use the
+cosmic-ext identity; Cargo.lock, runtime/SDK pins, sandbox permissions, binary,
+Fluent domain, module/build paths, and the storage namespace are unchanged.
 
 ### Task 3: Document and verify a data-preserving upgrade
 
