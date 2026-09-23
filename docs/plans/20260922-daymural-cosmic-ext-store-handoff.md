@@ -12,7 +12,7 @@ Display name, executable, Cargo package, module name, and Fluent domain remain
 Daymural / `daymural`. Persistent storage remains
 `io.github.ercling.cosmic-applet-daymural`. Native settings/state and shared
 host COSMIC config require no migration. Follow
-[the upgrade guide](../installation.md#upgrading-to-the-cosmic-ext-identity)
+[the upgrade guide](../../installation.md#upgrading-to-the-cosmic-ext-identity)
 for the private Flatpak catalogue/thumbnail transfer and panel re-addition.
 
 Hermetic tests verify retained settings, accent recovery fields, mailbox,
@@ -40,7 +40,8 @@ regressions. Its install-before-uninstall documentation minor was fixed in
 contract/mutation tests; final `just check` passed all 453 tests, formatting
 and clippy. The repeated AppStream metadata suggestion remains deliberately
 declined. Task 4 automated acceptance is complete; attended and external
-acceptance remain pending as described below.
+acceptance remain pending as described below. Final internal quality and
+implementation critical reviews reported no issues.
 
 ## Exact store changes
 

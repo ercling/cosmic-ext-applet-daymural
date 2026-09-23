@@ -346,15 +346,45 @@ patch; Task 4 is complete, with attended and external work explicitly pending.
 
 **Files:** `README.md`, `docs/installation.md`, this plan and its store handoff.
 
-- [ ] Cross-check upgrade guidance against the tested implementation; record
+- [x] Cross-check upgrade guidance against the tested implementation; record
       deviations and any unavailable build or manual acceptance gates.
-- [ ] Verify active links/names are consistent, allowing explicit compatibility
+- [x] Verify active links/names are consistent, allowing explicit compatibility
       references and historical plans; rerun `just check` after any code or
       embedded-documentation-contract change.
 - [ ] Archive the plan under `docs/plans/completed/` through the execution
       workflow only after required implementation/review gates are satisfied;
       archive its store-handoff companion alongside it and update links.
       Retain external follow-ups without marking them performed.
+
+Task 5 final audit: README, installation guidance, public assets, source/storage
+identities and the store handoff match the tested implementation. Old-ID
+references outside historical plans are limited to retained storage, upgrade
+instructions and deliberate compatibility/drift tests. Local documentation
+links were checked, including the handoff link prepared for the companion's
+archive location. Public repository URLs use the intended cosmic-ext name;
+remote rename, publication and redirect verification remain external work.
+
+Internal comprehensive review, smells review, critical re-review and the final
+quality/implementation critical pass are clean after the documented fixes.
+Two authorized Claude reviews completed; confirmed findings are resolved,
+with the planned AppStream policy and source-consumer guards retained. No
+required automated gate is unavailable: final `just check` passed all 453 tests,
+formatting and clippy; packaging validators and final production offline
+Flatpak build passed as recorded in Tasks 2 and 4. Task 5 changes only these
+execution documents, so no code/embedded-documentation-contract rerun is needed.
+
+Execution decisions/deviations: work stayed in the current checkout with
+focused authorized commits. Installed SDK Rust tools and GCC resolved local
+toolchain/ccache issues without changing dependencies or machine configuration.
+Upgrade transfer remains documented, without executable migration machinery.
+Review fanout was batched for runtime limits. Explicit user authorization
+resolved the initial Claude export block; the still-installed authorized
+Claude 2.1.275 was used after the default command updated, preserving the exact
+reviewer fingerprint. Fetch/rebase finalization remains skipped because those
+actions were not authorized. No applet was installed or launched, no live
+upgrade was exercised, and nothing was published or pushed. Attended native/
+Flatpak upgrade, accent restore, multi-output ownership, GitHub/store updates
+and reviewer acceptance remain pending under Post-Completion and the handoff.
 
 ## Plan Review Disposition
 
