@@ -351,7 +351,7 @@ patch; Task 4 is complete, with attended and external work explicitly pending.
 - [x] Verify active links/names are consistent, allowing explicit compatibility
       references and historical plans; rerun `just check` after any code or
       embedded-documentation-contract change.
-- [ ] Archive the plan under `docs/plans/completed/` through the execution
+- [x] Archive the plan under `docs/plans/completed/` through the execution
       workflow only after required implementation/review gates are satisfied;
       archive its store-handoff companion alongside it and update links.
       Retain external follow-ups without marking them performed.
@@ -385,6 +385,13 @@ actions were not authorized. No applet was installed or launched, no live
 upgrade was exercised, and nothing was published or pushed. Attended native/
 Flatpak upgrade, accent restore, multi-output ownership, GitHub/store updates
 and reviewer acceptance remain pending under Post-Completion and the handoff.
+
+Task 5 archive verification: the execution workflow moved this plan and its
+store-handoff companion together under `docs/plans/completed/` (archive commits
+`3f11306` and `1f9a363`). All 15 local links across README, installation,
+packaging, this plan and the handoff resolve at their actual final locations;
+old active plan paths are absent. All five implementation tasks are complete.
+External and attended follow-ups remain explicitly unperformed.
 
 ## Plan Review Disposition
 
