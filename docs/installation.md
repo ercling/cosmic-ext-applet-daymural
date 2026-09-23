@@ -148,10 +148,14 @@ separate leadership locks even though the storage suffix is unchanged.
    Verify both copied entries against their sources before proceeding. Resolve
    a conflict or failure manually using the backups while all instances remain
    stopped; do not treat a partially populated destination as a completed upgrade.
-5. Keep the old data and backups after the upgrade. Uninstall the old identity
-   with `flatpak uninstall --user io.github.ercling.cosmic-applet-daymural`
-   without `--delete-data`. From the new checkout, run `just flatpak-sources`
-   and `just flatpak-install`; these install the new public identity.
+5. Keep the old data and backups after the upgrade. From the new checkout, run
+   `just flatpak-sources` and `just flatpak-install` to install the new public
+   identity while all applet instances remain stopped. Only after the new
+   installation succeeds, uninstall the old identity with
+   `flatpak uninstall --user io.github.ercling.cosmic-applet-daymural`
+   without `--delete-data`. If the build or installation fails, keep the old
+   installation and retry this step after resolving the failure; do not repeat
+   the completed state transfer or launch either applet during the retry.
 6. Launch only after the transfer is complete. Restart `cosmic-panel` or log out
    and back in, then re-add **Daymural** in **COSMIC Settings → Desktop → Panel →
    Configure panel applets**. Verify settings, history, the current wallpaper,

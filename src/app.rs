@@ -8253,6 +8253,9 @@ mod tests {
             "Stop on a failed transfer; do not launch against partially transferred state.",
             "Verify both copied entries against their sources before proceeding.",
             "Keep the old data and backups after the upgrade.",
+            "Only after the new installation succeeds, uninstall the old identity",
+            "If the build or installation fails, keep the old installation and retry this step",
+            "do not repeat the completed state transfer or launch either applet during the retry.",
             "without `--delete-data`",
             "Keep `~/Pictures/BingWallpaper` and the applied wallpaper unchanged.",
             "### Rollback",
@@ -8288,6 +8291,9 @@ mod tests {
             "3. Inspect these exact default private state roots",
             "4. Transfer only `catalogue.json` and `thumbs/`",
             "5. Keep the old data and backups after the upgrade.",
+            "`just flatpak-sources`",
+            "`just flatpak-install`",
+            "`flatpak uninstall --user io.github.ercling.cosmic-applet-daymural`",
             "6. Launch only after the transfer is complete.",
             "re-add **Daymural**",
         ])
@@ -8353,6 +8359,14 @@ mod tests {
                 "$HOME/.local/share/applications/io.github.ercling.cosmic-ext-applet-daymural.desktop",
             ),
             ("Never copy sandbox-local", "Copy sandbox-local"),
+            (
+                "Only after the new\n   installation succeeds",
+                "Before the new\n   installation succeeds",
+            ),
+            (
+                "If the build or installation fails, keep the old\n   installation",
+                "If the build or installation fails, remove the old\n   installation",
+            ),
         ] {
             let mutated = INSTALLATION_GUIDE.replace(before, after);
             assert_ne!(
@@ -8371,6 +8385,14 @@ mod tests {
         let launch_step = reordered[launch..end].to_owned();
         reordered.replace_range(launch..end, "");
         reordered.insert_str(start, &launch_step);
+        assert!(!upgrade_documentation_contract(&reordered));
+
+        let install = "`just flatpak-install`";
+        let uninstall = "`flatpak uninstall --user io.github.ercling.cosmic-applet-daymural`";
+        let reordered = INSTALLATION_GUIDE
+            .replace(install, "INSTALL_PLACEHOLDER")
+            .replace(uninstall, install)
+            .replace("INSTALL_PLACEHOLDER", uninstall);
         assert!(!upgrade_documentation_contract(&reordered));
     }
 
