@@ -128,5 +128,5 @@ Before handing off packaging changes:
 CI and local format validators cover declarative syntax. The hermetic Rust tests
 cover deliberate identity, command, path, and permission drift. Detailed design
 evidence remains in
-[the Flatpak distribution plan](plans/20260820-flatpak-distribution.md) and
+[the Flatpak distribution plan](plans/completed/20260820-flatpak-distribution.md) and
 [the completed packaging plan](plans/completed/20260825-centralize-flatpak-packaging.md).

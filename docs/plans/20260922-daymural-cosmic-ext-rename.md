@@ -185,6 +185,15 @@ path is not used by this applet. Remaining runtime public-ID consumers are
 watchers, both config factories, injected config contexts, and the state-root
 suffix now use `STORAGE_ID`; no leader or accent state-machine behavior changes.
 
+External-review follow-up: exercise the production state-root fallback and
+catalogue-join decisions through pure injected helpers, covering both resolved
+and fallback absolute roots under TempDir without reading real user paths.
+Storage source guards tolerate whitespace, trailing call commas, and additional
+legitimate factories; state suffix behavior is covered by path tests instead
+of a source spelling. Retain source guards for factories/watchers as required
+above: an accessor alone cannot detect a consumer switching to APP_ID. Retain
+the planned decision against mandatory AppStream replacement metadata.
+
 ### Task 2: Rename the public integration and its packaging atomically
 
 **Files:** modify `src/app.rs`, `Cargo.toml`, `justfile`,

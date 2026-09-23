@@ -66,12 +66,17 @@ pub fn run() -> cosmic::iced::Result {
 /// working directory).
 pub fn state_dir() -> &'static Path {
     static STATE_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
-        state_path(&dirs::state_dir().unwrap_or_else(|| {
+        resolve_state_path(dirs::state_dir(), || {
             tracing::warn!("no home directory: keeping applet state in the temp dir");
             std::env::temp_dir()
-        }))
+        })
     });
     &STATE_DIR
+}
+
+/// Resolve the same fallback decision with injected roots in hermetic tests.
+fn resolve_state_path(root: Option<PathBuf>, fallback: impl FnOnce() -> PathBuf) -> PathBuf {
+    state_path(&root.unwrap_or_else(fallback))
 }
 
 /// Append the stable namespace to an injected, already resolved state root.
@@ -81,7 +86,11 @@ fn state_path(root: &Path) -> PathBuf {
 
 /// Where the catalogue JSON is persisted.
 fn catalogue_path() -> PathBuf {
-    state_dir().join(catalogue::CATALOGUE_FILENAME)
+    catalogue_path_in(state_dir())
+}
+
+fn catalogue_path_in(state: &Path) -> PathBuf {
+    state.join(catalogue::CATALOGUE_FILENAME)
 }
 
 #[derive(Default)]
@@ -5511,20 +5520,44 @@ mod tests {
         assert_eq!(state_path(root.path()), root.path().join(STORAGE_ID));
     }
 
+    #[test]
+    fn state_root_resolution_and_catalogue_join_preserve_absolute_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let resolved = root.path().join("state");
+        let fallback = root.path().join("temp");
+        let state = resolve_state_path(Some(resolved.clone()), || panic!("unexpected fallback"));
+        assert_eq!(state, resolved.join(STORAGE_ID));
+        let fallback_state = resolve_state_path(None, || fallback.clone());
+        assert_eq!(fallback_state, fallback.join(STORAGE_ID));
+        for state in [state, fallback_state] {
+            assert!(state.is_absolute());
+            assert_eq!(catalogue_path_in(&state), state.join("catalogue.json"));
+        }
+    }
+
     fn storage_identity_contract(config: &str, app: &str) -> bool {
+        // Formatting and extra legitimate consumers do not change identity.
+        let compact = |source: &str| {
+            source
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>()
+                .replace(",)", ")")
+        };
+        let config = compact(config);
+        let app = compact(app);
         // Scope to production code so test fixtures cannot satisfy the guards.
         let config = config.split("#[cfg(test)]").next().unwrap();
-        let app = app.split("#[cfg(test)]\nmod tests").next().unwrap();
+        let app = app.split("#[cfg(test)]modtests").next().unwrap();
         config
-            .matches("Config::new(STORAGE_ID, Self::VERSION)")
+            .matches("Config::new(STORAGE_ID,Self::VERSION)")
             .count()
-            == 2
+            >= 2
             && !config.contains("Config::new(APP_ID")
             && app.contains("watch_config::<AppletConfig>(STORAGE_ID)")
             && app.contains("watch_config::<CoordinationConfig>(STORAGE_ID)")
             && !app.contains("watch_config::<AppletConfig>(APP_ID)")
             && !app.contains("watch_config::<CoordinationConfig>(APP_ID)")
-            && app.contains("root.join(STORAGE_ID)")
     }
 
     #[test]
@@ -5532,6 +5565,17 @@ mod tests {
         let config = include_str!("config.rs");
         let app = include_str!("app.rs");
         assert!(storage_identity_contract(config, app));
+        assert!(storage_identity_contract(
+            &config.replace(
+                "Config::new(STORAGE_ID, Self::VERSION)",
+                "Config::new(\n STORAGE_ID,\n Self::VERSION,\n)",
+            ),
+            &app.replace("#[cfg(test)]\nmod tests", "#[cfg(test)]\n\nmod tests"),
+        ));
+        assert!(storage_identity_contract(
+            &format!("fn extra() {{ Config::new(STORAGE_ID, Self::VERSION) }}\n{config}"),
+            app,
+        ));
         for occurrence in 0..2 {
             let needle = "Config::new(STORAGE_ID, Self::VERSION)";
             let offset = config.match_indices(needle).nth(occurrence).unwrap().0;
