@@ -17,7 +17,7 @@ for the private Flatpak catalogue/thumbnail transfer and panel re-addition.
 
 Hermetic tests verify retained settings, accent recovery fields, mailbox,
 catalogue and thumbnail identity, both config factories/watchers, shared
-leadership, and mixed-identity rejection. `just check` passed with 452 tests,
+leadership, and mixed-identity rejection. Final review-fix `just check` passed with 453 tests,
 formatting and clippy clean. `just flatpak-sources`, `just flatpak-prefetch`,
 and `just flatpak-build-offline` passed; offline release compilation took
 2m02s, AppStream compose succeeded, and the new-ID desktop/icon/metainfo were
@@ -27,6 +27,20 @@ pins, manifest permissions/build options, and wallpaper, leader, accent, and
 thumbnail implementations unchanged. `~/Pictures/BingWallpaper` is unchanged.
 Attended native/Flatpak upgrade, accent restore, and multi-output acceptance
 remain pending; no live user data was accessed for verification.
+
+Claude 2.1.275 completed the authorized implementation review. Confirmed
+findings were fixed in `ca8304f`, including injected production state-root
+fallback/catalogue-join coverage, less brittle source guards, and a repaired
+packaging-plan link. Required source-consumer guards and the planned AppStream
+metadata policy remain intact. The final patch also passed a fresh offline
+Flatpak build (release compilation 2m02s, AppStream compose and new-ID exports
+successful). Follow-up Claude review confirmed those fixes and no correctness
+regressions. Its install-before-uninstall documentation minor was fixed in
+`078ae01`, with explicit failed-install retry guidance and passing text-only
+contract/mutation tests; final `just check` passed all 453 tests, formatting
+and clippy. The repeated AppStream metadata suggestion remains deliberately
+declined. Task 4 automated acceptance is complete; attended and external
+acceptance remain pending as described below.
 
 ## Exact store changes
 
@@ -111,6 +125,8 @@ authorization; reviewer acceptance remains pending. Do not claim legal clearance
 
 Stop old and new applet instances before attended upgrade testing. Back up
 first, preserve shared COSMIC config and accent recovery, transfer only private
-`catalogue.json` and `thumbs/`, and retain old data/backups. Confirm settings,
+`catalogue.json` and `thumbs/`, and retain old data/backups. Install the new
+Flatpak successfully before uninstalling the old; retry failed installation
+without repeating the completed transfer, keeping all instances stopped. Confirm settings,
 history, applied wallpaper, accent disable/restore, panel re-addition and
 multi-output ownership. Different Flatpak roots do not share a leader lock.

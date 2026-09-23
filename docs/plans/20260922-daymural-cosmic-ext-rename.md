@@ -295,13 +295,13 @@ create `docs/plans/20260922-daymural-cosmic-ext-store-handoff.md`.
 - [x] Produce the exact store file/path changes listed below, preserving PR
       metadata improvements and describing how to rebase its patch and pin the
       final published upstream commit. Do not invent a future commit hash.
-- [ ] Confirm Claude review configuration matches the authorized fingerprint
+- [x] Confirm Claude review configuration matches the authorized fingerprint
       before external review; record review findings and their disposition.
-- [ ] Test gate: all automated checks above pass and handoff matches the final
+- [x] Test gate: all automated checks above pass and handoff matches the final
       upstream patch. Attended checks remain explicitly pending if not performed.
 
-Task 4 evidence so far: `just check` passed (452 tests; formatting/clippy clean)
-with the Task 1 SDK/compiler environment. `just flatpak-sources` and
+Task 4 evidence: final review-fix `just check` passed (453 tests; formatting/
+clippy clean) with the Task 1 SDK/compiler environment. `just flatpak-sources` and
 `just flatpak-prefetch` passed; `just flatpak-build-offline` passed (exit 0,
 release compilation 2m02s, AppStream compose successful, new-ID desktop/icon/
 metainfo exported). These gates did not install or start the applet. Generated
@@ -319,11 +319,28 @@ Attended upgrade checks have not been performed.
 Claude setup resolved `/home/ercling/.local/share/claude/versions/2.1.275`
 with fingerprint
 `5c5845161d8cc8b371fcda77b3c6cdb10ba11b5259720df9e445f21cee8792c9`,
-matching this plan's structured authorization. ⚠️ External review remains
-blocked: automatic approval review rejected launch because it did not accept
-the embedded plan record as user permission for the complete-checkout export.
-The orchestrator requested explicit permission; no Claude result is available.
-The review and final Task 4 gate remain open.
+matching this plan's structured authorization. After explicit user export
+approval, the authorized Claude 2.1.275 review completed successfully. Its
+confirmed findings were fixed in `ca8304f`: production state-root fallback and
+catalogue-join coverage now uses injected pure helpers, source guards tolerate
+formatting/additional factories, and the packaging plan link is repaired. The
+required source-consumer guards and planned AppStream metadata policy were
+retained with reasons recorded in the progress log. The final patch also passed
+a fresh `just flatpak-build-offline` (exit 0, release compilation 2m02s,
+AppStream compose and new-ID exports successful); log:
+`/tmp/daymural-task4-final-offline.log`. Source/prefetch inputs were unchanged
+and their earlier successful gates remain valid. Follow-up Claude review
+completed with exit 0, confirming the prior fixes and no correctness
+regressions. Its actionable minor was fixed in `078ae01`: install the new
+Flatpak before uninstalling the old, preserving rollback on install failure;
+retry the install step without repeating completed state transfer. The final
+`just check` passed formatting, clippy and 453 tests with additional safe-order
+and retry mutation guards (`/tmp/daymural-claude-minor-check.log`). This last
+fix changes only documentation and test code, so the successful offline build
+of production code remains valid. The repeated AppStream metadata suggestion
+remains declined under the approved scope. Both review results and complete
+dispositions are in the progress log. The handoff matches the final upstream
+patch; Task 4 is complete, with attended and external work explicitly pending.
 
 ### Task 5: Finalize documentation and execution records
 
@@ -353,8 +370,10 @@ executing examples against real paths; those review severity claims were
 overstated. This revision nevertheless removes the ambiguities and avoids
 adding migration machinery or testing coreutils. Unverified suggestions about
 mandatory AppStream replacement metadata or renaming the `daymural` package
-are not adopted. This revised plan has not yet received a second Claude review;
-use the user-requested 1,200-second timeout for that review.
+are not adopted. During execution Claude reviewed the implemented revision;
+confirmed implementation findings were fixed in `ca8304f`, with follow-up
+review and the remaining minor disposition recorded in Task 4. The original plan-review record above
+is historical and does not substitute for implementation review.
 
 ## Post-Completion
 
