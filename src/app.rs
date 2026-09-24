@@ -8552,6 +8552,7 @@ mod tests {
             assert!(error.contains("desktop Exec"), "unexpected error: {error}");
         }
 
+        let current_release = format!("<release version=\"{}\"", env!("CARGO_PKG_VERSION"));
         let mismatches = [
             (
                 "<id>io.github.ercling.cosmic-ext-applet-daymural</id>",
@@ -8574,7 +8575,7 @@ mod tests {
                 "<summary>Daymural: daily Microsoft Bing wallpaper applet for the COSMIC desktop</summary>",
                 "<summary>Wrong summary</summary>",
             ),
-            ("<release version=\"0.1.0\"", "<release version=\"9.9.9\""),
+            (current_release.as_str(), "<release version=\"9.9.9\""),
         ];
         for (valid, invalid) in mismatches {
             let metainfo = METAINFO.replacen(valid, invalid, 1);
