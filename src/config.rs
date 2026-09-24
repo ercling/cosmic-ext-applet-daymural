@@ -1,7 +1,7 @@
-// Applet settings persisted via cosmic-config under the applet's app ID.
+// Applet settings persisted via cosmic-config under the applet's stable storage ID.
 //
 // The `CosmicConfigEntry` derive stores each field as its own RON file under
-// `$XDG_CONFIG_HOME/cosmic/<APP_ID>/v1/<field>` and generates per-field
+// `$XDG_CONFIG_HOME/cosmic/<STORAGE_ID>/v1/<field>` and generates per-field
 // `set_<field>(&mut self, &Config, value) -> Result<bool>` setters that write
 // to disk only when the value actually changed. The applet persists whole
 // settings one key at a time: ordinary controls use an asynchronous raw-key
@@ -22,7 +22,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::accent::{AccentPair, AccentSnapshot};
-use crate::app::APP_ID;
+use crate::app::STORAGE_ID;
 use crate::leader::with_coordination_lock;
 
 /// The retention values the applet supports (the "Keep images" dropdown's
@@ -68,7 +68,7 @@ impl Default for AppletConfig {
 impl AppletConfig {
     /// The cosmic-config context this applet's settings live in.
     pub fn context() -> Result<Config, cosmic_config::Error> {
-        Config::new(APP_ID, Self::VERSION)
+        Config::new(STORAGE_ID, Self::VERSION)
     }
 
     /// Load settings from `config`, falling back to defaults for any key that
@@ -111,7 +111,7 @@ impl AppletConfig {
 
 /// Cross-process mailbox shared by the leader and the other panel instances.
 ///
-/// Although this entry uses the applet's existing app ID and version, its
+/// Although this entry uses the applet's existing storage ID and version, its
 /// field names are deliberately disjoint from [`AppletConfig`]. Each helper
 /// below writes exactly one key, so a process never persists a stale snapshot
 /// of the rest of the mailbox.
@@ -144,11 +144,11 @@ pub struct PeerRefreshCompletion {
 }
 
 impl CoordinationConfig {
-    /// Use the same app ID/version directory as [`AppletConfig`]. The two
+    /// Use the same storage ID/version directory as [`AppletConfig`]. The two
     /// entries remain independent because cosmic-config persists each field
     /// under its field name.
     pub fn context() -> Result<Config, cosmic_config::Error> {
-        Config::new(APP_ID, Self::VERSION)
+        Config::new(STORAGE_ID, Self::VERSION)
     }
 
     /// Load the mailbox without repairing or otherwise writing missing or
@@ -269,7 +269,7 @@ mod tests {
     /// A cosmic-config context rooted in a TempDir — never touches the real
     /// user config.
     fn test_context(dir: &tempfile::TempDir) -> Config {
-        Config::with_custom_path(APP_ID, AppletConfig::VERSION, dir.path().to_path_buf())
+        Config::with_custom_path(STORAGE_ID, AppletConfig::VERSION, dir.path().to_path_buf())
             .expect("create test config context")
     }
 
@@ -321,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn write_then_load_roundtrips_non_default_values() {
+    fn retained_namespace_loads_old_settings_accent_and_mailbox_without_writes() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = test_context(&dir);
 
@@ -339,9 +339,29 @@ mod tests {
                 dark: [70, 80, 90],
             }),
         };
-        written.write_entry(&ctx).expect("write entry");
-
+        let old_context = Config::with_custom_path(
+            "io.github.ercling.cosmic-applet-daymural",
+            AppletConfig::VERSION,
+            dir.path().to_path_buf(),
+        )
+        .unwrap();
+        written.write_entry(&old_context).expect("write old entry");
+        let mailbox = CoordinationConfig {
+            refresh_request: 19,
+            refresh_completion: PeerRefreshCompletion {
+                request: 18,
+                outcome: PeerRefreshOutcome::Disk,
+            },
+            apply_notice: Some(PeerApplyNotice {
+                generation: 7,
+                path: dir.path().join("wallpaper.jpg"),
+            }),
+        };
+        mailbox.write_entry(&old_context).unwrap();
+        let before = files_under(dir.path());
+        assert_eq!(CoordinationConfig::load(&ctx), mailbox);
         assert_eq!(AppletConfig::load(&ctx), written);
+        assert_eq!(files_under(dir.path()), before);
         // And through the raw trait method too (no errors on a full config).
         let loaded = AppletConfig::get_entry(&ctx).expect("no errors on a fully written config");
         assert_eq!(loaded, written);
@@ -467,7 +487,7 @@ mod tests {
     // production call sites (the accent state machine's checked persists in
     // `app.rs`) are exercised by that module's failure-injection tests, the
     // accent fields' round-trip is covered by
-    // `write_then_load_roundtrips_non_default_values` /
+    // `retained_namespace_loads_old_settings_accent_and_mailbox_without_writes` /
     // `pre_accent_v1_entry_still_loads`, and the derive's write-on-change
     // mechanics are already exercised once by
     // `generated_setter_writes_only_on_change`.

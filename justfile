@@ -1,6 +1,6 @@
 name := 'daymural'
-appid := 'io.github.ercling.cosmic-applet-daymural'
-flatpak-manifest := 'packaging/flatpak/io.github.ercling.cosmic-applet-daymural.json'
+appid := 'io.github.ercling.cosmic-ext-applet-daymural'
+flatpak-manifest := 'packaging/flatpak/io.github.ercling.cosmic-ext-applet-daymural.json'
 flatpak-build-manifest := '.daymural-flatpak-manifest.json'
 
 # Default to a per-user install (no sudo needed); override with e.g.

@@ -1,0 +1,2 @@
+external_review_cmd = "claude --print --permission-mode plan --tools Read,Glob,Grep --allowedTools Read,Glob,Grep --strict-mcp-config --setting-sources \"\""
+external_review_credential_profile = "claude"

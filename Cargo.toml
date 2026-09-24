@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Daymural: daily Microsoft Bing wallpaper applet for the COSMIC desktop"
-repository = "https://github.com/ercling/cosmic-applet-daymural"
-homepage = "https://github.com/ercling/cosmic-applet-daymural"
+repository = "https://github.com/ercling/cosmic-ext-applet-daymural"
+homepage = "https://github.com/ercling/cosmic-ext-applet-daymural"
 
 [dependencies]
 # Feature flags copied from pop-os/cosmic-applets workspace (verified 2026-08-07).

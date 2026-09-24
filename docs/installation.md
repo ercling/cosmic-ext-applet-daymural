@@ -84,6 +84,96 @@ just uninstall
 This removes only the executable, desktop entry, and icon. It deliberately
 leaves downloaded images, settings, the catalogue, and thumbnails in place.
 
+## Upgrading to the cosmic-ext identity
+
+The public App ID is now `io.github.ercling.cosmic-ext-applet-daymural`;
+Daymural's display name and `daymural` executable are unchanged. The internal
+storage ID remains `io.github.ercling.cosmic-applet-daymural`. Native settings,
+history, thumbnail cache and accent recovery records remain in place.
+This upgrade preserves data; the separate historical rename below does not.
+
+### Native upgrade
+
+1. Remove the old Daymural panel entry on every output and stop its processes
+   before changing installation files. Back up the shared configuration and
+   native state directories listed under Data locations, and keep the backups.
+2. Before installing the replacement, remove only the old desktop entry and icon
+   (adjust the prefix if your previous installation was not under `~/.local`):
+
+   ```bash
+   rm -f "$HOME/.local/share/applications/io.github.ercling.cosmic-applet-daymural.desktop" \
+     "$HOME/.local/share/icons/hicolor/scalable/apps/io.github.ercling.cosmic-applet-daymural-symbolic.svg"
+   ```
+
+3. From the new checkout, run `just install`. The new `just uninstall` does not
+   remove old-ID assets. Do not remove the unchanged `daymural` binary after
+   installing its replacement. Native data needs no transfer.
+4. Restart `cosmic-panel` or log out and back in, then re-add **Daymural** through
+   **COSMIC Settings → Desktop → Panel → Configure panel applets** on each output.
+
+### Flatpak upgrade
+
+Perform these steps on the host before the new applet's first launch. Keep all
+applet instances stopped during the state transfer. The build and installation
+commands in step 5 may need network access to download build inputs.
+Do not run old and new instances together: their private state roots have
+separate leadership locks even though the storage suffix is unchanged.
+
+1. Stop all old and new Daymural instances. Remove their panel entries on every
+   output so the panel cannot restart them during the transfer. If necessary,
+   stop running sandboxes with `flatpak kill io.github.ercling.cosmic-applet-daymural`
+   and `flatpak kill io.github.ercling.cosmic-ext-applet-daymural`.
+2. Back up the old private state and shared configuration before making changes.
+   Also back up any existing new private state. Keep the backups outside both
+   sandbox roots. Shared COSMIC settings, accent snapshots/last-written records
+   and the coordination mailbox need no transfer. Never copy sandbox-local
+   configuration over host settings or accent records.
+3. Inspect these exact default private state roots (only the outer App ID changes):
+
+   Old: `~/.var/app/io.github.ercling.cosmic-applet-daymural/.local/state/io.github.ercling.cosmic-applet-daymural/`
+
+   New: `~/.var/app/io.github.ercling.cosmic-ext-applet-daymural/.local/state/io.github.ercling.cosmic-applet-daymural/`
+
+   Respect effective XDG overrides: determine the old and new applet's actual
+   `XDG_STATE_HOME` roots if customized, then append the retained storage ID.
+   Shared configuration follows `HOST_XDG_CONFIG_HOME` in Flatpak, falling back
+   to `$HOME/.config`; do not substitute the sandbox's private `config/` tree.
+4. Transfer only `catalogue.json` and `thumbs/` from old private state to new
+   private state, using a copy that preserves the old data. Include every
+   thumbnail sidecar and failed-decode record within `thumbs/`. Create the new
+   state directory if absent. Stop on any destination conflict; never overwrite
+   or merge existing destination entries. Do not copy `config/` or lock files.
+   If either source entry is absent, leave that entry absent at the destination.
+   Stop on a failed transfer; do not launch against partially transferred state.
+   Verify both copied entries against their sources before proceeding. Resolve
+   a conflict or failure manually using the backups while all instances remain
+   stopped; do not treat a partially populated destination as a completed upgrade.
+5. Keep the old data and backups after the upgrade. From the new checkout, run
+   `just flatpak-sources` and `just flatpak-install` to install the new public
+   identity while all applet instances remain stopped. Only after the new
+   installation succeeds, uninstall the old identity with
+   `flatpak uninstall --user io.github.ercling.cosmic-applet-daymural`
+   without `--delete-data`. If the build or installation fails, keep the old
+   installation and retry this step after resolving the failure; do not repeat
+   the completed state transfer or launch either applet during the retry.
+6. Launch only after the transfer is complete. Restart `cosmic-panel` or log out
+   and back in, then re-add **Daymural** in **COSMIC Settings → Desktop → Panel →
+   Configure panel applets**. Verify settings, history, the current wallpaper,
+   and accent disable/restore before discarding any installation files.
+
+### Rollback
+
+Stop the new instances and remove their panel entries first. For native rollback,
+run the new checkout's `just uninstall`, then reinstall the previous revision
+with its `just install` and re-add its panel entry. For Flatpak rollback,
+uninstall the new identity without `--delete-data`, reinstall the old build,
+and re-add its panel entry. Keep the old data and backups; the old Flatpak
+private state remains available. Shared configuration may have changed since
+upgrade: restore its backup only deliberately, with all instances stopped and
+with awareness that accent recovery records must match the theme being restored.
+Keep `~/Pictures/BingWallpaper` and the applied wallpaper unchanged. Do not
+restore or copy leadership lock files. Never run both revisions concurrently.
+
 ## Upgrading from the previous applet identity
 
 Early development builds used the native binary `cosmic-bing-wallpaper` and
@@ -130,18 +220,22 @@ Downloaded images are shared by both installation types:
 ~/Pictures/BingWallpaper
 ```
 
-Native settings and state use:
+The retained storage ID keeps native state and shared native/Flatpak COSMIC
+configuration at these default locations:
 
 ```text
 ~/.config/cosmic/io.github.ercling.cosmic-applet-daymural/
 ~/.local/state/io.github.ercling.cosmic-applet-daymural/
 ```
 
-Flatpak keeps the catalogue, thumbnails, and other private state below:
+The new Flatpak keeps the catalogue, thumbnails, and other private state below:
 
 ```text
-~/.var/app/io.github.ercling.cosmic-applet-daymural/.local/state/io.github.ercling.cosmic-applet-daymural/
+~/.var/app/io.github.ercling.cosmic-ext-applet-daymural/.local/state/io.github.ercling.cosmic-applet-daymural/
 ```
+
+Native paths respect `XDG_CONFIG_HOME` and `XDG_STATE_HOME`; Flatpak shared
+configuration respects `HOST_XDG_CONFIG_HOME`, falling back to `$HOME/.config`.
 
 It still uses the shared image directory and COSMIC configuration. On first
 start, it rescans existing JPEGs, so changing installation type does not require

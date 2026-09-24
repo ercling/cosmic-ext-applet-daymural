@@ -33,8 +33,12 @@ use crate::leader::Leadership;
 // popup (`view.rs`). The panel contributes an icon and nothing else.
 use crate::{accent, bing, lockwatch, schedule, thumbs, tooltip, view, wallpaper};
 
-/// One name everywhere: cosmic-config app ID, state dir, desktop entry.
-pub const APP_ID: &str = "io.github.ercling.cosmic-applet-daymural";
+/// Public application/Wayland identity and installed desktop entry.
+pub const APP_ID: &str = "io.github.ercling.cosmic-ext-applet-daymural";
+
+/// Stable namespace for settings, coordination, and durable state. Public
+/// integration renames must preserve this value to retain existing user data.
+pub const STORAGE_ID: &str = "io.github.ercling.cosmic-applet-daymural";
 
 /// Symbolic icon shown in the panel.
 const PANEL_ICON: &str = "preferences-desktop-wallpaper-symbolic";
@@ -51,7 +55,7 @@ pub fn run() -> cosmic::iced::Result {
     cosmic::applet::run::<Window>(())
 }
 
-/// The applet's state dir (`~/.local/state/<APP_ID>/`): catalogue JSON +
+/// The applet's state dir (`~/.local/state/<STORAGE_ID>/`): catalogue JSON +
 /// cached thumbnails. Resolved once — the view asks for it on every
 /// re-render and must not repeat env/home lookups per frame.
 ///
@@ -62,19 +66,31 @@ pub fn run() -> cosmic::iced::Result {
 /// working directory).
 pub fn state_dir() -> &'static Path {
     static STATE_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
-        dirs::state_dir()
-            .unwrap_or_else(|| {
-                tracing::warn!("no home directory: keeping applet state in the temp dir");
-                std::env::temp_dir()
-            })
-            .join(APP_ID)
+        resolve_state_path(dirs::state_dir(), || {
+            tracing::warn!("no home directory: keeping applet state in the temp dir");
+            std::env::temp_dir()
+        })
     });
     &STATE_DIR
 }
 
+/// Resolve the same fallback decision with injected roots in hermetic tests.
+fn resolve_state_path(root: Option<PathBuf>, fallback: impl FnOnce() -> PathBuf) -> PathBuf {
+    state_path(&root.unwrap_or_else(fallback))
+}
+
+/// Append the stable namespace to an injected, already resolved state root.
+fn state_path(root: &Path) -> PathBuf {
+    root.join(STORAGE_ID)
+}
+
 /// Where the catalogue JSON is persisted.
 fn catalogue_path() -> PathBuf {
-    state_dir().join(catalogue::CATALOGUE_FILENAME)
+    catalogue_path_in(state_dir())
+}
+
+fn catalogue_path_in(state: &Path) -> PathBuf {
+    state.join(catalogue::CATALOGUE_FILENAME)
 }
 
 #[derive(Default)]
@@ -4579,10 +4595,10 @@ impl cosmic::Application for Window {
             // Keep `self.config` in sync with on-disk changes (our own setter
             // writes echo back through here too, which is harmless).
             self.core
-                .watch_config::<AppletConfig>(APP_ID)
+                .watch_config::<AppletConfig>(STORAGE_ID)
                 .map(|update| Message::ConfigUpdated(update.config)),
             self.core
-                .watch_config::<CoordinationConfig>(APP_ID)
+                .watch_config::<CoordinationConfig>(STORAGE_ID)
                 .map(|update| Message::CoordinationUpdated(update.config)),
             // logind lock/resume events → the poke ladder (the
             // cosmic-greeter#511 workaround; rationale in `lockwatch.rs`).
@@ -4910,7 +4926,7 @@ mod tests {
 
     fn takeover_contexts(root: &Path) -> (cosmic_config::Config, cosmic_config::Config) {
         let config = cosmic_config::Config::with_custom_path(
-            APP_ID,
+            STORAGE_ID,
             AppletConfig::VERSION,
             root.to_path_buf(),
         )
@@ -5473,14 +5489,14 @@ mod tests {
 
     #[test]
     fn app_id_is_reverse_dns() {
-        assert_eq!(APP_ID, "io.github.ercling.cosmic-applet-daymural");
+        assert_eq!(APP_ID, "io.github.ercling.cosmic-ext-applet-daymural");
         assert_eq!(<Window as cosmic::Application>::APP_ID, APP_ID);
         assert!(APP_ID.split('.').count() >= 3);
     }
 
     #[test]
     fn cargo_identity_is_daymural() {
-        const PROJECT_URL: &str = "https://github.com/ercling/cosmic-applet-daymural";
+        const PROJECT_URL: &str = "https://github.com/ercling/cosmic-ext-applet-daymural";
 
         assert_eq!(env!("CARGO_PKG_NAME"), "daymural");
         assert_eq!(env!("CARGO_PKG_REPOSITORY"), PROJECT_URL);
@@ -5497,13 +5513,110 @@ mod tests {
     }
 
     #[test]
-    fn state_paths_live_under_the_app_id() {
-        // No self-skip: `state_dir` falls back to the temp dir when there is
-        // no home, so it is absolute in every environment.
-        let state = state_dir();
-        assert!(state.ends_with(APP_ID));
-        assert!(state.is_absolute());
-        assert_eq!(state_dir().join("catalogue.json"), catalogue_path());
+    fn state_paths_live_under_the_storage_id() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(STORAGE_ID, "io.github.ercling.cosmic-applet-daymural");
+        assert_ne!(APP_ID, STORAGE_ID);
+        assert_eq!(state_path(root.path()), root.path().join(STORAGE_ID));
+    }
+
+    #[test]
+    fn state_root_resolution_and_catalogue_join_preserve_absolute_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let resolved = root.path().join("state");
+        let fallback = root.path().join("temp");
+        let state = resolve_state_path(Some(resolved.clone()), || panic!("unexpected fallback"));
+        assert_eq!(state, resolved.join(STORAGE_ID));
+        let fallback_state = resolve_state_path(None, || fallback.clone());
+        assert_eq!(fallback_state, fallback.join(STORAGE_ID));
+        for state in [state, fallback_state] {
+            assert!(state.is_absolute());
+            assert_eq!(catalogue_path_in(&state), state.join("catalogue.json"));
+        }
+    }
+
+    fn storage_identity_contract(config: &str, app: &str) -> bool {
+        // Formatting and extra legitimate consumers do not change identity.
+        let compact = |source: &str| {
+            source
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>()
+                .replace(",)", ")")
+        };
+        let config = compact(config);
+        let app = compact(app);
+        // Scope to production code so test fixtures cannot satisfy the guards.
+        let config = config.split("#[cfg(test)]").next().unwrap();
+        let app = app.split("#[cfg(test)]modtests").next().unwrap();
+        config
+            .matches("Config::new(STORAGE_ID,Self::VERSION)")
+            .count()
+            >= 2
+            && !config.contains("Config::new(APP_ID")
+            && app.contains("watch_config::<AppletConfig>(STORAGE_ID)")
+            && app.contains("watch_config::<CoordinationConfig>(STORAGE_ID)")
+            && !app.contains("watch_config::<AppletConfig>(APP_ID)")
+            && !app.contains("watch_config::<CoordinationConfig>(APP_ID)")
+    }
+
+    #[test]
+    fn persistence_factories_and_watchers_use_storage_identity() {
+        let config = include_str!("config.rs");
+        let app = include_str!("app.rs");
+        assert!(storage_identity_contract(config, app));
+        assert!(storage_identity_contract(
+            &config.replace(
+                "Config::new(STORAGE_ID, Self::VERSION)",
+                "Config::new(\n STORAGE_ID,\n Self::VERSION,\n)",
+            ),
+            &app.replace("#[cfg(test)]\nmod tests", "#[cfg(test)]\n\nmod tests"),
+        ));
+        assert!(storage_identity_contract(
+            &format!("fn extra() {{ Config::new(STORAGE_ID, Self::VERSION) }}\n{config}"),
+            app,
+        ));
+        for occurrence in 0..2 {
+            let needle = "Config::new(STORAGE_ID, Self::VERSION)";
+            let offset = config.match_indices(needle).nth(occurrence).unwrap().0;
+            let mut drift = config.to_owned();
+            drift.replace_range(
+                offset..offset + needle.len(),
+                "Config::new(APP_ID, Self::VERSION)",
+            );
+            assert!(!storage_identity_contract(&drift, app));
+        }
+        for entry in ["AppletConfig", "CoordinationConfig"] {
+            let drift = app.replacen(
+                &format!("watch_config::<{entry}>(STORAGE_ID)"),
+                &format!("watch_config::<{entry}>(APP_ID)"),
+                1,
+            );
+            assert!(!storage_identity_contract(config, &drift));
+        }
+    }
+
+    #[test]
+    fn retained_state_namespace_reopens_catalogue_and_thumbnail_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let images = root.path().join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        let old_state = root.path().join("io.github.ercling.cosmic-applet-daymural");
+        let kept = entry_on_disk(&images, "20260807", "Kept_ROW1");
+        std::fs::write(&kept.filename, crate::testutil::tiny_jpeg(64, 36)).unwrap();
+        let catalogue = Catalogue {
+            images: vec![kept.clone()],
+        };
+        catalogue
+            .save(&old_state.join(catalogue::CATALOGUE_FILENAME))
+            .unwrap();
+        thumbs::ensure_thumbnail(&kept.filename, &old_state).unwrap();
+        let state = state_path(root.path());
+        assert!(thumbs::is_cached(&kept.filename, &state));
+        let restored =
+            restore_catalogue(&state.join(catalogue::CATALOGUE_FILENAME), &images, &state);
+        assert_eq!(restored.catalogue, catalogue);
+        assert!(thumbs::is_cached(&kept.filename, &state));
     }
 
     #[test]
@@ -6720,13 +6833,15 @@ mod tests {
         assert_eq!(web_url(""), None);
     }
 
-    const DESKTOP: &str = include_str!("../data/io.github.ercling.cosmic-applet-daymural.desktop");
+    const DESKTOP: &str =
+        include_str!("../data/io.github.ercling.cosmic-ext-applet-daymural.desktop");
     const METAINFO: &str =
-        include_str!("../data/io.github.ercling.cosmic-applet-daymural.metainfo.xml");
+        include_str!("../data/io.github.ercling.cosmic-ext-applet-daymural.metainfo.xml");
     const FLATPAK_MANIFEST: &str =
-        include_str!("../packaging/flatpak/io.github.ercling.cosmic-applet-daymural.json");
+        include_str!("../packaging/flatpak/io.github.ercling.cosmic-ext-applet-daymural.json");
     const JUSTFILE: &str = include_str!("../justfile");
     const README: &str = include_str!("../README.md");
+    const PACKAGING_GUIDE: &str = include_str!("../docs/packaging.md");
     const INSTALLATION_GUIDE: &str = include_str!("../docs/installation.md");
     const SCREENSHOT_PROVENANCE: &str = include_str!("../resources/screenshots/README.md");
     const STORE_SCREENSHOT: &[u8] = include_bytes!("../resources/screenshots/screenshot-main.png");
@@ -6746,7 +6861,7 @@ mod tests {
     const RUST_WORKFLOW: &str = include_str!("../.github/workflows/rust.yml");
     const FLATPAK_WORKFLOW: &str = include_str!("../.github/workflows/flatpak.yml");
     const FLATPAK_MANIFEST_PATH: &str =
-        "packaging/flatpak/io.github.ercling.cosmic-applet-daymural.json";
+        "packaging/flatpak/io.github.ercling.cosmic-ext-applet-daymural.json";
     const FLATPAK_BUILD_MANIFEST_PATH: &str = ".daymural-flatpak-manifest.json";
     const CARGO_SOURCES_MANIFEST_FILENAME: &str = "cargo-sources.json";
     const CARGO_SOURCES_REPOSITORY_PATH: &str = "packaging/flatpak/cargo-sources.json";
@@ -7201,7 +7316,7 @@ mod tests {
     #[test]
     fn flatpak_manifest_rejects_an_uppercase_application_id() {
         let uppercase = FLATPAK_MANIFEST.replace(
-            "io.github.ercling.cosmic-applet-daymural",
+            "io.github.ercling.cosmic-ext-applet-daymural",
             "io.github.ercling.CosmicAppletDaymural",
         );
         assert!(
@@ -7311,8 +7426,8 @@ mod tests {
                 "echo cargo --offline fetch --locked --manifest-path Cargo.toml --verbose",
             ),
             (
-                "install -Dm644 data/io.github.ercling.cosmic-applet-daymural.metainfo.xml /app/share/metainfo/io.github.ercling.cosmic-applet-daymural.metainfo.xml",
-                "echo install -Dm644 data/io.github.ercling.cosmic-applet-daymural.metainfo.xml /app/share/metainfo/io.github.ercling.cosmic-applet-daymural.metainfo.xml",
+                "install -Dm644 data/io.github.ercling.cosmic-ext-applet-daymural.metainfo.xml /app/share/metainfo/io.github.ercling.cosmic-ext-applet-daymural.metainfo.xml",
+                "echo install -Dm644 data/io.github.ercling.cosmic-ext-applet-daymural.metainfo.xml /app/share/metainfo/io.github.ercling.cosmic-ext-applet-daymural.metainfo.xml",
             ),
             (
                 "cargo --offline build --release --locked --verbose",
@@ -7550,8 +7665,8 @@ mod tests {
         }
 
         let wrong_manifest_path = JUSTFILE.replace(
-            "flatpak-manifest := 'packaging/flatpak/io.github.ercling.cosmic-applet-daymural.json'",
-            "flatpak-manifest := 'io.github.ercling.cosmic-applet-daymural.json'",
+            "flatpak-manifest := 'packaging/flatpak/io.github.ercling.cosmic-ext-applet-daymural.json'",
+            "flatpak-manifest := 'io.github.ercling.cosmic-ext-applet-daymural.json'",
         );
         assert!(
             validate_flatpak_tooling(FLATPAK_MANIFEST, CARGO_SOURCES_SCRIPT, &wrong_manifest_path,)
@@ -7824,7 +7939,7 @@ mod tests {
             CARGO_SOURCES_REPOSITORY_PATH.to_owned(),
             "astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b".to_owned(),
             "version: \"0.12.1\"".to_owned(),
-            "appstreamcli validate --pedantic --explain --strict --no-net --override cid-contains-uppercase-letter=error data/io.github.ercling.cosmic-applet-daymural.metainfo.xml".to_owned(),
+            "appstreamcli validate --pedantic --explain --strict --no-net --override cid-contains-uppercase-letter=error data/io.github.ercling.cosmic-ext-applet-daymural.metainfo.xml".to_owned(),
             FLATPAK_BUILDER_ACTION.to_owned(),
             format!("bundle: {}.flatpak", env!("CARGO_PKG_NAME")),
         ] {
@@ -7898,8 +8013,8 @@ mod tests {
                 "python3 flatpak/test_git_manifest_scan.py",
             ),
             FLATPAK_WORKFLOW.replace(
-                "manifest-path: packaging/flatpak/io.github.ercling.cosmic-applet-daymural.json",
-                "manifest-path: io.github.ercling.cosmic-applet-daymural.json",
+                "manifest-path: packaging/flatpak/io.github.ercling.cosmic-ext-applet-daymural.json",
+                "manifest-path: io.github.ercling.cosmic-ext-applet-daymural.json",
             ),
             FLATPAK_WORKFLOW.replace("packaging/flatpak/cargo-sources.json", "cargo-sources.json"),
         ] {
@@ -8078,6 +8193,7 @@ mod tests {
             ("Rust workflow", RUST_WORKFLOW),
             ("Flatpak workflow", FLATPAK_WORKFLOW),
             ("README", README),
+            ("packaging guide", PACKAGING_GUIDE),
             (
                 "installation guide before explicit uninstall instructions",
                 &INSTALLATION_GUIDE[..uninstall_start],
@@ -8106,6 +8222,205 @@ mod tests {
             CLAUDE_GUIDE, "# Claude Code\n\n@AGENTS.md\n",
             "CLAUDE.md must remain a thin loader for the shared agent guide"
         );
+    }
+
+    fn upgrade_documentation_contract(guide: &str) -> bool {
+        let Some((_, upgrade)) = guide.split_once("## Upgrading to the cosmic-ext identity") else {
+            return false;
+        };
+        let Some((upgrade, _)) =
+            upgrade.split_once("## Upgrading from the previous applet identity")
+        else {
+            return false;
+        };
+        let normalized = upgrade.split_whitespace().collect::<Vec<_>>().join(" ");
+        let required = [
+            "public App ID is now `io.github.ercling.cosmic-ext-applet-daymural`",
+            "storage ID remains `io.github.ercling.cosmic-applet-daymural`",
+            "Native data needs no transfer.",
+            "The new `just uninstall` does not remove old-ID assets.",
+            "Do not remove the unchanged `daymural` binary after installing its replacement.",
+            "Shared COSMIC settings, accent snapshots/last-written records and the coordination mailbox need no transfer.",
+            "Never copy sandbox-local configuration over host settings or accent records.",
+            "Old: `~/.var/app/io.github.ercling.cosmic-applet-daymural/.local/state/io.github.ercling.cosmic-applet-daymural/`",
+            "New: `~/.var/app/io.github.ercling.cosmic-ext-applet-daymural/.local/state/io.github.ercling.cosmic-applet-daymural/`",
+            "Respect effective XDG overrides",
+            "`HOST_XDG_CONFIG_HOME`",
+            "Transfer only `catalogue.json` and `thumbs/`",
+            "Include every thumbnail sidecar and failed-decode record within `thumbs/`.",
+            "Stop on any destination conflict; never overwrite or merge existing destination entries.",
+            "Do not copy `config/` or lock files.",
+            "Stop on a failed transfer; do not launch against partially transferred state.",
+            "Verify both copied entries against their sources before proceeding.",
+            "Keep the old data and backups after the upgrade.",
+            "Only after the new installation succeeds, uninstall the old identity",
+            "If the build or installation fails, keep the old installation and retry this step",
+            "do not repeat the completed state transfer or launch either applet during the retry.",
+            "without `--delete-data`",
+            "Keep `~/Pictures/BingWallpaper` and the applied wallpaper unchanged.",
+            "### Rollback",
+            "re-add **Daymural**",
+        ];
+        if !required.iter().all(|part| normalized.contains(part)) {
+            return false;
+        }
+        // Validate order within each route, so earlier installation examples
+        // elsewhere in the guide cannot satisfy an upgrade ordering assertion.
+        let ordered = |steps: &[&str]| {
+            let mut remainder = normalized.as_str();
+            for step in steps {
+                let Some((_, tail)) = remainder.split_once(step) else {
+                    return false;
+                };
+                remainder = tail;
+            }
+            true
+        };
+        ordered(&[
+            "### Native upgrade",
+            "stop its processes",
+            "Back up",
+            "rm -f \"$HOME/.local/share/applications/io.github.ercling.cosmic-applet-daymural.desktop\"",
+            "\"$HOME/.local/share/icons/hicolor/scalable/apps/io.github.ercling.cosmic-applet-daymural-symbolic.svg\"",
+            "run `just install`",
+            "re-add **Daymural**",
+        ]) && ordered(&[
+            "### Flatpak upgrade",
+            "1. Stop all old and new Daymural instances.",
+            "2. Back up the old private state and shared configuration before making changes.",
+            "3. Inspect these exact default private state roots",
+            "4. Transfer only `catalogue.json` and `thumbs/`",
+            "5. Keep the old data and backups after the upgrade.",
+            "`just flatpak-sources`",
+            "`just flatpak-install`",
+            "`flatpak uninstall --user io.github.ercling.cosmic-applet-daymural`",
+            "6. Launch only after the transfer is complete.",
+            "re-add **Daymural**",
+        ])
+    }
+
+    #[test]
+    fn upgrade_documentation_preserves_native_and_flatpak_data() {
+        assert!(upgrade_documentation_contract(INSTALLATION_GUIDE));
+        let locations = INSTALLATION_GUIDE
+            .split_once("## Data locations")
+            .unwrap()
+            .1;
+        for path in [
+            "~/.config/cosmic/io.github.ercling.cosmic-applet-daymural/",
+            "~/.local/state/io.github.ercling.cosmic-applet-daymural/",
+            "~/.var/app/io.github.ercling.cosmic-ext-applet-daymural/.local/state/io.github.ercling.cosmic-applet-daymural/",
+            "~/Pictures/BingWallpaper",
+        ] {
+            assert!(locations.contains(path), "missing data location: {path}");
+        }
+        assert!(README.contains("docs/installation.md#upgrading-to-the-cosmic-ext-identity"));
+        assert!(README.contains(APP_ID));
+        assert!(README.contains(STORAGE_ID));
+        assert!(
+            AGENT_GUIDE.contains(
+                "`APP_ID` names public integration. `STORAGE_ID` names applet/coordination"
+            )
+        );
+        assert!(AGENT_GUIDE.contains("silently change durable storage identity"));
+    }
+
+    #[test]
+    fn upgrade_documentation_rejects_unsafe_transfer_mutations() {
+        // Text-only tests: never execute documentation commands or resolve
+        // their real user paths, even on an isolated build machine.
+        for (before, after) in [
+            (
+                "Stop on any destination conflict; never overwrite",
+                "Ignore any destination conflict; overwrite",
+            ),
+            (
+                "or merge existing destination entries.",
+                "existing destination entries.",
+            ),
+            (
+                "Do not copy `config/` or lock files.",
+                "Copy `config/` and lock files.",
+            ),
+            (
+                "Transfer only `catalogue.json` and `thumbs/`",
+                "Transfer `catalogue.json`, `thumbs/`, `config/` and locks",
+            ),
+            (
+                "Keep the old data and backups after the upgrade.",
+                "Delete the old data and backups after the upgrade.",
+            ),
+            (
+                "Stop on a failed transfer; do not launch against partially transferred state.",
+                "Launch even if the transfer failed.",
+            ),
+            (
+                "$HOME/.local/share/applications/io.github.ercling.cosmic-applet-daymural.desktop",
+                "$HOME/.local/share/applications/io.github.ercling.cosmic-ext-applet-daymural.desktop",
+            ),
+            ("Never copy sandbox-local", "Copy sandbox-local"),
+            (
+                "Only after the new\n   installation succeeds",
+                "Before the new\n   installation succeeds",
+            ),
+            (
+                "If the build or installation fails, keep the old\n   installation",
+                "If the build or installation fails, remove the old\n   installation",
+            ),
+        ] {
+            let mutated = INSTALLATION_GUIDE.replace(before, after);
+            assert_ne!(
+                mutated, INSTALLATION_GUIDE,
+                "missing mutation target: {before}"
+            );
+            assert!(
+                !upgrade_documentation_contract(&mutated),
+                "accepted mutation: {before}"
+            );
+        }
+        let start = INSTALLATION_GUIDE.find("4. Transfer only").unwrap();
+        let launch = INSTALLATION_GUIDE.find("6. Launch only after").unwrap();
+        let end = INSTALLATION_GUIDE[launch..].find("\n### Rollback").unwrap() + launch;
+        let mut reordered = INSTALLATION_GUIDE.to_owned();
+        let launch_step = reordered[launch..end].to_owned();
+        reordered.replace_range(launch..end, "");
+        reordered.insert_str(start, &launch_step);
+        assert!(!upgrade_documentation_contract(&reordered));
+
+        let install = "`just flatpak-install`";
+        let uninstall = "`flatpak uninstall --user io.github.ercling.cosmic-applet-daymural`";
+        let reordered = INSTALLATION_GUIDE
+            .replace(install, "INSTALL_PLACEHOLDER")
+            .replace(uninstall, install)
+            .replace("INSTALL_PLACEHOLDER", uninstall);
+        assert!(!upgrade_documentation_contract(&reordered));
+    }
+
+    // These inputs describe public exports only. Persistent compatibility is
+    // checked separately against the exact STORAGE_ID in the storage tests.
+    fn public_identity_has_no_storage_namespace(text: &str) -> bool {
+        !text.contains(STORAGE_ID)
+            && !text.contains("https://github.com/ercling/cosmic-applet-daymural")
+    }
+
+    #[test]
+    fn public_packaging_rejects_mixed_old_and_new_identities() {
+        for (name, text) in [
+            ("desktop", DESKTOP),
+            ("metainfo", METAINFO),
+            ("manifest", FLATPAK_MANIFEST),
+            ("native install", JUSTFILE),
+            ("workflow", FLATPAK_WORKFLOW),
+            ("packaging guide", PACKAGING_GUIDE),
+            ("Cargo metadata", include_str!("../Cargo.toml")),
+        ] {
+            assert!(public_identity_has_no_storage_namespace(text), "{name}");
+            // Mutate just one occurrence: mixed identities must fail even when
+            // other fields still carry the correct public ID.
+            let drift = text.replacen("cosmic-ext-applet-daymural", "cosmic-applet-daymural", 1);
+            assert_ne!(drift, text, "{name} must expose a public identity");
+            assert!(!public_identity_has_no_storage_namespace(&drift), "{name}");
+        }
     }
 
     fn identity_inventory(root: &Path) -> std::io::Result<Vec<PathBuf>> {
@@ -8141,6 +8456,7 @@ mod tests {
         paths.iter().any(|path| {
             let path = path.to_string_lossy();
             path.contains("io.github.ercling.CosmicBingWallpaper")
+                || path.contains("io.github.ercling.cosmic-applet-daymural")
                 || path.contains("cosmic-bing-wallpaper")
                 || path.contains("cosmic_bing_wallpaper")
         })
@@ -8152,9 +8468,9 @@ mod tests {
         let inventory = identity_inventory(root).expect("repository identity inventory");
         assert!(!inventory_has_legacy_identity(&inventory));
         for expected in [
-            "packaging/flatpak/io.github.ercling.cosmic-applet-daymural.json",
-            "data/io.github.ercling.cosmic-applet-daymural.desktop",
-            "data/icons/io.github.ercling.cosmic-applet-daymural-symbolic.svg",
+            "packaging/flatpak/io.github.ercling.cosmic-ext-applet-daymural.json",
+            "data/io.github.ercling.cosmic-ext-applet-daymural.desktop",
+            "data/icons/io.github.ercling.cosmic-ext-applet-daymural-symbolic.svg",
             "i18n/en/daymural.ftl",
         ] {
             assert!(
@@ -8164,6 +8480,10 @@ mod tests {
         }
 
         for relative in [
+            "io.github.ercling.cosmic-applet-daymural.json",
+            "data/io.github.ercling.cosmic-applet-daymural.desktop",
+            "data/io.github.ercling.cosmic-applet-daymural.metainfo.xml",
+            "data/icons/io.github.ercling.cosmic-applet-daymural-symbolic.svg",
             "io.github.ercling.CosmicBingWallpaper.json",
             "data/io.github.ercling.CosmicBingWallpaper.desktop",
             "data/icons/io.github.ercling.CosmicBingWallpaper-symbolic.svg",
@@ -8234,11 +8554,11 @@ mod tests {
 
         let mismatches = [
             (
-                "<id>io.github.ercling.cosmic-applet-daymural</id>",
+                "<id>io.github.ercling.cosmic-ext-applet-daymural</id>",
                 "<id>wrong.id</id>",
             ),
             (
-                "io.github.ercling.cosmic-applet-daymural.desktop",
+                "io.github.ercling.cosmic-ext-applet-daymural.desktop",
                 "wrong.id.desktop",
             ),
             ("<binary>daymural</binary>", "<binary>wrong</binary>"),
@@ -8274,7 +8594,7 @@ mod tests {
             "a metainfo filename that does not match APP_ID must fail"
         );
         let desktop = DESKTOP.replace(
-            "Icon=io.github.ercling.cosmic-applet-daymural-symbolic",
+            "Icon=io.github.ercling.cosmic-ext-applet-daymural-symbolic",
             "Icon=wrong-symbolic",
         );
         assert!(
@@ -8628,7 +8948,7 @@ source = "git+https://example.invalid/repo#abc""#;
 
     fn follower_with_mailbox(dir: &Path) -> Window {
         let context = cosmic_config::Config::with_custom_path(
-            APP_ID,
+            STORAGE_ID,
             AppletConfig::VERSION,
             dir.join("config"),
         )
@@ -9273,7 +9593,7 @@ source = "git+https://example.invalid/repo#abc""#;
         assert!(!window.refresh_pending);
 
         let context = cosmic_config::Config::with_custom_path(
-            APP_ID,
+            STORAGE_ID,
             AppletConfig::VERSION,
             dir.path().join("config"),
         )
@@ -9314,7 +9634,7 @@ source = "git+https://example.invalid/repo#abc""#;
     fn request_reserved_during_live_read_is_acknowledged_by_intervening_refresh() {
         let dir = tempfile::tempdir().unwrap();
         let context = cosmic_config::Config::with_custom_path(
-            APP_ID,
+            STORAGE_ID,
             AppletConfig::VERSION,
             dir.path().join("config"),
         )
@@ -9515,7 +9835,7 @@ source = "git+https://example.invalid/repo#abc""#;
         let dir = tempfile::tempdir().unwrap();
         let config_root = dir.path().join("config");
         let context =
-            cosmic_config::Config::with_custom_path(APP_ID, AppletConfig::VERSION, config_root)
+            cosmic_config::Config::with_custom_path(STORAGE_ID, AppletConfig::VERSION, config_root)
                 .unwrap();
         let invalid_state = dir.path().join("not-a-directory");
         std::fs::write(&invalid_state, b"file").unwrap();
@@ -9542,7 +9862,7 @@ source = "git+https://example.invalid/repo#abc""#;
 
         let dir = tempfile::tempdir().unwrap();
         let context = cosmic_config::Config::with_custom_path(
-            APP_ID,
+            STORAGE_ID,
             AppletConfig::VERSION,
             dir.path().join("config"),
         )
@@ -9575,7 +9895,7 @@ source = "git+https://example.invalid/repo#abc""#;
 
         let dir = tempfile::tempdir().unwrap();
         let context = cosmic_config::Config::with_custom_path(
-            APP_ID,
+            STORAGE_ID,
             AppletConfig::VERSION,
             dir.path().join("config"),
         )
@@ -9618,7 +9938,7 @@ source = "git+https://example.invalid/repo#abc""#;
 
         let dir = tempfile::tempdir().unwrap();
         let context = cosmic_config::Config::with_custom_path(
-            APP_ID,
+            STORAGE_ID,
             AppletConfig::VERSION,
             dir.path().join("config"),
         )
@@ -9691,9 +10011,12 @@ source = "git+https://example.invalid/repo#abc""#;
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("config");
-        let context =
-            cosmic_config::Config::with_custom_path(APP_ID, AppletConfig::VERSION, root.clone())
-                .unwrap();
+        let context = cosmic_config::Config::with_custom_path(
+            STORAGE_ID,
+            AppletConfig::VERSION,
+            root.clone(),
+        )
+        .unwrap();
         let snapshot = AccentSnapshot {
             light: Some([1, 2, 3]),
             dark: None,
@@ -9709,7 +10032,7 @@ source = "git+https://example.invalid/repo#abc""#;
             ..Default::default()
         };
         seeded.write_entry(&context).unwrap();
-        let version_dir = root.join("cosmic").join(APP_ID).join("v1");
+        let version_dir = root.join("cosmic").join(STORAGE_ID).join("v1");
         let snapshot_path = version_dir.join("accent_snapshot");
         let last_written_path = version_dir.join("accent_last_written");
         let accent_bytes = || {
@@ -9767,11 +10090,14 @@ source = "git+https://example.invalid/repo#abc""#;
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("config");
-        let context =
-            cosmic_config::Config::with_custom_path(APP_ID, AppletConfig::VERSION, root.clone())
-                .unwrap();
+        let context = cosmic_config::Config::with_custom_path(
+            STORAGE_ID,
+            AppletConfig::VERSION,
+            root.clone(),
+        )
+        .unwrap();
         AppletConfig::default().write_entry(&context).unwrap();
-        let version_dir = root.join("cosmic").join(APP_ID).join("v1");
+        let version_dir = root.join("cosmic").join(STORAGE_ID).join("v1");
         std::fs::remove_dir_all(&version_dir).unwrap();
         std::fs::write(&version_dir, b"not a directory").unwrap();
         let mut failing = Window {
@@ -12100,7 +12426,7 @@ source = "git+https://example.invalid/repo#abc""#;
 
         let dir = tempfile::tempdir().unwrap();
         let context = cosmic_config::Config::with_custom_path(
-            APP_ID,
+            STORAGE_ID,
             AppletConfig::VERSION,
             dir.path().to_path_buf(),
         )
@@ -12154,7 +12480,7 @@ source = "git+https://example.invalid/repo#abc""#;
             accent_state_dir: dir.path().join("state"),
             config_context: Some(
                 cosmic_config::Config::with_custom_path(
-                    APP_ID,
+                    STORAGE_ID,
                     AppletConfig::VERSION,
                     dir.path().join("applet-config"),
                 )
@@ -12240,11 +12566,14 @@ source = "git+https://example.invalid/repo#abc""#;
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("config");
-        let context =
-            cosmic_config::Config::with_custom_path(APP_ID, AppletConfig::VERSION, root.clone())
-                .unwrap();
+        let context = cosmic_config::Config::with_custom_path(
+            STORAGE_ID,
+            AppletConfig::VERSION,
+            root.clone(),
+        )
+        .unwrap();
         AppletConfig::default().write_entry(&context).unwrap();
-        let version_dir = root.join("cosmic").join(APP_ID).join("v1");
+        let version_dir = root.join("cosmic").join(STORAGE_ID).join("v1");
         std::fs::remove_dir_all(&version_dir).unwrap();
         std::fs::write(&version_dir, b"not a directory").unwrap();
         let mut failing = Window {
@@ -12304,7 +12633,7 @@ source = "git+https://example.invalid/repo#abc""#;
 
         let dir = tempfile::tempdir().unwrap();
         let context = cosmic_config::Config::with_custom_path(
-            APP_ID,
+            STORAGE_ID,
             AppletConfig::VERSION,
             dir.path().join("config"),
         )
@@ -12355,7 +12684,7 @@ source = "git+https://example.invalid/repo#abc""#;
 
         let dir = tempfile::tempdir().unwrap();
         let context = cosmic_config::Config::with_custom_path(
-            APP_ID,
+            STORAGE_ID,
             AppletConfig::VERSION,
             dir.path().join("config"),
         )
@@ -12443,7 +12772,7 @@ source = "git+https://example.invalid/repo#abc""#;
         leader.current = Some(old.clone());
 
         let coordination_context = cosmic_config::Config::with_custom_path(
-            APP_ID,
+            STORAGE_ID,
             AppletConfig::VERSION,
             dir.path().join("coordination-config"),
         )

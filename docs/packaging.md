@@ -7,7 +7,7 @@ preserve when preparing a COSMIC Store submission. Normal users should follow
 The authoritative manifest is:
 
 ```text
-packaging/flatpak/io.github.ercling.cosmic-applet-daymural.json
+packaging/flatpak/io.github.ercling.cosmic-ext-applet-daymural.json
 ```
 
 It targets Freedesktop 25.08 with the Rust stable SDK extension. The intended
@@ -63,7 +63,7 @@ Validate AppStream metadata without network access:
 ```bash
 appstreamcli validate --pedantic --explain --strict --no-net \
   --override cid-contains-uppercase-letter=error \
-  data/io.github.ercling.cosmic-applet-daymural.metainfo.xml
+  data/io.github.ercling.cosmic-ext-applet-daymural.metainfo.xml
 ```
 
 Run the network-enabled validation before Store submission after the project
@@ -73,7 +73,7 @@ homepage and hosted screenshot are public.
 
 These values must remain aligned and are cross-checked by tests in `src/app.rs`:
 
-- application ID `io.github.ercling.cosmic-applet-daymural`;
+- application ID `io.github.ercling.cosmic-ext-applet-daymural`;
 - executable and manifest command `daymural`;
 - desktop entry and AppStream metadata names;
 - exported symbolic icon; and
@@ -128,5 +128,5 @@ Before handing off packaging changes:
 CI and local format validators cover declarative syntax. The hermetic Rust tests
 cover deliberate identity, command, path, and permission drift. Detailed design
 evidence remains in
-[the Flatpak distribution plan](plans/20260820-flatpak-distribution.md) and
+[the Flatpak distribution plan](plans/completed/20260820-flatpak-distribution.md) and
 [the completed packaging plan](plans/completed/20260825-centralize-flatpak-packaging.md).
