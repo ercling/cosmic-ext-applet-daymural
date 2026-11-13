@@ -21,7 +21,10 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use cosmic_bg_config::{Config, DEFAULT_BACKGROUND, Entry, Source};
+use cosmic_bg_config::{
+    Config, DEFAULT_BACKGROUND, Entry, FilterMethod, SamplingMethod, ScalingMode, Source,
+};
+use serde::{Deserialize, Serialize};
 
 /// Applying a wallpaper failed: either a cosmic-bg config operation errored
 /// (the concrete error type lives in a crate instance this crate cannot
@@ -59,12 +62,125 @@ pub fn download_dir() -> PathBuf {
         .join("BingWallpaper")
 }
 
+/// cosmic-bg's background entry, in a shape every cosmic-bg layout can read
+/// and write back.
+///
+/// The pinned `cosmic_bg_config::Entry` is `deny_unknown_fields` and knows
+/// nothing of `transition_duration`, which per-mode cosmic-bg writes into
+/// every entry: reading such an entry through the pinned type fails, and an
+/// apply would then rebuild it from defaults, dropping the user's scaling and
+/// filter settings. This local mirror instead
+///
+/// - ignores fields it does not know (a future cosmic-bg stays readable; the
+///   unknown fields are dropped on write, not fatal);
+/// - keeps `transition_duration` only when it was already there, so an entry
+///   written to a legacy cosmic-bg never grows the field that cosmic-bg's
+///   `deny_unknown_fields` rejects;
+/// - defaults `filter_by_theme`, which per-mode cosmic-bg made optional.
+///
+/// The enum/source types are cosmic-bg-config's own: they are plain serde
+/// types, so the two-`cosmic-config`-instances problem (module comment) does
+/// not reach them.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct BgEntry {
+    /// The configured output (`all` for the entry this applet writes).
+    pub output: String,
+    /// The configured image source.
+    pub source: Source,
+    /// Whether images are filtered by the active theme.
+    #[serde(default)]
+    pub filter_by_theme: bool,
+    /// Rotation frequency in seconds.
+    pub rotation_frequency: u64,
+    /// Fade duration in milliseconds; absent on legacy cosmic-bg. On disk
+    /// it is a bare integer (see [`bare_u64`]), never RON's `Some(..)`.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "bare_u64")]
+    pub transition_duration: Option<u64>,
+    #[serde(default)]
+    pub filter_method: FilterMethod,
+    #[serde(default)]
+    pub scaling_mode: ScalingMode,
+    #[serde(default)]
+    pub sampling_method: SamplingMethod,
+}
+
+/// (De)serialize an optional field as the **bare** `u64` cosmic-bg stores.
+///
+/// A derived `Option<u64>` does not work here: RON spells options
+/// `Some(1200)`/`None` and (without its `implicit_some` extension, which
+/// cosmic-config does not enable) rejects the bare `1200` per-mode cosmic-bg
+/// writes — and would write back a `Some(1200)` that cosmic-bg's plain `u64`
+/// field rejects in turn. Absence is handled by the field's `serde(default)`
+/// and `skip_serializing_if`, so these only ever see a present value.
+mod bare_u64 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    // serde's `with` contract passes the field by reference.
+    #[allow(clippy::ref_option, clippy::trivially_copy_pass_by_ref)]
+    pub fn serialize<S: Serializer>(value: &Option<u64>, serializer: S) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(value) => serializer.serialize_u64(*value),
+            // Unreachable through `skip_serializing_if`; kept total.
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<u64>, D::Error> {
+        u64::deserialize(deserializer).map(Some)
+    }
+}
+
+impl BgEntry {
+    /// A fresh `all` entry: the pinned `Entry::new`'s defaults, with no
+    /// `transition_duration` (per-mode cosmic-bg defaults a missing one).
+    pub fn new_all(source: Source) -> Self {
+        Self {
+            output: DEFAULT_BACKGROUND.to_owned(),
+            source,
+            filter_by_theme: false,
+            rotation_frequency: 900,
+            transition_duration: None,
+            filter_method: FilterMethod::default(),
+            scaling_mode: ScalingMode::default(),
+            sampling_method: SamplingMethod::default(),
+        }
+    }
+
+    /// Back to the pinned type for the pinned `Config::set_entry` write.
+    fn into_pinned(self) -> Entry {
+        let mut entry = Entry::new(self.output, self.source);
+        entry.filter_by_theme = self.filter_by_theme;
+        entry.rotation_frequency = self.rotation_frequency;
+        entry.filter_method = self.filter_method;
+        entry.scaling_mode = self.scaling_mode;
+        entry.sampling_method = self.sampling_method;
+        entry
+    }
+}
+
+impl From<Entry> for BgEntry {
+    fn from(entry: Entry) -> Self {
+        Self {
+            output: entry.output,
+            source: entry.source,
+            filter_by_theme: entry.filter_by_theme,
+            rotation_frequency: entry.rotation_frequency,
+            transition_duration: None,
+            filter_method: entry.filter_method,
+            scaling_mode: entry.scaling_mode,
+            sampling_method: entry.sampling_method,
+        }
+    }
+}
+
 /// Build the `all` entry to write: change only `source` (and pin `output` to
 /// the `all` key we write under); every other field the user configured in
 /// COSMIC Settings (scaling_mode, filter_method, rotation_frequency, …) is
 /// preserved. With no existing entry, start from cosmic-bg's defaults via
-/// `Entry::new`.
-pub fn updated_entry(existing: Option<Entry>, path: &Path) -> Entry {
+/// [`BgEntry::new_all`].
+pub fn updated_entry(existing: Option<BgEntry>, path: &Path) -> BgEntry {
     let source = Source::Path(path.to_path_buf());
     match existing {
         Some(mut entry) => {
@@ -72,7 +188,7 @@ pub fn updated_entry(existing: Option<Entry>, path: &Path) -> Entry {
             entry.source = source;
             entry
         }
-        None => Entry::new(DEFAULT_BACKGROUND.to_owned(), source),
+        None => BgEntry::new_all(source),
     }
 }
 
@@ -113,7 +229,8 @@ fn check_apply_source(path: &Path) -> Result<(), WallpaperError> {
 pub fn apply(path: &Path) -> Result<(), WallpaperError> {
     check_apply_source(path)?;
     let context = cosmic_bg_config::context().map_err(config_err)?;
-    let entry = updated_entry(context.entry(DEFAULT_BACKGROUND).ok(), path);
+    let existing = context.entry(DEFAULT_BACKGROUND).ok().map(BgEntry::from);
+    let entry = updated_entry(existing, path).into_pinned();
 
     let mut config = Config::load(&context).map_err(config_err)?;
     config.set_entry(&context, entry).map_err(config_err)?;
@@ -234,7 +351,7 @@ impl CurrentWallpaper {
 /// pure function so the three-way mapping is testable without a `Context`
 /// (which can only ever be opened against the *real* user config — see
 /// [`apply`]).
-fn classify(same_on_all: bool, entry: Option<Entry>) -> CurrentWallpaper {
+fn classify(same_on_all: bool, entry: Option<BgEntry>) -> CurrentWallpaper {
     if !same_on_all {
         return CurrentWallpaper::Unknown;
     }
@@ -264,7 +381,7 @@ pub fn current_wallpaper() -> CurrentWallpaper {
     };
     classify(
         context.same_on_all(),
-        context.entry(DEFAULT_BACKGROUND).ok(),
+        context.entry(DEFAULT_BACKGROUND).ok().map(BgEntry::from),
     )
 }
 
@@ -333,7 +450,40 @@ fn is_inside(path: &Path, dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cosmic_bg_config::Entry as PinnedEntry;
     use cosmic_bg_config::{FilterMethod, SamplingMethod, ScalingMode};
+
+    /// The `all` entry in the on-disk shape legacy cosmic-bg writes (the
+    /// pinned `Entry`: no `transition_duration`).
+    const LEGACY_ALL_RON: &str = r#"(
+    output: "all",
+    source: Path("/usr/share/backgrounds/cosmic/orion_nebula_nasa_heic0601a.jpg"),
+    filter_by_theme: true,
+    rotation_frequency: 300,
+    filter_method: Lanczos,
+    scaling_mode: Zoom,
+    sampling_method: Alphanumeric,
+)"#;
+
+    /// The `all` entry in the on-disk shape per-mode cosmic-bg writes: the
+    /// legacy fields plus a bare-integer `transition_duration`.
+    const PER_MODE_ALL_RON: &str = r#"(
+    output: "all",
+    source: Path("/usr/share/backgrounds/cosmic/old.jpg"),
+    filter_by_theme: false,
+    rotation_frequency: 300,
+    transition_duration: 1200,
+    filter_method: Lanczos,
+    scaling_mode: Fit((0.0, 0.0, 0.0)),
+    sampling_method: Alphanumeric,
+)"#;
+
+    /// What per-mode cosmic-bg requires of `transition_duration`: a bare
+    /// `u64`, never RON's `Some(..)` wrapper.
+    #[derive(Deserialize)]
+    struct PerModeOracle {
+        transition_duration: u64,
+    }
 
     #[test]
     fn updated_entry_from_none_uses_cosmic_bg_defaults() {
@@ -342,17 +492,23 @@ mod tests {
 
         assert_eq!(entry.output, "all");
         assert_eq!(entry.source, Source::Path(path.to_path_buf()));
-        // Everything else matches Entry::new's defaults.
-        let defaults = Entry::new("all".to_owned(), Source::Path(path.to_path_buf()));
-        assert_eq!(entry, defaults);
+        assert_eq!(entry, BgEntry::new_all(Source::Path(path.to_path_buf())));
+        // Everything else matches the pinned Entry::new's defaults, and no
+        // `transition_duration` is invented.
+        let pinned = PinnedEntry::new("all".to_owned(), Source::Path(path.to_path_buf()));
+        assert_eq!(entry.filter_by_theme, pinned.filter_by_theme);
+        assert_eq!(entry.rotation_frequency, pinned.rotation_frequency);
+        assert_eq!(entry.filter_method, pinned.filter_method);
+        assert_eq!(entry.scaling_mode, pinned.scaling_mode);
+        assert_eq!(entry.sampling_method, pinned.sampling_method);
+        assert_eq!(entry.transition_duration, None);
     }
 
     #[test]
     fn updated_entry_preserves_user_fields_and_sets_source() {
-        let mut existing = Entry::new(
-            "all".to_owned(),
-            Source::Path(PathBuf::from("/usr/share/backgrounds/old.jpg")),
-        );
+        let mut existing = BgEntry::new_all(Source::Path(PathBuf::from(
+            "/usr/share/backgrounds/old.jpg",
+        )));
         existing.filter_by_theme = true;
         existing.rotation_frequency = 12_345;
         existing.filter_method = FilterMethod::Nearest;
@@ -373,10 +529,8 @@ mod tests {
     #[test]
     fn updated_entry_pins_output_to_all() {
         // A stray per-output entry passed in still writes under `all`.
-        let existing = Entry::new(
-            "DP-1".to_owned(),
-            Source::Path(PathBuf::from("/tmp/old.jpg")),
-        );
+        let mut existing = BgEntry::new_all(Source::Path(PathBuf::from("/tmp/old.jpg")));
+        existing.output = "DP-1".to_owned();
         let entry = updated_entry(Some(existing), Path::new("/tmp/new.jpg"));
         assert_eq!(entry.output, "all");
     }
@@ -385,16 +539,81 @@ mod tests {
     fn updated_entry_keeps_color_source_users_scaling() {
         // Coming from a solid-color background: source swaps to the path,
         // scaling fields survive.
-        let mut existing = Entry::new(
-            "all".to_owned(),
-            Source::Color(cosmic_bg_config::Color::Single([0.1, 0.2, 0.3])),
-        );
+        let mut existing = BgEntry::new_all(Source::Color(cosmic_bg_config::Color::Single([
+            0.1, 0.2, 0.3,
+        ])));
         existing.scaling_mode = ScalingMode::Fit([1.0, 1.0, 1.0]);
 
         let path = Path::new("/home/u/Pictures/BingWallpaper/20260807-Foo_UHD.jpg");
         let entry = updated_entry(Some(existing), path);
         assert_eq!(entry.source, Source::Path(path.to_path_buf()));
         assert_eq!(entry.scaling_mode, ScalingMode::Fit([1.0, 1.0, 1.0]));
+    }
+
+    #[test]
+    fn legacy_shape_round_trips_without_transition_duration() {
+        let existing: BgEntry = ron::from_str(LEGACY_ALL_RON).expect("legacy entry parses");
+        assert_eq!(existing.transition_duration, None);
+
+        let path = Path::new("/home/u/Pictures/BingWallpaper/20260807-Foo_UHD.jpg");
+        let written = ron::to_string(&updated_entry(Some(existing), path)).expect("serialize");
+
+        assert!(
+            !written.contains("transition_duration"),
+            "a legacy entry must not grow the field legacy cosmic-bg rejects: {written}"
+        );
+        // The pinned Entry (`deny_unknown_fields`) is the legacy oracle.
+        let pinned: PinnedEntry =
+            ron::from_str(&written).expect("legacy cosmic-bg must parse what we write");
+        assert_eq!(pinned.output, "all");
+        assert_eq!(pinned.source, Source::Path(path.to_path_buf()));
+        assert!(pinned.filter_by_theme);
+        assert_eq!(pinned.rotation_frequency, 300);
+    }
+
+    #[test]
+    fn new_shape_preserves_transition_duration() {
+        let existing: BgEntry = ron::from_str(PER_MODE_ALL_RON).expect("per-mode entry parses");
+        assert_eq!(existing.transition_duration, Some(1200));
+        assert_eq!(existing.scaling_mode, ScalingMode::Fit([0.0, 0.0, 0.0]));
+
+        let path = Path::new("/home/u/Pictures/BingWallpaper/20260807-Foo_UHD.jpg");
+        let entry = updated_entry(Some(existing), path);
+        assert_eq!(entry.source, Source::Path(path.to_path_buf()));
+        assert_eq!(entry.transition_duration, Some(1200));
+        assert_eq!(entry.scaling_mode, ScalingMode::Fit([0.0, 0.0, 0.0]));
+
+        // Written back as the bare integer per-mode cosmic-bg deserializes.
+        let written = ron::to_string(&entry).expect("serialize");
+        let oracle: PerModeOracle =
+            ron::from_str(&written).expect("per-mode cosmic-bg must parse what we write");
+        assert_eq!(oracle.transition_duration, 1200);
+    }
+
+    #[test]
+    fn unknown_fields_are_tolerated() {
+        // A future cosmic-bg adds a field we have never heard of: the entry
+        // must still parse, and an apply must keep the fields we do know.
+        let ron = PER_MODE_ALL_RON.replace(
+            "    transition_duration: 1200,\n",
+            "    transition_duration: 1200,\n    future_field: 1,\n",
+        );
+        assert!(ron.contains("future_field"), "fixture edit must apply");
+        let existing: BgEntry = ron::from_str(&ron).expect("unknown fields must not be fatal");
+
+        let entry = updated_entry(Some(existing), Path::new("/tmp/new.jpg"));
+        assert_eq!(entry.source, Source::Path(PathBuf::from("/tmp/new.jpg")));
+        assert_eq!(entry.scaling_mode, ScalingMode::Fit([0.0, 0.0, 0.0]));
+        assert_eq!(entry.transition_duration, Some(1200));
+    }
+
+    #[test]
+    fn missing_filter_by_theme_defaults_false() {
+        // Per-mode cosmic-bg made the field optional (`serde(default)`).
+        let ron = PER_MODE_ALL_RON.replace("    filter_by_theme: false,\n", "");
+        assert!(!ron.contains("filter_by_theme"), "fixture edit must apply");
+        let entry: BgEntry = ron::from_str(&ron).expect("entry without filter_by_theme parses");
+        assert!(!entry.filter_by_theme);
     }
 
     #[test]
@@ -429,11 +648,10 @@ mod tests {
     #[test]
     fn classify_maps_the_three_cosmic_bg_states() {
         let path = PathBuf::from("/home/u/Pictures/BingWallpaper/20260807-Foo_UHD.jpg");
-        let file_entry = Entry::new("all".to_owned(), Source::Path(path.clone()));
-        let color_entry = Entry::new(
-            "all".to_owned(),
-            Source::Color(cosmic_bg_config::Color::Single([0.1, 0.2, 0.3])),
-        );
+        let file_entry = BgEntry::new_all(Source::Path(path.clone()));
+        let color_entry = BgEntry::new_all(Source::Color(cosmic_bg_config::Color::Single([
+            0.1, 0.2, 0.3,
+        ])));
 
         // Same-on-all with a path: that file is displayed.
         assert_eq!(
