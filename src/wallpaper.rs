@@ -18,6 +18,7 @@
 // `cosmic_config` instance instead (see `poke_state` for why the two-instance
 // split forces that and why the bytes are identical either way).
 
+use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -209,6 +210,161 @@ fn check_apply_source(path: &Path) -> Result<(), WallpaperError> {
             path.display()
         )))
     }
+}
+
+/// cosmic-bg's config names. Legacy cosmic-bg reads and watches only the
+/// shared config; per-mode cosmic-bg displays the `.Dark`/`.Light` config
+/// matching the active theme mode and reads the shared one only to seed a
+/// mode config that has no `all` key yet. All three are version 1.
+const BG_SHARED: &str = cosmic_bg_config::NAME;
+const BG_DARK: &str = "com.system76.CosmicBackground.Dark";
+const BG_LIGHT: &str = "com.system76.CosmicBackground.Light";
+const BG_VERSION: u64 = 1;
+
+/// COSMIC's theme-mode config; its `is_dark` key selects the mode per-mode
+/// cosmic-bg displays.
+const THEME_MODE: &str = "com.system76.CosmicTheme.Mode";
+const THEME_MODE_VERSION: u64 = 1;
+
+/// One of per-mode cosmic-bg's two background configs. Deliberately not
+/// `accent::Mode`: that one names a theme builder, this one a cosmic-bg
+/// config directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BgMode {
+    Dark,
+    Light,
+}
+
+impl BgMode {
+    fn config_name(self) -> &'static str {
+        match self {
+            Self::Dark => BG_DARK,
+            Self::Light => BG_LIGHT,
+        }
+    }
+}
+
+/// Whether the cosmic-bg whose config lives under `config_root` uses
+/// per-mode backgrounds: true iff a `.Dark` or `.Light` config directory
+/// exists. Per-mode cosmic-bg creates both at every startup (it opens them
+/// before seeding), and legacy cosmic-bg never does — so the on-disk layout,
+/// not any COSMIC version number, is the signal.
+///
+/// A pure path probe that **opens no config**: opening one creates its
+/// directory, and a mode directory invented on a legacy system would make
+/// this probe lie from then on (see [`open_targets`]).
+pub fn per_mode_layout(config_root: &Path) -> bool {
+    [BG_DARK, BG_LIGHT].into_iter().any(|name| {
+        config_root
+            .join("cosmic")
+            .join(name)
+            .join(format!("v{BG_VERSION}"))
+            .is_dir()
+    })
+}
+
+/// The cosmic-bg config handles an apply writes and a read consults.
+// Fields are consumed by the apply/read rewiring in the following commits.
+#[allow(dead_code)]
+pub struct BgTargets {
+    /// The shared config: all a legacy cosmic-bg reads, and what a per-mode
+    /// cosmic-bg seeds a fresh mode config from.
+    pub shared: cosmic::cosmic_config::Config,
+    /// The per-mode configs, Dark then Light; empty on a legacy layout.
+    pub modes: Vec<(BgMode, cosmic::cosmic_config::Config)>,
+    /// COSMIC's theme-mode config, for picking the displayed mode. Only
+    /// opened (best-effort) on a per-mode layout — nothing else reads it.
+    pub theme_mode: Option<cosmic::cosmic_config::Config>,
+}
+
+/// Open the cosmic-bg handles for the layout found under `config_root`.
+///
+/// The mode configs are opened **only** when [`per_mode_layout`] already
+/// holds. Never create them on a legacy system: when that system later
+/// upgrades, per-mode cosmic-bg seeds each mode from the shared config only
+/// if the mode config has no `all` key — a mode config this applet had
+/// written would win over, and so discard, a wallpaper the user chose on
+/// legacy after our last apply.
+///
+/// Raw keys through **our** pinned `cosmic_config` instance, exactly like
+/// [`poke_state`] (see the module comment); `with_custom_path` keeps the
+/// handles injectable for tests.
+pub fn open_targets(config_root: &Path) -> Result<BgTargets, WallpaperError> {
+    use cosmic::cosmic_config::Config;
+
+    // Probe first: every open below creates its directory.
+    let per_mode = per_mode_layout(config_root);
+    let open = |name: &str| {
+        Config::with_custom_path(name, BG_VERSION, config_root.to_path_buf()).map_err(config_err)
+    };
+
+    let shared = open(BG_SHARED)?;
+    let (modes, theme_mode) = if per_mode {
+        let modes = [BgMode::Dark, BgMode::Light]
+            .into_iter()
+            .map(|mode| open(mode.config_name()).map(|config| (mode, config)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let theme_mode =
+            Config::with_custom_path(THEME_MODE, THEME_MODE_VERSION, config_root.to_path_buf())
+                .map_err(|error| tracing::warn!("cannot open the theme-mode config: {error}"))
+                .ok();
+        (modes, theme_mode)
+    } else {
+        (Vec::new(), None)
+    };
+    Ok(BgTargets {
+        shared,
+        modes,
+        theme_mode,
+    })
+}
+
+/// The directory cosmic-config roots user configs in — a mirror of the
+/// locked cosmic-config's private `get_config_dir()`
+/// (`cosmic-config/src/lib.rs`), which is what `Config::new` uses for every
+/// other handle in this applet. In Flatpak that is `HOST_XDG_CONFIG_HOME`,
+/// else `$HOME/.config`, and only then `dirs::config_dir()` — the last being
+/// the sandbox-private `~/.var/app/<id>/config`, where cosmic-bg never
+/// looks. Values are used verbatim (no emptiness filtering) to stay
+/// byte-for-byte with upstream. Once a deliberate libcosmic bump makes
+/// `get_config_dir` public, replace this with it.
+fn config_root_from(
+    flatpak: bool,
+    host_xdg_config_home: Option<OsString>,
+    home: Option<OsString>,
+    default: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if flatpak {
+        if let Some(host) = host_xdg_config_home {
+            return Some(PathBuf::from(host));
+        }
+        if let Some(home) = home {
+            return Some(PathBuf::from(home).join(".config"));
+        }
+    }
+    default
+}
+
+/// The production config root; see [`config_root_from`]. Never substitute
+/// `dirs::config_dir()`: a handle rooted elsewhere fails silently — the
+/// layout probe says "legacy" and the write lands where cosmic-bg never
+/// reads.
+fn config_root() -> Option<PathBuf> {
+    config_root_from(
+        std::env::var_os("FLATPAK_ID").is_some(),
+        std::env::var_os("HOST_XDG_CONFIG_HOME"),
+        std::env::var_os("HOME"),
+        dirs::config_dir(),
+    )
+}
+
+/// The production [`BgTargets`], rooted at [`config_root`].
+// Called by the apply/read rewiring in the following commits.
+#[allow(dead_code)]
+fn production_targets() -> Result<BgTargets, WallpaperError> {
+    let root = config_root()
+        .ok_or_else(|| WallpaperError("no config directory for cosmic-bg".to_owned()))?;
+    open_targets(&root)
 }
 
 /// Apply `path` as the wallpaper on all displays by writing cosmic-bg's
@@ -785,6 +941,160 @@ mod tests {
             Path::new("/home/u/Pictures/BingWallpaper/sub/../a.jpg"),
             dir
         ));
+    }
+
+    mod targets {
+        //! Layout detection, target handles, and the config root — all
+        //! against a tempdir (`Config::with_custom_path`), never the real
+        //! user config.
+
+        use super::*;
+        use crate::testutil::{bg_key_file, bg_layout};
+
+        fn cosmic_dir_names(root: &Path) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(root.join("cosmic"))
+                .expect("read cosmic dir")
+                .map(|entry| entry.expect("dir entry").file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            names
+        }
+
+        #[test]
+        fn mode_names_are_pinned() {
+            // Literal pins of cosmic-bg's on-disk identity: a drift in the
+            // consts must break here, not silently retarget the writes.
+            assert_eq!(BG_SHARED, "com.system76.CosmicBackground");
+            assert_eq!(
+                BgMode::Dark.config_name(),
+                "com.system76.CosmicBackground.Dark"
+            );
+            assert_eq!(
+                BgMode::Light.config_name(),
+                "com.system76.CosmicBackground.Light"
+            );
+            assert_eq!(BG_VERSION, 1);
+        }
+
+        #[test]
+        fn old_layout_detects_shared_only() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            // Nothing at all (a machine that never ran cosmic-bg) is legacy.
+            assert!(!per_mode_layout(dir.path()));
+            bg_layout(dir.path(), false);
+            assert!(!per_mode_layout(dir.path()));
+        }
+
+        #[test]
+        fn new_layout_detects_per_mode() {
+            // Either mode directory alone is enough.
+            for name in [
+                "com.system76.CosmicBackground.Dark",
+                "com.system76.CosmicBackground.Light",
+            ] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                bg_layout(dir.path(), false);
+                let mode_dir = dir.path().join("cosmic").join(name);
+                // The config name without its version dir is not a layout.
+                std::fs::create_dir_all(&mode_dir).expect("create mode dir");
+                assert!(!per_mode_layout(dir.path()), "{name} without v1");
+                std::fs::create_dir_all(mode_dir.join("v1")).expect("create version dir");
+                assert!(per_mode_layout(dir.path()), "{name}/v1");
+            }
+        }
+
+        #[test]
+        fn open_targets_old_layout_opens_no_mode_configs() {
+            // The seeding-safety guard: opening a config creates its
+            // directory, and a mode directory created on a legacy system
+            // makes the later per-mode upgrade skip seeding from shared.
+            let dir = tempfile::tempdir().expect("tempdir");
+            bg_layout(dir.path(), false);
+
+            let targets = open_targets(dir.path()).expect("open targets");
+
+            assert!(targets.modes.is_empty());
+            assert!(targets.theme_mode.is_none());
+            assert_eq!(
+                cosmic_dir_names(dir.path()),
+                ["com.system76.CosmicBackground"],
+                "a legacy probe must create nothing beside the shared config"
+            );
+        }
+
+        #[test]
+        fn open_targets_new_layout_opens_dark_then_light() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            bg_layout(dir.path(), true);
+
+            let targets = open_targets(dir.path()).expect("open targets");
+
+            let modes: Vec<BgMode> = targets.modes.iter().map(|(mode, _)| *mode).collect();
+            assert_eq!(modes, [BgMode::Dark, BgMode::Light]);
+            assert!(targets.theme_mode.is_some());
+
+            // Each handle is rooted at the directory cosmic-bg reads: a key
+            // set through it lands in that config's v1 dir under the root.
+            use cosmic::cosmic_config::ConfigSet as _;
+            let handles = [
+                ("com.system76.CosmicBackground", &targets.shared),
+                ("com.system76.CosmicBackground.Dark", &targets.modes[0].1),
+                ("com.system76.CosmicBackground.Light", &targets.modes[1].1),
+            ];
+            for (name, config) in handles {
+                let key_file = bg_key_file(dir.path(), name, "same-on-all");
+                assert!(!key_file.exists(), "{name}: nothing written yet");
+                config.set("same-on-all", true).expect("set key");
+                assert!(key_file.is_file(), "{name}: key must land under the root");
+            }
+        }
+
+        fn os(value: &str) -> Option<OsString> {
+            Some(OsString::from(value))
+        }
+
+        #[test]
+        fn config_root_native_uses_default() {
+            let default = Some(PathBuf::from("/home/u/.config"));
+            assert_eq!(
+                config_root_from(false, os("/host/config"), os("/home/u"), default.clone()),
+                default
+            );
+            assert_eq!(config_root_from(false, None, None, None), None);
+        }
+
+        #[test]
+        fn config_root_flatpak_prefers_host_xdg_config_home() {
+            assert_eq!(
+                config_root_from(
+                    true,
+                    os("/host/config"),
+                    os("/home/u"),
+                    Some(PathBuf::from("/home/u/.var/app/id/config")),
+                ),
+                Some(PathBuf::from("/host/config"))
+            );
+        }
+
+        #[test]
+        fn config_root_flatpak_falls_back_to_home_dot_config() {
+            // Not the sandbox-private default: cosmic-bg never looks there.
+            assert_eq!(
+                config_root_from(
+                    true,
+                    None,
+                    os("/home/u"),
+                    Some(PathBuf::from("/home/u/.var/app/id/config")),
+                ),
+                Some(PathBuf::from("/home/u/.config"))
+            );
+        }
+
+        #[test]
+        fn config_root_flatpak_without_host_or_home_uses_default() {
+            let default = Some(PathBuf::from("/home/u/.var/app/id/config"));
+            assert_eq!(config_root_from(true, None, None, default.clone()), default);
+        }
     }
 
     mod poke {
