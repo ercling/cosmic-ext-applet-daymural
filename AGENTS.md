@@ -221,6 +221,13 @@ keep it a bare integer on disk, never RON's `Some(..)`. Root these handles with
 `get_config_dir`; never with `dirs::config_dir()`. Detect the layout, never a
 COSMIC version number.
 
+Reads follow the active mode only (falling back to the shared config when that
+mode has no `all` key), while an apply sets both modes. Do-not-clobber and
+prune protection therefore do not cover a wallpaper only the inactive mode
+uses, and a mode config left on a legacy `cosmic-bg` is trusted although
+nothing updates it. These gaps are recorded in `docs/limitations.md`; do not
+widen them.
+
 ### Lock-screen workaround
 
 The lock/resume poke deliberately writes a semantically equivalent but

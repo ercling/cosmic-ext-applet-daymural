@@ -401,8 +401,42 @@ still open. Where the code differs from the text above:
   order and rooting), `unreadable_entry_is_rebuilt_from_defaults`,
   `apply_fails_fast_on_a_failed_write`, `active_mode_per_output_is_unknown`,
   `missing_active_mode_config_is_unknown`.
-- **Not handled:** mode directories created by a third party on a *legacy*
-  cosmic-bg. Apply still works (shared is written), but `current_wallpaper`
-  then reads the mode config, which legacy cosmic-bg never updates, so a
-  wallpaper later chosen in legacy Settings is not seen by the do-not-clobber
-  rule. The layout alone cannot tell this case from a real per-mode system.
+- **The active mode falls back to shared when it has no `all` key** (added
+  after the final review; `active_mode_without_entry_reads_shared`). Without
+  it, mode directories with no entry — a per-mode cosmic-bg before seeding, or
+  directories left on a legacy cosmic-bg — read as "no file": the daily apply
+  stops, and the image legacy cosmic-bg displays loses its prune protection.
+  A present but unreadable mode entry does not fall back.
+- **`classify` decisions do change in one native case.** On a never-customised
+  native desktop the read is now `NoFile` where it used to be
+  `File(<distro default>)`, because the handles have no system path. This
+  matches the Flatpak build and is benign.
+- **The "two `cosmic-config` instances" rationale is stale.** `Cargo.lock`
+  holds one `cosmic-config` package. The raw-key design stands for other
+  reasons (the pinned `context()` cannot open mode configs or an injected
+  path, and the pinned `Entry` is `deny_unknown_fields`); the comments in
+  `src/wallpaper.rs` now say so.
+
+### Open after the final review
+
+- **Leftover mode directories on a legacy cosmic-bg are not harmless for
+  reads.** This corrects the "Downgrade" and "Third-party directory creation"
+  detection notes, which hold for apply only. When a mode config holds an
+  entry that legacy cosmic-bg never updates (after a downgrade, or once
+  Daymural has applied through third-party-created directories),
+  `current_wallpaper` trusts it. A wallpaper later chosen in legacy Settings
+  is then not seen by the do-not-clobber rule. The layout alone cannot tell
+  this from a real per-mode system; cosmic-bg's `wallpapers` state key could
+  arbitrate. Documented in `docs/limitations.md` with the workaround (delete
+  the directories).
+- **Prune protects only the active mode's file.** With a foreign wallpaper in
+  the active mode and a Daymural image in the other, that image can be deleted
+  once it ages out. Protecting every mode's file source needs changes in
+  `src/app.rs`, which this plan froze. Documented in `docs/limitations.md`.
+- **Background applies still set both modes** (accepted in Task 4). Together
+  with the prune gap this argues for a follow-up that makes protection and
+  background applies mode-aware and then reconciles the AGENTS.md
+  do-not-clobber and prune invariants.
+- **Manual smoke Steps 3–5 have not been run.** Per-mode behaviour is so far
+  backed by hermetic tests and by reading upstream `2439903`, not by a real
+  per-mode system.

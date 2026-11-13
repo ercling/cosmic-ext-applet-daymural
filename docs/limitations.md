@@ -20,6 +20,16 @@ dependencies.
   and transition settings. Before a background apply Daymural checks only the
   wallpaper of the mode that is active at that moment, so a wallpaper you chose
   for the other mode alone is replaced too.
+- Cleanup likewise protects only the active mode's wallpaper. A Daymural image
+  that only the other mode still uses can be deleted once it is older than the
+  retention period; that mode then falls back to COSMIC's default image.
+- Leftover per-mode background settings mislead Daymural on a COSMIC that does
+  not use them. If `~/.config/cosmic/com.system76.CosmicBackground.Dark` or
+  `.Light` exists while the installed cosmic-bg has no separate dark and light
+  backgrounds (after a downgrade, or because another tool created them),
+  Daymural reads the displayed wallpaper from those directories instead of the
+  one COSMIC shows. A background refresh can then replace a wallpaper you chose
+  in COSMIC Settings. Delete both directories to fix it.
 
 ## Timers and multiple outputs
 
