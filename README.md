@@ -68,6 +68,9 @@ details.
   their respective rightsholders. Use them only as personal, noncommercial
   wallpaper unless the rightsholder grants broader permission. See
   [Image rights and attribution](docs/image-rights.md).
+- Daymural works with cosmic-bg both before and after it gained separate dark
+  and light backgrounds. Where COSMIC keeps a background per mode, applying an
+  image sets it for both dark and light.
 - Do not run native and Flatpak installations at the same time. Their separate
   applet instances can both modify the shared wallpaper and COSMIC settings.
 - If **Match accent to wallpaper** is enabled, switch it off before uninstalling

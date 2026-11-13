@@ -14,6 +14,12 @@ dependencies.
   restart. Daymural then disables matching and preserves the user's choice.
 - Applying a Daymural image changes a per-output wallpaper setup to COSMIC's
   same-wallpaper-on-all-outputs mode.
+- Where COSMIC keeps separate dark and light backgrounds, applying a Daymural
+  image sets both modes to that image, whether you apply it yourself or a
+  background refresh or shuffle does. Each mode keeps its own scaling, filter,
+  and transition settings. Before a background apply Daymural checks only the
+  wallpaper of the mode that is active at that moment, so a wallpaper you chose
+  for the other mode alone is replaced too.
 
 ## Timers and multiple outputs
 
