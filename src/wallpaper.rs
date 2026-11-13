@@ -41,7 +41,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use cosmic_bg_config::{
-    DEFAULT_BACKGROUND, Entry, FilterMethod, SAME_ON_ALL, SamplingMethod, ScalingMode, Source,
+    DEFAULT_BACKGROUND, FilterMethod, SAME_ON_ALL, SamplingMethod, ScalingMode, Source,
 };
 use serde::{Deserialize, Serialize};
 
@@ -168,21 +168,6 @@ impl BgEntry {
     }
 }
 
-impl From<Entry> for BgEntry {
-    fn from(entry: Entry) -> Self {
-        Self {
-            output: entry.output,
-            source: entry.source,
-            filter_by_theme: entry.filter_by_theme,
-            rotation_frequency: entry.rotation_frequency,
-            transition_duration: None,
-            filter_method: entry.filter_method,
-            scaling_mode: entry.scaling_mode,
-            sampling_method: entry.sampling_method,
-        }
-    }
-}
-
 /// Build the `all` entry to write: change only `source` (and pin `output` to
 /// the `all` key we write under); every other field the user configured in
 /// COSMIC Settings (scaling_mode, filter_method, rotation_frequency, …) is
@@ -232,6 +217,7 @@ const BG_VERSION: u64 = 1;
 /// cosmic-bg displays.
 const THEME_MODE: &str = "com.system76.CosmicTheme.Mode";
 const THEME_MODE_VERSION: u64 = 1;
+const IS_DARK: &str = "is_dark";
 
 /// One of per-mode cosmic-bg's two background configs. Deliberately not
 /// `accent::Mode`: that one names a theme builder, this one a cosmic-bg
@@ -279,8 +265,6 @@ pub struct BgTargets {
     pub modes: Vec<(BgMode, cosmic::cosmic_config::Config)>,
     /// COSMIC's theme-mode config, for picking the displayed mode. Only
     /// opened (best-effort) on a per-mode layout — nothing else reads it.
-    // Read by the current-wallpaper rewiring in the following commit.
-    #[allow(dead_code)]
     pub theme_mode: Option<cosmic::cosmic_config::Config>,
 }
 
@@ -565,10 +549,8 @@ impl CurrentWallpaper {
     }
 }
 
-/// Classify cosmic-bg's config state. Split out of [`current_wallpaper`] as a
-/// pure function so the three-way mapping is testable without a `Context`
-/// (which can only ever be opened against the *real* user config — see
-/// [`apply`]).
+/// Classify one cosmic-bg config's state — the pure three-way mapping
+/// behind [`current_from`].
 fn classify(same_on_all: bool, entry: Option<BgEntry>) -> CurrentWallpaper {
     if !same_on_all {
         return CurrentWallpaper::Unknown;
@@ -584,23 +566,49 @@ fn classify(same_on_all: bool, entry: Option<BgEntry>) -> CurrentWallpaper {
     }
 }
 
-/// Read what cosmic-bg currently displays from its config.
+/// The mode a per-mode cosmic-bg displays: `is_dark` false → Light; true,
+/// unreadable, or no theme-mode config at all → Dark. Matches upstream
+/// `Mode::current`, which also defaults to Dark.
+fn active_mode(theme_mode: Option<&cosmic::cosmic_config::Config>) -> BgMode {
+    use cosmic::cosmic_config::ConfigGet as _;
+
+    match theme_mode.map(|config| config.get::<bool>(IS_DARK)) {
+        Some(Ok(false)) => BgMode::Light,
+        _ => BgMode::Dark,
+    }
+}
+
+/// What cosmic-bg displays according to `targets`: on a per-mode layout the
+/// **active mode's** config (the shared one is stale there — cosmic-bg
+/// never re-reads it), otherwise the shared config. An active mode whose
+/// config is not among the targets is [`CurrentWallpaper::Unknown`]: the
+/// other mode and the shared config say nothing about what is on screen.
+///
+/// Only the active mode is consulted, while an apply sets both: a foreign
+/// wallpaper chosen for the inactive mode alone is not seen by the
+/// do-not-clobber rule (documented limitation).
+pub fn current_from(targets: &BgTargets) -> CurrentWallpaper {
+    let config = if targets.modes.is_empty() {
+        &targets.shared
+    } else {
+        let active = active_mode(targets.theme_mode.as_ref());
+        match targets.modes.iter().find(|(mode, _)| *mode == active) {
+            Some((_, config)) => config,
+            None => return CurrentWallpaper::Unknown,
+        }
+    };
+    classify(read_same_on_all(config), read_entry(config))
+}
+
+/// Read what cosmic-bg currently displays from its config ([`current_from`]
+/// over the [`production_targets`]); unopenable config is
+/// [`CurrentWallpaper::Unknown`].
 ///
 /// Accepted v1 limitation: this is read on demand (startup / next apply /
-/// prune), not watched — external changes are picked up then.
-///
-/// Test note: only the context read has no automated coverage (the real user
-/// config is the only constructible context); the classification it feeds is
-/// the pure, tested [`classify`], as are the decisions built on the result
-/// ([`prune_retention`], [`should_auto_apply`]).
+/// prune), not watched — external changes, a theme-mode switch included,
+/// are picked up then.
 pub fn current_wallpaper() -> CurrentWallpaper {
-    let Ok(context) = cosmic_bg_config::context() else {
-        return CurrentWallpaper::Unknown;
-    };
-    classify(
-        context.same_on_all(),
-        context.entry(DEFAULT_BACKGROUND).ok().map(BgEntry::from),
-    )
+    production_targets().map_or(CurrentWallpaper::Unknown, |targets| current_from(&targets))
 }
 
 /// The applet's tracked "current" after a fresh read of the live state:
@@ -1159,10 +1167,11 @@ mod tests {
         }
     }
 
-    mod apply {
-        //! [`apply_to`] against tempdir-rooted targets. Write assertions go
-        //! by inode (every cosmic-config `set` is temp+rename — see
-        //! [`crate::testutil::bg_wallpapers_inode`] for the rationale).
+    mod config_side {
+        //! [`apply_to`] and [`current_from`] against tempdir-rooted targets.
+        //! Write assertions go by inode (every cosmic-config `set` is
+        //! temp+rename — see [`crate::testutil::bg_wallpapers_inode`] for
+        //! the rationale).
 
         use super::*;
         use crate::testutil::{bg_key_file, bg_layout, read_only_trees, restore_dir_permissions};
@@ -1170,6 +1179,26 @@ mod tests {
         const SHARED: &str = "com.system76.CosmicBackground";
         const DARK: &str = "com.system76.CosmicBackground.Dark";
         const LIGHT: &str = "com.system76.CosmicBackground.Light";
+        const THEME_MODE_NAME: &str = "com.system76.CosmicTheme.Mode";
+
+        /// A minimal same-shape `all` entry showing `path`.
+        fn entry_ron(path: &Path) -> String {
+            ron::to_string(&BgEntry::new_all(Source::Path(path.to_path_buf()))).expect("serialize")
+        }
+
+        /// Set (or, with `None`, remove) the theme mode's `is_dark` key.
+        fn set_is_dark(root: &Path, ron: Option<&str>) {
+            let file = bg_key_file(root, THEME_MODE_NAME, "is_dark");
+            match ron {
+                Some(ron) => {
+                    std::fs::create_dir_all(file.parent().unwrap()).expect("theme-mode dir");
+                    std::fs::write(file, ron).expect("write is_dark");
+                }
+                None => {
+                    let _ = std::fs::remove_file(file);
+                }
+            }
+        }
 
         fn image(name: &str) -> PathBuf {
             PathBuf::from(format!("/home/u/Pictures/BingWallpaper/{name}.jpg"))
@@ -1410,6 +1439,122 @@ mod tests {
                 key_inodes(dir.path()).is_empty(),
                 "nothing after the failed write may land"
             );
+        }
+
+        #[test]
+        fn old_layout_reads_shared() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            bg_layout(dir.path(), false);
+            let targets = open_targets(dir.path()).expect("open targets");
+
+            // No `all` key at all: cosmic-bg shows its default.
+            assert_eq!(current_from(&targets), CurrentWallpaper::NoFile);
+
+            seed(dir.path(), SHARED, "all", &entry_ron(&image("a")));
+            assert_eq!(current_from(&targets), CurrentWallpaper::File(image("a")));
+
+            // Per-output mode: unknowable from the `all` entry.
+            seed(dir.path(), SHARED, "same-on-all", "false");
+            assert_eq!(current_from(&targets), CurrentWallpaper::Unknown);
+
+            // And an apply through the same targets is read back.
+            apply_to(&targets, &image("b")).expect("apply");
+            assert_eq!(current_from(&targets), CurrentWallpaper::File(image("b")));
+        }
+
+        #[test]
+        fn current_follows_active_mode() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            bg_layout(dir.path(), true);
+            seed(dir.path(), DARK, "all", &entry_ron(&image("a")));
+            let foreign = PathBuf::from("/usr/share/backgrounds/cosmic/b.jpg");
+            seed(dir.path(), LIGHT, "all", &entry_ron(&foreign));
+            let targets = open_targets(dir.path()).expect("open targets");
+
+            set_is_dark(dir.path(), Some("false"));
+            assert_eq!(current_from(&targets), CurrentWallpaper::File(foreign));
+
+            set_is_dark(dir.path(), Some("true"));
+            assert_eq!(current_from(&targets), CurrentWallpaper::File(image("a")));
+
+            // Unreadable or missing mode → Dark, like upstream `Mode::current`.
+            set_is_dark(dir.path(), Some("not a bool ["));
+            assert_eq!(current_from(&targets), CurrentWallpaper::File(image("a")));
+            set_is_dark(dir.path(), None);
+            assert_eq!(current_from(&targets), CurrentWallpaper::File(image("a")));
+
+            // No theme-mode config at all → Dark as well.
+            set_is_dark(dir.path(), Some("false"));
+            let without_theme_mode = BgTargets {
+                theme_mode: None,
+                ..targets
+            };
+            assert_eq!(
+                current_from(&without_theme_mode),
+                CurrentWallpaper::File(image("a"))
+            );
+        }
+
+        #[test]
+        fn new_layout_ignores_stale_shared() {
+            // Per-mode cosmic-bg never re-reads the shared config: whatever
+            // it holds says nothing about what is on screen.
+            let dir = tempfile::tempdir().expect("tempdir");
+            bg_layout(dir.path(), true);
+            seed(dir.path(), SHARED, "all", &entry_ron(&image("old")));
+            seed(dir.path(), SHARED, "same-on-all", "false");
+            for name in [DARK, LIGHT] {
+                seed(dir.path(), name, "all", &entry_ron(&image("new")));
+            }
+            let targets = open_targets(dir.path()).expect("open targets");
+
+            assert_eq!(current_from(&targets), CurrentWallpaper::File(image("new")));
+        }
+
+        #[test]
+        fn new_shape_entry_is_classified() {
+            // The regression: an entry carrying `transition_duration` did
+            // not parse as the pinned Entry and read as "no file".
+            let dir = tempfile::tempdir().expect("tempdir");
+            bg_layout(dir.path(), true);
+            seed(dir.path(), DARK, "all", PER_MODE_ALL_RON);
+            let targets = open_targets(dir.path()).expect("open targets");
+
+            assert_eq!(
+                current_from(&targets),
+                CurrentWallpaper::File(PathBuf::from("/usr/share/backgrounds/cosmic/old.jpg"))
+            );
+        }
+
+        #[test]
+        fn active_mode_per_output_is_unknown() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            bg_layout(dir.path(), true);
+            seed(dir.path(), DARK, "all", &entry_ron(&image("a")));
+            seed(dir.path(), DARK, "same-on-all", "false");
+            seed(dir.path(), LIGHT, "all", &entry_ron(&image("a")));
+            let targets = open_targets(dir.path()).expect("open targets");
+
+            // Dark is active (no `is_dark` key) and is in per-output mode.
+            assert_eq!(current_from(&targets), CurrentWallpaper::Unknown);
+            // Light is same-on-all: known again once it is the active mode.
+            set_is_dark(dir.path(), Some("false"));
+            assert_eq!(current_from(&targets), CurrentWallpaper::File(image("a")));
+        }
+
+        #[test]
+        fn missing_active_mode_config_is_unknown() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            bg_layout(dir.path(), true);
+            for name in [SHARED, DARK, LIGHT] {
+                seed(dir.path(), name, "all", &entry_ron(&image("a")));
+            }
+            let mut targets = open_targets(dir.path()).expect("open targets");
+
+            // Dark is active but its handle is not among the targets: do
+            // not guess from the other mode or from shared.
+            targets.modes.retain(|(mode, _)| *mode == BgMode::Light);
+            assert_eq!(current_from(&targets), CurrentWallpaper::Unknown);
         }
     }
 
