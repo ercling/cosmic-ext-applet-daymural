@@ -197,6 +197,31 @@ pub fn bg_path_source(name: &str) -> cosmic_bg_config::Source {
     )))
 }
 
+/// Create the cosmic-bg *config* directories of the requested layout under
+/// `root`: the shared config always, plus the `.Dark`/`.Light` configs when
+/// `per_mode` — what a legacy or a per-mode cosmic-bg leaves on disk.
+///
+/// The names are **deliberate literal pins** of cosmic-bg's on-disk identity
+/// (same policy as [`bg_wallpapers_key_file`]): a drift in
+/// `wallpaper`'s consts must break the tests, not retarget them.
+pub fn bg_layout(root: &Path, per_mode: bool) {
+    let mut names = vec!["com.system76.CosmicBackground"];
+    if per_mode {
+        names.push("com.system76.CosmicBackground.Dark");
+        names.push("com.system76.CosmicBackground.Light");
+    }
+    for name in names {
+        std::fs::create_dir_all(root.join("cosmic").join(name).join("v1"))
+            .expect("create cosmic-bg config dir");
+    }
+}
+
+/// Where a `with_custom_path` handle for config `name` (version 1) keeps
+/// `key`: `<root>/cosmic/<name>/v1/<key>`.
+pub fn bg_key_file(root: &Path, name: &str, key: &str) -> PathBuf {
+    root.join("cosmic").join(name).join("v1").join(key)
+}
+
 /// A real, decodable JPEG of the given size, in memory (for mock download
 /// bodies that must pass both the magic-byte check and thumbnailing).
 pub fn tiny_jpeg(width: u32, height: u32) -> Vec<u8> {
