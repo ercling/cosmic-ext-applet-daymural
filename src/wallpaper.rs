@@ -23,18 +23,17 @@
 // every config of the detected layout (`apply_to`), while a read follows the
 // displayed one (`current_from`).
 //
-// Note on types: cosmic-bg-config depends on its own `cosmic-config`
-// instance (unpinned git source, distinct from libcosmic's rev-pinned one),
-// so its `Context` API can neither be handed a handle from this crate nor
-// have its error type named here — and its pinned `Entry` rejects the fields
-// a newer cosmic-bg writes. Both the *config* side (`apply_to`,
-// `current_from`) and the lock-screen *state* poke (`poke_state`) therefore
-// read and write raw keys through **our** pinned `cosmic_config` instance;
-// cosmic-bg-config contributes only its key names and its plain serde types
-// (`Source`, the enums), mirrored for the entry itself by the
-// version-tolerant `BgEntry`. The RON bytes are identical either way (same
-// serializer), and every handle stays injectable via
-// `Config::with_custom_path` for tests.
+// Note on types: the pinned cosmic-bg-config API cannot serve this. Its
+// `context()` opens only the shared config under cosmic-config's own root
+// (no mode configs, no injectable path), and its `Entry` is
+// `deny_unknown_fields`, so it rejects the entries a newer cosmic-bg writes.
+// Both the *config* side (`apply_to`, `current_from`) and the lock-screen
+// *state* poke (`poke_state`) therefore read and write raw keys through
+// `cosmic::cosmic_config`; cosmic-bg-config contributes only its key names
+// and its plain serde types (`Source`, the enums), mirrored for the entry
+// itself by the version-tolerant `BgEntry`. The RON bytes are the ones
+// cosmic-bg reads and writes (same serializer), and every handle stays
+// injectable via `Config::with_custom_path` for tests.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -97,9 +96,8 @@ pub fn download_dir() -> PathBuf {
 ///   `deny_unknown_fields` rejects;
 /// - defaults `filter_by_theme`, which per-mode cosmic-bg made optional.
 ///
-/// The enum/source types are cosmic-bg-config's own: they are plain serde
-/// types, so the two-`cosmic-config`-instances problem (module comment) does
-/// not reach them.
+/// The enum/source types are cosmic-bg-config's own: plain serde types that
+/// per-mode cosmic-bg left unchanged.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct BgEntry {
     /// The configured output (`all` for the entry this applet writes).
@@ -277,9 +275,9 @@ pub struct BgTargets {
 /// written would win over, and so discard, a wallpaper the user chose on
 /// legacy after our last apply.
 ///
-/// Raw keys through **our** pinned `cosmic_config` instance, exactly like
-/// [`poke_state`] (see the module comment); `with_custom_path` keeps the
-/// handles injectable for tests.
+/// Raw keys through `cosmic::cosmic_config`, exactly like [`poke_state`]
+/// (see the module comment); `with_custom_path` keeps the handles injectable
+/// for tests.
 pub fn open_targets(config_root: &Path) -> Result<BgTargets, WallpaperError> {
     use cosmic::cosmic_config::Config;
 
@@ -468,12 +466,9 @@ const WALLPAPERS_KEY: &str = "wallpapers";
 /// (≤ `rotation_frequency`, 300 s default) rewrites the current source and
 /// self-heals it.
 ///
-/// Raw keys, not `cosmic_bg_config::state::State`'s entry API: that API
-/// comes from cosmic-bg-config's own `cosmic-config` instance, whose traits
-/// this crate cannot name (see module comment; `Cargo.lock` carries both
-/// packages — same commit today, still distinct). The RON bytes are
-/// identical either way (same commit, same serializer), so raw
-/// `ConfigGet::get`/`ConfigSet::set` through **our** pinned instance write
+/// Raw keys, not `cosmic_bg_config::state::State`'s entry API: a single-key
+/// read-toggle-write needs nothing more. The RON bytes are identical either
+/// way (same serializer), so raw `ConfigGet::get`/`ConfigSet::set` write
 /// exactly what cosmic-bg and the greeter read — and the handle stays
 /// injectable via `Config::with_custom_path` for tests.
 pub fn poke_state(config: &cosmic::cosmic_config::Config) -> Result<bool, WallpaperError> {
@@ -578,26 +573,51 @@ fn active_mode(theme_mode: Option<&cosmic::cosmic_config::Config>) -> BgMode {
     }
 }
 
+/// Whether a config has an `all` key of its own — readable or not. Absence
+/// is what makes a per-mode cosmic-bg seed that mode from the shared config.
+fn has_local_entry(config: &cosmic::cosmic_config::Config) -> bool {
+    use cosmic::cosmic_config::ConfigGet as _;
+
+    match config.get::<BgEntry>(DEFAULT_BACKGROUND) {
+        Ok(_) => true,
+        // `is_err` is false exactly for a merely absent key.
+        Err(error) => error.is_err(),
+    }
+}
+
 /// What cosmic-bg displays according to `targets`: on a per-mode layout the
 /// **active mode's** config (the shared one is stale there — cosmic-bg
-/// never re-reads it), otherwise the shared config. An active mode whose
-/// config is not among the targets is [`CurrentWallpaper::Unknown`]: the
-/// other mode and the shared config say nothing about what is on screen.
+/// never re-reads it), otherwise the shared config.
+///
+/// Two per-mode edge cases:
+///
+/// - The active mode has **no `all` key**: read the shared config instead.
+///   That is what a per-mode cosmic-bg seeds the mode from, and all a legacy
+///   cosmic-bg displays when the mode directories were merely left behind
+///   (a downgrade) or created by a third party. Reading "no file" here would
+///   stop the daily apply and unprotect the displayed image from the prune.
+/// - The active mode's config is **not among the targets**:
+///   [`CurrentWallpaper::Unknown`] — the other mode and the shared config
+///   say nothing about what is on screen.
 ///
 /// Only the active mode is consulted, while an apply sets both: a foreign
 /// wallpaper chosen for the inactive mode alone is not seen by the
-/// do-not-clobber rule (documented limitation).
+/// do-not-clobber rule, and a file only the inactive mode references is not
+/// protected from the prune (documented limitations). Likewise a mode config
+/// that *has* an entry is trusted even on a legacy cosmic-bg that never
+/// updates it; the layout alone cannot tell that case apart.
 pub fn current_from(targets: &BgTargets) -> CurrentWallpaper {
-    let config = if targets.modes.is_empty() {
+    let displayed = if targets.modes.is_empty() {
         &targets.shared
     } else {
         let active = active_mode(targets.theme_mode.as_ref());
         match targets.modes.iter().find(|(mode, _)| *mode == active) {
-            Some((_, config)) => config,
+            Some((_, config)) if has_local_entry(config) => config,
+            Some(_) => &targets.shared,
             None => return CurrentWallpaper::Unknown,
         }
     };
-    classify(read_same_on_all(config), read_entry(config))
+    classify(read_same_on_all(displayed), read_entry(displayed))
 }
 
 /// Read what cosmic-bg currently displays from its config ([`current_from`]
@@ -1540,6 +1560,44 @@ mod tests {
             // Light is same-on-all: known again once it is the active mode.
             set_is_dark(dir.path(), Some("false"));
             assert_eq!(current_from(&targets), CurrentWallpaper::File(image("a")));
+        }
+
+        #[test]
+        fn active_mode_without_entry_reads_shared() {
+            // Mode directories exist but the active mode has no `all` key:
+            // a per-mode cosmic-bg that has not seeded yet, or directories a
+            // third party (or a since-downgraded cosmic-bg) left on a legacy
+            // system. Either way the shared config is what is, or is about
+            // to be, displayed — reading "no file" here would stop the
+            // daily apply and unprotect the displayed image from the prune.
+            let dir = tempfile::tempdir().expect("tempdir");
+            bg_layout(dir.path(), true);
+            let targets = open_targets(dir.path()).expect("open targets");
+
+            // Nothing anywhere: cosmic-bg shows its default.
+            assert_eq!(current_from(&targets), CurrentWallpaper::NoFile);
+
+            seed(dir.path(), SHARED, "all", &entry_ron(&image("a")));
+            assert_eq!(current_from(&targets), CurrentWallpaper::File(image("a")));
+
+            // Only the active mode's key matters: Light having an entry
+            // does not stand in for Dark, nor stop Dark's fallback.
+            seed(dir.path(), LIGHT, "all", &entry_ron(&image("b")));
+            assert_eq!(current_from(&targets), CurrentWallpaper::File(image("a")));
+            set_is_dark(dir.path(), Some("false"));
+            assert_eq!(current_from(&targets), CurrentWallpaper::File(image("b")));
+            set_is_dark(dir.path(), None);
+
+            // The fallback takes the shared config whole, `same-on-all`
+            // included.
+            seed(dir.path(), SHARED, "same-on-all", "false");
+            assert_eq!(current_from(&targets), CurrentWallpaper::Unknown);
+            seed(dir.path(), SHARED, "same-on-all", "true");
+
+            // A present but unreadable mode entry is not "absent": the mode
+            // owns its state, so stay with the mode's (default) reading.
+            seed(dir.path(), DARK, "all", "not valid ron [");
+            assert_eq!(current_from(&targets), CurrentWallpaper::NoFile);
         }
 
         #[test]
