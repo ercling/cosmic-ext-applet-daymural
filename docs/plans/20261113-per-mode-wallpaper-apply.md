@@ -362,13 +362,15 @@ reverse holds too.
   `cosmic-bg-1.10.0`. Install with `just install`, restart the panel, and
   apply from the popup. Expected: the wallpaper changes, and neither
   `~/.config/cosmic/com.system76.CosmicBackground.Dark` nor `.Light` exists.
-- [ ] **Step 4: Manual smoke, legacy, Flatpak.** Same machine. `just uninstall`
+  *Not run (2026-11-14): every smoke run used the Flatpak build.*
+- [x] **Step 4: Manual smoke, legacy, Flatpak.** Same machine. `just uninstall`
   the native build first (two installs means two leaders), then
   `just flatpak-sources` and `just flatpak-install`, restart the panel, and
   apply from the popup. Expected: the wallpaper changes;
   `~/.config/cosmic/com.system76.CosmicBackground/v1/all` on the **host**
   names the new image; neither mode directory exists under
   `~/.config/cosmic`.
+  *Done 2026-11-14, see "Manual smoke" below.*
 - [ ] **Step 5: Manual smoke, per-mode.** Needs a tester on cosmic-bg
   `d6dcfa9`+ (master/nightly, or the release after 1.11.0), ideally the
   reporter. A stock 1.11.0 system is **legacy** and proves nothing here:
@@ -376,6 +378,8 @@ reverse holds too.
   exists. Then apply, toggle dark/light in Settings, and confirm both modes
   show the image and the custom scaling survived. Ask for one run with the
   native build and one with the Flatpak build.
+  *Partly done 2026-11-14: the Flatpak run passed, see "Manual smoke" below.
+  The native run and the custom-scaling check are still open.*
 - [x] **Step 6:** Commit `docs: document per-mode wallpaper support`.
 
 ## Implementation notes (2026-11-14)
@@ -437,6 +441,39 @@ still open. Where the code differs from the text above:
   with the prune gap this argues for a follow-up that makes protection and
   background applies mode-aware and then reconciles the AGENTS.md
   do-not-clobber and prune invariants.
-- **Manual smoke Steps 3–5 have not been run.** Per-mode behaviour is so far
-  backed by hermetic tests and by reading upstream `2439903`, not by a real
-  per-mode system.
+- **Manual smoke:** superseded by the section below.
+
+### Manual smoke (2026-11-14)
+
+All runs used a local Flatpak build of `f880cf3` on Fedora 45, COSMIC 1.10.0.
+No native build was run on either layout.
+
+- **Legacy, Flatpak (Step 4): passed.** With `cosmic-bg-1.10.0`, applies at
+  16:11, 16:21 and 16:27 rewrote the host's shared `all`, the wallpaper
+  changed, and neither mode directory existed afterwards.
+- **Per-mode, Flatpak (Step 5): passed as far as it was run.** With cosmic-bg
+  built from upstream `2439903` installed over the packaged binary, cosmic-bg
+  created both mode directories with `transition_duration: 500`. Applies at
+  16:38 and 16:52 wrote Dark, Light and then the shared config within about
+  30 ms. Both mode entries kept `transition_duration: 500` as a bare integer,
+  the shared entry stayed free of it, and cosmic-bg's `wallpapers` state key
+  named the new image about 250 ms later. The accent followed both applies.
+  Dark/light was toggled at 16:59, after the last apply, and no problem was
+  reported.
+- **Not run:** Step 3 (legacy, native), a native run on the per-mode layout,
+  and the custom-scaling check (both modes used `Zoom` throughout; the
+  hermetic `new_layout_preserves_each_modes_own_fields` is the only evidence).
+- **Unexplained, not shown to be this change:** after four of the five applies
+  the applet logged `xdg_popup was destroyed while it was not the topmost
+  popup` two to four seconds later and stopped responding until respawned.
+  The session log has no such error for the 0.1.1 Flatpak that ran before,
+  but how often it applied is unknown. This branch does not touch popup or
+  tooltip code. An A/B run against 0.1.1 would settle it.
+- **Test-session artefacts, not applet behaviour:** an accent that stopped
+  following applies was caused by the tester's session losing
+  `cosmic-settings-daemon` (the applet waits for its startup config
+  confirmation), and stray standalone instances came from a desktop-entry
+  override in `~/.local/share/applications`, which stops cosmic-panel from
+  treating the applet as a Flatpak. Flatpak 1.18.4 strips `X-CosmicApplet`
+  from exported desktop entries, so COSMIC Settings does not list Flatpak
+  applets there; that affects 0.1.1 equally.
