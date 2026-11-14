@@ -153,7 +153,7 @@ pub fn sleep_edge_to_event(start: bool) -> Option<LockEvent> {
 // ---------------------------------------------------------------------------
 // logind subscription stream.
 //
-// UNTESTED PLUMBING (same exemption class as `wallpaper::apply`): the system
+// UNTESTED PLUMBING (same exemption class as `wallpaper::poke_state_handle`): the system
 // bus cannot be faked hermetically from this crate — zbus offers no injectable
 // transport, and a mock bus daemon would be exactly the kind of non-hermetic
 // fixture the test suite bans. Every decision the stream makes lives in the

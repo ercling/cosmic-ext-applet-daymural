@@ -67,8 +67,8 @@ needed.
   records, and cache reconciliation.
 - `src/fsutil.rs`: shared sibling-temp-plus-rename atomic-write helpers.
 - `src/config.rs`: applet configuration via `cosmic-config`.
-- `src/wallpaper.rs`: `cosmic-bg` reads/writes, do-not-clobber decisions, and
-  lock-screen state pokes.
+- `src/wallpaper.rs`: `cosmic-bg` layout detection and reads/writes,
+  do-not-clobber decisions, and lock-screen state pokes.
 - `src/lockwatch.rs`: logind lock/resume subscription and the greeter-cache
   workaround.
 - `src/accent.rs`: colour extraction and the guarded asynchronous accent
@@ -208,6 +208,25 @@ changing it, read
 - Recompute through the established async path after successful applies,
   startup reconciliation, and thumbnail-pass completion. Do not decode full
   UHD images in the accent path.
+
+### cosmic-bg config layouts
+
+One binary serves a legacy `cosmic-bg` (shared config only) and a per-mode one
+(`.Dark`/`.Light` configs selected by theme mode). The `cosmic-bg` config side
+uses raw keys via our `cosmic_config` and a local `BgEntry`; per-mode configs
+are written only when their directory already exists. Never write
+`transition_duration` into the shared config unless it was already there, and
+keep it a bare integer on disk, never RON's `Some(..)`. Root these handles with
+`wallpaper::config_root`, which mirrors cosmic-config's Flatpak-aware
+`get_config_dir`; never with `dirs::config_dir()`. Detect the layout, never a
+COSMIC version number.
+
+Reads follow the active mode only (falling back to the shared config when that
+mode has no `all` key), while an apply sets both modes. Do-not-clobber and
+prune protection therefore do not cover a wallpaper only the inactive mode
+uses, and a mode config left on a legacy `cosmic-bg` is trusted although
+nothing updates it. These gaps are recorded in `docs/limitations.md`; do not
+widen them.
 
 ### Lock-screen workaround
 

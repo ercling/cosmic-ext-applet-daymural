@@ -3,30 +3,51 @@
 // cosmic-bg watches its cosmic-config keys (`same-on-all`, `all`,
 // `backgrounds`, `output.*` — verified against the watch handler in
 // pop-os/cosmic-bg src/main.rs at the pinned rev) and transitions live, so
-// applying a wallpaper is just writing config: set `same-on-all = true` and
-// write the `all` entry with `source: Path(<file>)`, preserving the user's
-// other fields (scaling_mode, filter_method, …). Per-output setups
+// applying a wallpaper is just writing config: write the `all` entry with
+// `source: Path(<file>)`, preserving the user's other fields (scaling_mode,
+// filter_method, …), and make sure `same-on-all` is true. Per-output setups
 // intentionally collapse to same-on-all on first apply (documented design
 // decision).
 //
-// Note on types: cosmic-bg-config depends on its own `cosmic-config`
-// instance (unpinned git source, distinct from libcosmic's rev-pinned one),
-// so its error type cannot be named from this crate. The *config* side
-// (`apply` and friends) goes through cosmic-bg-config's public API and maps
-// errors into a local type; the lock-screen *state* poke deliberately does
-// not — it reads/writes the raw `wallpapers` key through our pinned
-// `cosmic_config` instance instead (see `poke_state` for why the two-instance
-// split forces that and why the bytes are identical either way).
+// Which config depends on the cosmic-bg installed:
+//
+// - legacy (up to and including `epoch-1.11.0`) reads and watches only the
+//   shared `com.system76.CosmicBackground`;
+// - per-mode (upstream `d6dcfa9` and later) displays
+//   `com.system76.CosmicBackground.Dark` or `.Light`, whichever matches the
+//   theme mode, and reads the shared config only once, to seed a mode config
+//   that has no `all` key yet.
+//
+// One binary serves both: the on-disk layout is the signal
+// (`per_mode_layout`) — never a COSMIC version number — and an apply writes
+// every config of the detected layout (`apply_to`), while a read follows the
+// displayed one (`current_from`).
+//
+// Note on types: the pinned cosmic-bg-config API cannot serve this. Its
+// `context()` opens only the shared config under cosmic-config's own root
+// (no mode configs, no injectable path), and its `Entry` is
+// `deny_unknown_fields`, so it rejects the entries a newer cosmic-bg writes.
+// Both the *config* side (`apply_to`, `current_from`) and the lock-screen
+// *state* poke (`poke_state`) therefore read and write raw keys through
+// `cosmic::cosmic_config`; cosmic-bg-config contributes only its key names
+// and its plain serde types (`Source`, the enums), mirrored for the entry
+// itself by the version-tolerant `BgEntry`. The RON bytes are the ones
+// cosmic-bg reads and writes (same serializer), and every handle stays
+// injectable via `Config::with_custom_path` for tests.
 
+use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use cosmic_bg_config::{Config, DEFAULT_BACKGROUND, Entry, Source};
+use cosmic_bg_config::{
+    DEFAULT_BACKGROUND, FilterMethod, SAME_ON_ALL, SamplingMethod, ScalingMode, Source,
+};
+use serde::{Deserialize, Serialize};
 
-/// Applying a wallpaper failed: either a cosmic-bg config operation errored
-/// (the concrete error type lives in a crate instance this crate cannot
-/// name — see module comment) or the source file failed the [`apply`]
-/// precondition. Carries a message only; only ever logged, never matched on.
+/// Applying a wallpaper failed: a cosmic-bg config or state operation
+/// errored, no config directory could be found, or the source file failed
+/// the [`apply`] precondition. Carries a message only; only ever logged,
+/// never matched on.
 #[derive(Debug)]
 pub struct WallpaperError(String);
 
@@ -59,12 +80,98 @@ pub fn download_dir() -> PathBuf {
         .join("BingWallpaper")
 }
 
+/// cosmic-bg's background entry, in a shape every cosmic-bg layout can read
+/// and write back.
+///
+/// The pinned `cosmic_bg_config::Entry` is `deny_unknown_fields` and knows
+/// nothing of `transition_duration`, which per-mode cosmic-bg writes into
+/// every entry: reading such an entry through the pinned type fails, and an
+/// apply would then rebuild it from defaults, dropping the user's scaling and
+/// filter settings. This local mirror instead
+///
+/// - ignores fields it does not know (a future cosmic-bg stays readable; the
+///   unknown fields are dropped on write, not fatal);
+/// - keeps `transition_duration` only when it was already there, so an entry
+///   written to a legacy cosmic-bg never grows the field that cosmic-bg's
+///   `deny_unknown_fields` rejects;
+/// - defaults `filter_by_theme`, which per-mode cosmic-bg made optional.
+///
+/// The enum/source types are cosmic-bg-config's own: plain serde types that
+/// per-mode cosmic-bg left unchanged.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct BgEntry {
+    /// The configured output (`all` for the entry this applet writes).
+    pub output: String,
+    /// The configured image source.
+    pub source: Source,
+    /// Whether images are filtered by the active theme.
+    #[serde(default)]
+    pub filter_by_theme: bool,
+    /// Rotation frequency in seconds.
+    pub rotation_frequency: u64,
+    /// Fade duration in milliseconds; absent on legacy cosmic-bg. On disk
+    /// it is a bare integer (see [`bare_u64`]), never RON's `Some(..)`.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "bare_u64")]
+    pub transition_duration: Option<u64>,
+    #[serde(default)]
+    pub filter_method: FilterMethod,
+    #[serde(default)]
+    pub scaling_mode: ScalingMode,
+    #[serde(default)]
+    pub sampling_method: SamplingMethod,
+}
+
+/// (De)serialize an optional field as the **bare** `u64` cosmic-bg stores.
+///
+/// A derived `Option<u64>` does not work here: RON spells options
+/// `Some(1200)`/`None` and (without its `implicit_some` extension, which
+/// cosmic-config does not enable) rejects the bare `1200` per-mode cosmic-bg
+/// writes — and would write back a `Some(1200)` that cosmic-bg's plain `u64`
+/// field rejects in turn. Absence is handled by the field's `serde(default)`
+/// and `skip_serializing_if`, so these only ever see a present value.
+mod bare_u64 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    // serde's `with` contract passes the field by reference.
+    #[allow(clippy::ref_option, clippy::trivially_copy_pass_by_ref)]
+    pub fn serialize<S: Serializer>(value: &Option<u64>, serializer: S) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(value) => serializer.serialize_u64(*value),
+            // Unreachable through `skip_serializing_if`; kept total.
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<u64>, D::Error> {
+        u64::deserialize(deserializer).map(Some)
+    }
+}
+
+impl BgEntry {
+    /// A fresh `all` entry: the pinned `Entry::new`'s defaults, with no
+    /// `transition_duration` (per-mode cosmic-bg defaults a missing one).
+    pub fn new_all(source: Source) -> Self {
+        Self {
+            output: DEFAULT_BACKGROUND.to_owned(),
+            source,
+            filter_by_theme: false,
+            rotation_frequency: 900,
+            transition_duration: None,
+            filter_method: FilterMethod::default(),
+            scaling_mode: ScalingMode::default(),
+            sampling_method: SamplingMethod::default(),
+        }
+    }
+}
+
 /// Build the `all` entry to write: change only `source` (and pin `output` to
 /// the `all` key we write under); every other field the user configured in
 /// COSMIC Settings (scaling_mode, filter_method, rotation_frequency, …) is
 /// preserved. With no existing entry, start from cosmic-bg's defaults via
-/// `Entry::new`.
-pub fn updated_entry(existing: Option<Entry>, path: &Path) -> Entry {
+/// [`BgEntry::new_all`].
+pub fn updated_entry(existing: Option<BgEntry>, path: &Path) -> BgEntry {
     let source = Source::Path(path.to_path_buf());
     match existing {
         Some(mut entry) => {
@@ -72,7 +179,7 @@ pub fn updated_entry(existing: Option<Entry>, path: &Path) -> Entry {
             entry.source = source;
             entry
         }
-        None => Entry::new(DEFAULT_BACKGROUND.to_owned(), source),
+        None => BgEntry::new_all(source),
     }
 }
 
@@ -95,30 +202,240 @@ fn check_apply_source(path: &Path) -> Result<(), WallpaperError> {
     }
 }
 
-/// Apply `path` as the wallpaper on all displays by writing cosmic-bg's
-/// config. Errors without touching the config if `path` no longer exists
-/// (see [`check_apply_source`]). Order matters: the `all` entry is written
-/// first so that when
-/// `same-on-all` flips to true, cosmic-bg already sees the new image (no
-/// flash of the previous default). Both writes are change-only, so a
-/// re-apply of the current image touches nothing.
+/// cosmic-bg's config names. Legacy cosmic-bg reads and watches only the
+/// shared config; per-mode cosmic-bg displays the `.Dark`/`.Light` config
+/// matching the active theme mode and reads the shared one only to seed a
+/// mode config that has no `all` key yet. All three are version 1.
+const BG_SHARED: &str = cosmic_bg_config::NAME;
+const BG_DARK: &str = "com.system76.CosmicBackground.Dark";
+const BG_LIGHT: &str = "com.system76.CosmicBackground.Light";
+const BG_VERSION: u64 = 1;
+
+/// COSMIC's theme-mode config; its `is_dark` key selects the mode per-mode
+/// cosmic-bg displays.
+const THEME_MODE: &str = "com.system76.CosmicTheme.Mode";
+const THEME_MODE_VERSION: u64 = 1;
+const IS_DARK: &str = "is_dark";
+
+/// One of per-mode cosmic-bg's two background configs. Deliberately not
+/// `accent::Mode`: that one names a theme builder, this one a cosmic-bg
+/// config directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BgMode {
+    Dark,
+    Light,
+}
+
+impl BgMode {
+    fn config_name(self) -> &'static str {
+        match self {
+            Self::Dark => BG_DARK,
+            Self::Light => BG_LIGHT,
+        }
+    }
+}
+
+/// Whether the cosmic-bg whose config lives under `config_root` uses
+/// per-mode backgrounds: true iff a `.Dark` or `.Light` config directory
+/// exists. Per-mode cosmic-bg creates both at every startup (it opens them
+/// before seeding), and legacy cosmic-bg never does — so the on-disk layout,
+/// not any COSMIC version number, is the signal.
 ///
-/// Test note: what stays uncovered is only the *context* plumbing —
-/// `cosmic_bg_config::context()` always opens the real user config, and
-/// building a `Context` rooted elsewhere requires naming the crate's own
-/// `cosmic_config` instance, which this crate cannot (see module comment).
-/// That much is covered by the Post-Completion manual smoke test; everything
-/// decided around it (`updated_entry`, `check_apply_source`, `classify`,
-/// `is_ours`, `should_auto_apply`) is pure and unit-tested below.
+/// A pure path probe that **opens no config**: opening one creates its
+/// directory, and a mode directory invented on a legacy system would make
+/// this probe lie from then on (see [`open_targets`]).
+pub fn per_mode_layout(config_root: &Path) -> bool {
+    [BG_DARK, BG_LIGHT].into_iter().any(|name| {
+        config_root
+            .join("cosmic")
+            .join(name)
+            .join(format!("v{BG_VERSION}"))
+            .is_dir()
+    })
+}
+
+/// The cosmic-bg config handles an apply writes and a read consults.
+pub struct BgTargets {
+    /// The shared config: all a legacy cosmic-bg reads, and what a per-mode
+    /// cosmic-bg seeds a fresh mode config from.
+    pub shared: cosmic::cosmic_config::Config,
+    /// The per-mode configs, Dark then Light; empty on a legacy layout.
+    pub modes: Vec<(BgMode, cosmic::cosmic_config::Config)>,
+    /// COSMIC's theme-mode config, for picking the displayed mode. Only
+    /// opened (best-effort) on a per-mode layout — nothing else reads it.
+    pub theme_mode: Option<cosmic::cosmic_config::Config>,
+}
+
+/// Open the cosmic-bg handles for the layout found under `config_root`.
+///
+/// The mode configs are opened **only** when [`per_mode_layout`] already
+/// holds. Never create them on a legacy system: when that system later
+/// upgrades, per-mode cosmic-bg seeds each mode from the shared config only
+/// if the mode config has no `all` key — a mode config this applet had
+/// written would win over, and so discard, a wallpaper the user chose on
+/// legacy after our last apply.
+///
+/// Raw keys through `cosmic::cosmic_config`, exactly like [`poke_state`]
+/// (see the module comment); `with_custom_path` keeps the handles injectable
+/// for tests.
+pub fn open_targets(config_root: &Path) -> Result<BgTargets, WallpaperError> {
+    use cosmic::cosmic_config::Config;
+
+    // Probe first: every open below creates its directory.
+    let per_mode = per_mode_layout(config_root);
+    let open = |name: &str| {
+        Config::with_custom_path(name, BG_VERSION, config_root.to_path_buf()).map_err(config_err)
+    };
+
+    let shared = open(BG_SHARED)?;
+    let (modes, theme_mode) = if per_mode {
+        let modes = [BgMode::Dark, BgMode::Light]
+            .into_iter()
+            .map(|mode| open(mode.config_name()).map(|config| (mode, config)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let theme_mode =
+            Config::with_custom_path(THEME_MODE, THEME_MODE_VERSION, config_root.to_path_buf())
+                .map_err(|error| tracing::warn!("cannot open the theme-mode config: {error}"))
+                .ok();
+        (modes, theme_mode)
+    } else {
+        (Vec::new(), None)
+    };
+    Ok(BgTargets {
+        shared,
+        modes,
+        theme_mode,
+    })
+}
+
+/// The directory cosmic-config roots user configs in — a mirror of the
+/// locked cosmic-config's private `get_config_dir()`
+/// (`cosmic-config/src/lib.rs`), which is what `Config::new` uses for every
+/// other handle in this applet. In Flatpak that is `HOST_XDG_CONFIG_HOME`,
+/// else `$HOME/.config`, and only then `dirs::config_dir()` — the last being
+/// the sandbox-private `~/.var/app/<id>/config`, where cosmic-bg never
+/// looks. Values are used verbatim (no emptiness filtering) to stay
+/// byte-for-byte with upstream. Once a deliberate libcosmic bump makes
+/// `get_config_dir` public, replace this with it.
+fn config_root_from(
+    flatpak: bool,
+    host_xdg_config_home: Option<OsString>,
+    home: Option<OsString>,
+    default: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if flatpak {
+        if let Some(host) = host_xdg_config_home {
+            return Some(PathBuf::from(host));
+        }
+        if let Some(home) = home {
+            return Some(PathBuf::from(home).join(".config"));
+        }
+    }
+    default
+}
+
+/// The production config root; see [`config_root_from`]. Never substitute
+/// `dirs::config_dir()`: a handle rooted elsewhere fails silently — the
+/// layout probe says "legacy" and the write lands where cosmic-bg never
+/// reads.
+fn config_root() -> Option<PathBuf> {
+    config_root_from(
+        std::env::var_os("FLATPAK_ID").is_some(),
+        std::env::var_os("HOST_XDG_CONFIG_HOME"),
+        std::env::var_os("HOME"),
+        dirs::config_dir(),
+    )
+}
+
+/// The production [`BgTargets`], rooted at [`config_root`].
+///
+/// Test note: this and [`config_root`] are the only untested plumbing left
+/// on the config side — they read the process environment and nothing else.
+/// Every decision is made in the injectable functions around them
+/// ([`config_root_from`], [`open_targets`], [`apply_to`]).
+fn production_targets() -> Result<BgTargets, WallpaperError> {
+    let root = config_root()
+        .ok_or_else(|| WallpaperError("no config directory for cosmic-bg".to_owned()))?;
+    open_targets(&root)
+}
+
+/// Read a config's `all` entry. A missing key is `None`; so is a present
+/// but unparseable one (logged) — an apply then rebuilds it from defaults,
+/// and a read classifies it like cosmic-bg does, as "showing its default".
+///
+/// These handles carry no system path, so a missing *user* key does not fall
+/// back to the distro default under `/usr/share/cosmic` the way the pinned
+/// `context()` did natively. Intended: the Flatpak build could never see
+/// that default, so both builds now behave alike.
+fn read_entry(config: &cosmic::cosmic_config::Config) -> Option<BgEntry> {
+    use cosmic::cosmic_config::ConfigGet as _;
+
+    match config.get::<BgEntry>(DEFAULT_BACKGROUND) {
+        Ok(entry) => Some(entry),
+        Err(error) => {
+            // `is_err` is false for a merely absent key.
+            if error.is_err() {
+                tracing::warn!("unreadable cosmic-bg `{DEFAULT_BACKGROUND}` entry: {error}");
+            }
+            None
+        }
+    }
+}
+
+/// Read a config's `same-on-all`; missing (or unreadable) means `true`, as
+/// in cosmic-bg. A plain read never writes — the pinned getter's
+/// write-on-read side effect is intentionally not reproduced.
+fn read_same_on_all(config: &cosmic::cosmic_config::Config) -> bool {
+    use cosmic::cosmic_config::ConfigGet as _;
+
+    config.get::<bool>(SAME_ON_ALL).unwrap_or(true)
+}
+
+/// Point one cosmic-bg config at `path`. Order matters: the `all` entry is
+/// written first so that when `same-on-all` flips to true, cosmic-bg already
+/// sees the new image (no flash of the previous default). Both writes are
+/// change-only, so a re-apply of the current image touches nothing — a
+/// rewrite would make cosmic-bg reload and fade for no reason. The
+/// `backgrounds` key (the per-output list) is left alone.
+fn apply_to_config(
+    config: &cosmic::cosmic_config::Config,
+    path: &Path,
+) -> Result<(), WallpaperError> {
+    use cosmic::cosmic_config::ConfigSet as _;
+
+    let existing = read_entry(config);
+    let entry = updated_entry(existing.clone(), path);
+    if existing.as_ref() != Some(&entry) {
+        config.set(DEFAULT_BACKGROUND, &entry).map_err(config_err)?;
+    }
+    if !read_same_on_all(config) {
+        config.set(SAME_ON_ALL, true).map_err(config_err)?;
+    }
+    Ok(())
+}
+
+/// Apply `path` to every cosmic-bg config in `targets`: each mode config
+/// (Dark, then Light) and then the shared one. The modes go first because
+/// they are what a per-mode cosmic-bg displays; the shared config is all a
+/// legacy cosmic-bg reads, and what a per-mode one seeds a fresh mode from.
+/// Every mode gets the same image, each keeping its own scaling, filter and
+/// transition settings. Fails fast on the first write error.
+pub fn apply_to(targets: &BgTargets, path: &Path) -> Result<(), WallpaperError> {
+    targets
+        .modes
+        .iter()
+        .map(|(_, config)| config)
+        .chain(std::iter::once(&targets.shared))
+        .try_for_each(|config| apply_to_config(config, path))
+}
+
+/// Apply `path` as the wallpaper on all displays by writing cosmic-bg's
+/// config ([`apply_to`] over the [`production_targets`]). Errors without
+/// touching the config if `path` no longer exists (see
+/// [`check_apply_source`]).
 pub fn apply(path: &Path) -> Result<(), WallpaperError> {
     check_apply_source(path)?;
-    let context = cosmic_bg_config::context().map_err(config_err)?;
-    let entry = updated_entry(context.entry(DEFAULT_BACKGROUND).ok(), path);
-
-    let mut config = Config::load(&context).map_err(config_err)?;
-    config.set_entry(&context, entry).map_err(config_err)?;
-    context.set_same_on_all(true).map_err(config_err)?;
-    Ok(())
+    apply_to(&production_targets()?, path)
 }
 
 /// The single cosmic-bg *state* key the lock-screen poke rewrites.
@@ -149,12 +466,9 @@ const WALLPAPERS_KEY: &str = "wallpapers";
 /// (≤ `rotation_frequency`, 300 s default) rewrites the current source and
 /// self-heals it.
 ///
-/// Raw keys, not `cosmic_bg_config::state::State`'s entry API: that API
-/// comes from cosmic-bg-config's own `cosmic-config` instance, whose traits
-/// this crate cannot name (see module comment; `Cargo.lock` carries both
-/// packages — same commit today, still distinct). The RON bytes are
-/// identical either way (same commit, same serializer), so raw
-/// `ConfigGet::get`/`ConfigSet::set` through **our** pinned instance write
+/// Raw keys, not `cosmic_bg_config::state::State`'s entry API: a single-key
+/// read-toggle-write needs nothing more. The RON bytes are identical either
+/// way (same serializer), so raw `ConfigGet::get`/`ConfigSet::set` write
 /// exactly what cosmic-bg and the greeter read — and the handle stays
 /// injectable via `Config::with_custom_path` for tests.
 pub fn poke_state(config: &cosmic::cosmic_config::Config) -> Result<bool, WallpaperError> {
@@ -182,7 +496,7 @@ pub fn poke_state(config: &cosmic::cosmic_config::Config) -> Result<bool, Wallpa
 /// built once in `init` and cloned into poke tasks. `None` (with a warning)
 /// when it cannot be opened — every poke is then a no-op.
 ///
-/// Test note: like [`apply`], this is untestable context plumbing —
+/// Test note: like [`production_targets`], this is untestable plumbing —
 /// `Config::new_state` always roots in the real user state dir
 /// (`~/.local/state/cosmic/…`), so tests inject a tempdir-rooted
 /// `Config::with_custom_path` handle into [`poke_state`] instead; nothing
@@ -230,11 +544,9 @@ impl CurrentWallpaper {
     }
 }
 
-/// Classify cosmic-bg's config state. Split out of [`current_wallpaper`] as a
-/// pure function so the three-way mapping is testable without a `Context`
-/// (which can only ever be opened against the *real* user config — see
-/// [`apply`]).
-fn classify(same_on_all: bool, entry: Option<Entry>) -> CurrentWallpaper {
+/// Classify one cosmic-bg config's state — the pure three-way mapping
+/// behind [`current_from`].
+fn classify(same_on_all: bool, entry: Option<BgEntry>) -> CurrentWallpaper {
     if !same_on_all {
         return CurrentWallpaper::Unknown;
     }
@@ -249,23 +561,74 @@ fn classify(same_on_all: bool, entry: Option<Entry>) -> CurrentWallpaper {
     }
 }
 
-/// Read what cosmic-bg currently displays from its config.
+/// The mode a per-mode cosmic-bg displays: `is_dark` false → Light; true,
+/// unreadable, or no theme-mode config at all → Dark. Matches upstream
+/// `Mode::current`, which also defaults to Dark.
+fn active_mode(theme_mode: Option<&cosmic::cosmic_config::Config>) -> BgMode {
+    use cosmic::cosmic_config::ConfigGet as _;
+
+    match theme_mode.map(|config| config.get::<bool>(IS_DARK)) {
+        Some(Ok(false)) => BgMode::Light,
+        _ => BgMode::Dark,
+    }
+}
+
+/// Whether a config has an `all` key of its own — readable or not. Absence
+/// is what makes a per-mode cosmic-bg seed that mode from the shared config.
+fn has_local_entry(config: &cosmic::cosmic_config::Config) -> bool {
+    use cosmic::cosmic_config::ConfigGet as _;
+
+    match config.get::<BgEntry>(DEFAULT_BACKGROUND) {
+        Ok(_) => true,
+        // `is_err` is false exactly for a merely absent key.
+        Err(error) => error.is_err(),
+    }
+}
+
+/// What cosmic-bg displays according to `targets`: on a per-mode layout the
+/// **active mode's** config (the shared one is stale there — cosmic-bg
+/// never re-reads it), otherwise the shared config.
+///
+/// Two per-mode edge cases:
+///
+/// - The active mode has **no `all` key**: read the shared config instead.
+///   That is what a per-mode cosmic-bg seeds the mode from, and all a legacy
+///   cosmic-bg displays when the mode directories were merely left behind
+///   (a downgrade) or created by a third party. Reading "no file" here would
+///   stop the daily apply and unprotect the displayed image from the prune.
+/// - The active mode's config is **not among the targets**:
+///   [`CurrentWallpaper::Unknown`] — the other mode and the shared config
+///   say nothing about what is on screen.
+///
+/// Only the active mode is consulted, while an apply sets both: a foreign
+/// wallpaper chosen for the inactive mode alone is not seen by the
+/// do-not-clobber rule, and a file only the inactive mode references is not
+/// protected from the prune (documented limitations). Likewise a mode config
+/// that *has* an entry is trusted even on a legacy cosmic-bg that never
+/// updates it; the layout alone cannot tell that case apart.
+pub fn current_from(targets: &BgTargets) -> CurrentWallpaper {
+    let displayed = if targets.modes.is_empty() {
+        &targets.shared
+    } else {
+        let active = active_mode(targets.theme_mode.as_ref());
+        match targets.modes.iter().find(|(mode, _)| *mode == active) {
+            Some((_, config)) if has_local_entry(config) => config,
+            Some(_) => &targets.shared,
+            None => return CurrentWallpaper::Unknown,
+        }
+    };
+    classify(read_same_on_all(displayed), read_entry(displayed))
+}
+
+/// Read what cosmic-bg currently displays from its config ([`current_from`]
+/// over the [`production_targets`]); unopenable config is
+/// [`CurrentWallpaper::Unknown`].
 ///
 /// Accepted v1 limitation: this is read on demand (startup / next apply /
-/// prune), not watched — external changes are picked up then.
-///
-/// Test note: only the context read has no automated coverage (the real user
-/// config is the only constructible context); the classification it feeds is
-/// the pure, tested [`classify`], as are the decisions built on the result
-/// ([`prune_retention`], [`should_auto_apply`]).
+/// prune), not watched — external changes, a theme-mode switch included,
+/// are picked up then.
 pub fn current_wallpaper() -> CurrentWallpaper {
-    let Ok(context) = cosmic_bg_config::context() else {
-        return CurrentWallpaper::Unknown;
-    };
-    classify(
-        context.same_on_all(),
-        context.entry(DEFAULT_BACKGROUND).ok(),
-    )
+    production_targets().map_or(CurrentWallpaper::Unknown, |targets| current_from(&targets))
 }
 
 /// The applet's tracked "current" after a fresh read of the live state:
@@ -333,7 +696,40 @@ fn is_inside(path: &Path, dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cosmic_bg_config::Entry as PinnedEntry;
     use cosmic_bg_config::{FilterMethod, SamplingMethod, ScalingMode};
+
+    /// The `all` entry in the on-disk shape legacy cosmic-bg writes (the
+    /// pinned `Entry`: no `transition_duration`).
+    const LEGACY_ALL_RON: &str = r#"(
+    output: "all",
+    source: Path("/usr/share/backgrounds/cosmic/orion_nebula_nasa_heic0601a.jpg"),
+    filter_by_theme: true,
+    rotation_frequency: 300,
+    filter_method: Lanczos,
+    scaling_mode: Zoom,
+    sampling_method: Alphanumeric,
+)"#;
+
+    /// The `all` entry in the on-disk shape per-mode cosmic-bg writes: the
+    /// legacy fields plus a bare-integer `transition_duration`.
+    const PER_MODE_ALL_RON: &str = r#"(
+    output: "all",
+    source: Path("/usr/share/backgrounds/cosmic/old.jpg"),
+    filter_by_theme: false,
+    rotation_frequency: 300,
+    transition_duration: 1200,
+    filter_method: Lanczos,
+    scaling_mode: Fit((0.0, 0.0, 0.0)),
+    sampling_method: Alphanumeric,
+)"#;
+
+    /// What per-mode cosmic-bg requires of `transition_duration`: a bare
+    /// `u64`, never RON's `Some(..)` wrapper.
+    #[derive(Deserialize)]
+    struct PerModeOracle {
+        transition_duration: u64,
+    }
 
     #[test]
     fn updated_entry_from_none_uses_cosmic_bg_defaults() {
@@ -342,17 +738,23 @@ mod tests {
 
         assert_eq!(entry.output, "all");
         assert_eq!(entry.source, Source::Path(path.to_path_buf()));
-        // Everything else matches Entry::new's defaults.
-        let defaults = Entry::new("all".to_owned(), Source::Path(path.to_path_buf()));
-        assert_eq!(entry, defaults);
+        assert_eq!(entry, BgEntry::new_all(Source::Path(path.to_path_buf())));
+        // Everything else matches the pinned Entry::new's defaults, and no
+        // `transition_duration` is invented.
+        let pinned = PinnedEntry::new("all".to_owned(), Source::Path(path.to_path_buf()));
+        assert_eq!(entry.filter_by_theme, pinned.filter_by_theme);
+        assert_eq!(entry.rotation_frequency, pinned.rotation_frequency);
+        assert_eq!(entry.filter_method, pinned.filter_method);
+        assert_eq!(entry.scaling_mode, pinned.scaling_mode);
+        assert_eq!(entry.sampling_method, pinned.sampling_method);
+        assert_eq!(entry.transition_duration, None);
     }
 
     #[test]
     fn updated_entry_preserves_user_fields_and_sets_source() {
-        let mut existing = Entry::new(
-            "all".to_owned(),
-            Source::Path(PathBuf::from("/usr/share/backgrounds/old.jpg")),
-        );
+        let mut existing = BgEntry::new_all(Source::Path(PathBuf::from(
+            "/usr/share/backgrounds/old.jpg",
+        )));
         existing.filter_by_theme = true;
         existing.rotation_frequency = 12_345;
         existing.filter_method = FilterMethod::Nearest;
@@ -373,10 +775,8 @@ mod tests {
     #[test]
     fn updated_entry_pins_output_to_all() {
         // A stray per-output entry passed in still writes under `all`.
-        let existing = Entry::new(
-            "DP-1".to_owned(),
-            Source::Path(PathBuf::from("/tmp/old.jpg")),
-        );
+        let mut existing = BgEntry::new_all(Source::Path(PathBuf::from("/tmp/old.jpg")));
+        existing.output = "DP-1".to_owned();
         let entry = updated_entry(Some(existing), Path::new("/tmp/new.jpg"));
         assert_eq!(entry.output, "all");
     }
@@ -385,16 +785,81 @@ mod tests {
     fn updated_entry_keeps_color_source_users_scaling() {
         // Coming from a solid-color background: source swaps to the path,
         // scaling fields survive.
-        let mut existing = Entry::new(
-            "all".to_owned(),
-            Source::Color(cosmic_bg_config::Color::Single([0.1, 0.2, 0.3])),
-        );
+        let mut existing = BgEntry::new_all(Source::Color(cosmic_bg_config::Color::Single([
+            0.1, 0.2, 0.3,
+        ])));
         existing.scaling_mode = ScalingMode::Fit([1.0, 1.0, 1.0]);
 
         let path = Path::new("/home/u/Pictures/BingWallpaper/20260807-Foo_UHD.jpg");
         let entry = updated_entry(Some(existing), path);
         assert_eq!(entry.source, Source::Path(path.to_path_buf()));
         assert_eq!(entry.scaling_mode, ScalingMode::Fit([1.0, 1.0, 1.0]));
+    }
+
+    #[test]
+    fn legacy_shape_round_trips_without_transition_duration() {
+        let existing: BgEntry = ron::from_str(LEGACY_ALL_RON).expect("legacy entry parses");
+        assert_eq!(existing.transition_duration, None);
+
+        let path = Path::new("/home/u/Pictures/BingWallpaper/20260807-Foo_UHD.jpg");
+        let written = ron::to_string(&updated_entry(Some(existing), path)).expect("serialize");
+
+        assert!(
+            !written.contains("transition_duration"),
+            "a legacy entry must not grow the field legacy cosmic-bg rejects: {written}"
+        );
+        // The pinned Entry (`deny_unknown_fields`) is the legacy oracle.
+        let pinned: PinnedEntry =
+            ron::from_str(&written).expect("legacy cosmic-bg must parse what we write");
+        assert_eq!(pinned.output, "all");
+        assert_eq!(pinned.source, Source::Path(path.to_path_buf()));
+        assert!(pinned.filter_by_theme);
+        assert_eq!(pinned.rotation_frequency, 300);
+    }
+
+    #[test]
+    fn new_shape_preserves_transition_duration() {
+        let existing: BgEntry = ron::from_str(PER_MODE_ALL_RON).expect("per-mode entry parses");
+        assert_eq!(existing.transition_duration, Some(1200));
+        assert_eq!(existing.scaling_mode, ScalingMode::Fit([0.0, 0.0, 0.0]));
+
+        let path = Path::new("/home/u/Pictures/BingWallpaper/20260807-Foo_UHD.jpg");
+        let entry = updated_entry(Some(existing), path);
+        assert_eq!(entry.source, Source::Path(path.to_path_buf()));
+        assert_eq!(entry.transition_duration, Some(1200));
+        assert_eq!(entry.scaling_mode, ScalingMode::Fit([0.0, 0.0, 0.0]));
+
+        // Written back as the bare integer per-mode cosmic-bg deserializes.
+        let written = ron::to_string(&entry).expect("serialize");
+        let oracle: PerModeOracle =
+            ron::from_str(&written).expect("per-mode cosmic-bg must parse what we write");
+        assert_eq!(oracle.transition_duration, 1200);
+    }
+
+    #[test]
+    fn unknown_fields_are_tolerated() {
+        // A future cosmic-bg adds a field we have never heard of: the entry
+        // must still parse, and an apply must keep the fields we do know.
+        let ron = PER_MODE_ALL_RON.replace(
+            "    transition_duration: 1200,\n",
+            "    transition_duration: 1200,\n    future_field: 1,\n",
+        );
+        assert!(ron.contains("future_field"), "fixture edit must apply");
+        let existing: BgEntry = ron::from_str(&ron).expect("unknown fields must not be fatal");
+
+        let entry = updated_entry(Some(existing), Path::new("/tmp/new.jpg"));
+        assert_eq!(entry.source, Source::Path(PathBuf::from("/tmp/new.jpg")));
+        assert_eq!(entry.scaling_mode, ScalingMode::Fit([0.0, 0.0, 0.0]));
+        assert_eq!(entry.transition_duration, Some(1200));
+    }
+
+    #[test]
+    fn missing_filter_by_theme_defaults_false() {
+        // Per-mode cosmic-bg made the field optional (`serde(default)`).
+        let ron = PER_MODE_ALL_RON.replace("    filter_by_theme: false,\n", "");
+        assert!(!ron.contains("filter_by_theme"), "fixture edit must apply");
+        let entry: BgEntry = ron::from_str(&ron).expect("entry without filter_by_theme parses");
+        assert!(!entry.filter_by_theme);
     }
 
     #[test]
@@ -429,11 +894,10 @@ mod tests {
     #[test]
     fn classify_maps_the_three_cosmic_bg_states() {
         let path = PathBuf::from("/home/u/Pictures/BingWallpaper/20260807-Foo_UHD.jpg");
-        let file_entry = Entry::new("all".to_owned(), Source::Path(path.clone()));
-        let color_entry = Entry::new(
-            "all".to_owned(),
-            Source::Color(cosmic_bg_config::Color::Single([0.1, 0.2, 0.3])),
-        );
+        let file_entry = BgEntry::new_all(Source::Path(path.clone()));
+        let color_entry = BgEntry::new_all(Source::Color(cosmic_bg_config::Color::Single([
+            0.1, 0.2, 0.3,
+        ])));
 
         // Same-on-all with a path: that file is displayed.
         assert_eq!(
@@ -567,6 +1031,589 @@ mod tests {
             Path::new("/home/u/Pictures/BingWallpaper/sub/../a.jpg"),
             dir
         ));
+    }
+
+    mod targets {
+        //! Layout detection, target handles, and the config root — all
+        //! against a tempdir (`Config::with_custom_path`), never the real
+        //! user config.
+
+        use super::*;
+        use crate::testutil::{bg_key_file, bg_layout};
+
+        fn cosmic_dir_names(root: &Path) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(root.join("cosmic"))
+                .expect("read cosmic dir")
+                .map(|entry| entry.expect("dir entry").file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            names
+        }
+
+        #[test]
+        fn mode_names_are_pinned() {
+            // Literal pins of cosmic-bg's on-disk identity: a drift in the
+            // consts must break here, not silently retarget the writes.
+            assert_eq!(BG_SHARED, "com.system76.CosmicBackground");
+            assert_eq!(
+                BgMode::Dark.config_name(),
+                "com.system76.CosmicBackground.Dark"
+            );
+            assert_eq!(
+                BgMode::Light.config_name(),
+                "com.system76.CosmicBackground.Light"
+            );
+            assert_eq!(BG_VERSION, 1);
+        }
+
+        #[test]
+        fn old_layout_detects_shared_only() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            // Nothing at all (a machine that never ran cosmic-bg) is legacy.
+            assert!(!per_mode_layout(dir.path()));
+            bg_layout(dir.path(), false);
+            assert!(!per_mode_layout(dir.path()));
+        }
+
+        #[test]
+        fn new_layout_detects_per_mode() {
+            // Either mode directory alone is enough.
+            for name in [
+                "com.system76.CosmicBackground.Dark",
+                "com.system76.CosmicBackground.Light",
+            ] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                bg_layout(dir.path(), false);
+                let mode_dir = dir.path().join("cosmic").join(name);
+                // The config name without its version dir is not a layout.
+                std::fs::create_dir_all(&mode_dir).expect("create mode dir");
+                assert!(!per_mode_layout(dir.path()), "{name} without v1");
+                std::fs::create_dir_all(mode_dir.join("v1")).expect("create version dir");
+                assert!(per_mode_layout(dir.path()), "{name}/v1");
+            }
+        }
+
+        #[test]
+        fn open_targets_old_layout_opens_no_mode_configs() {
+            // The seeding-safety guard: opening a config creates its
+            // directory, and a mode directory created on a legacy system
+            // makes the later per-mode upgrade skip seeding from shared.
+            let dir = tempfile::tempdir().expect("tempdir");
+            bg_layout(dir.path(), false);
+
+            let targets = open_targets(dir.path()).expect("open targets");
+
+            assert!(targets.modes.is_empty());
+            assert!(targets.theme_mode.is_none());
+            assert_eq!(
+                cosmic_dir_names(dir.path()),
+                ["com.system76.CosmicBackground"],
+                "a legacy probe must create nothing beside the shared config"
+            );
+        }
+
+        #[test]
+        fn open_targets_new_layout_opens_dark_then_light() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            bg_layout(dir.path(), true);
+
+            let targets = open_targets(dir.path()).expect("open targets");
+
+            let modes: Vec<BgMode> = targets.modes.iter().map(|(mode, _)| *mode).collect();
+            assert_eq!(modes, [BgMode::Dark, BgMode::Light]);
+            assert!(targets.theme_mode.is_some());
+
+            // Each handle is rooted at the directory cosmic-bg reads: a key
+            // set through it lands in that config's v1 dir under the root.
+            use cosmic::cosmic_config::ConfigSet as _;
+            let handles = [
+                ("com.system76.CosmicBackground", &targets.shared),
+                ("com.system76.CosmicBackground.Dark", &targets.modes[0].1),
+                ("com.system76.CosmicBackground.Light", &targets.modes[1].1),
+            ];
+            for (name, config) in handles {
+                let key_file = bg_key_file(dir.path(), name, "same-on-all");
+                assert!(!key_file.exists(), "{name}: nothing written yet");
+                config.set("same-on-all", true).expect("set key");
+                assert!(key_file.is_file(), "{name}: key must land under the root");
+            }
+        }
+
+        fn os(value: &str) -> Option<OsString> {
+            Some(OsString::from(value))
+        }
+
+        #[test]
+        fn config_root_native_uses_default() {
+            let default = Some(PathBuf::from("/home/u/.config"));
+            assert_eq!(
+                config_root_from(false, os("/host/config"), os("/home/u"), default.clone()),
+                default
+            );
+            assert_eq!(config_root_from(false, None, None, None), None);
+        }
+
+        #[test]
+        fn config_root_flatpak_prefers_host_xdg_config_home() {
+            assert_eq!(
+                config_root_from(
+                    true,
+                    os("/host/config"),
+                    os("/home/u"),
+                    Some(PathBuf::from("/home/u/.var/app/id/config")),
+                ),
+                Some(PathBuf::from("/host/config"))
+            );
+        }
+
+        #[test]
+        fn config_root_flatpak_falls_back_to_home_dot_config() {
+            // Not the sandbox-private default: cosmic-bg never looks there.
+            assert_eq!(
+                config_root_from(
+                    true,
+                    None,
+                    os("/home/u"),
+                    Some(PathBuf::from("/home/u/.var/app/id/config")),
+                ),
+                Some(PathBuf::from("/home/u/.config"))
+            );
+        }
+
+        #[test]
+        fn config_root_flatpak_without_host_or_home_uses_default() {
+            let default = Some(PathBuf::from("/home/u/.var/app/id/config"));
+            assert_eq!(config_root_from(true, None, None, default.clone()), default);
+        }
+    }
+
+    mod config_side {
+        //! [`apply_to`] and [`current_from`] against tempdir-rooted targets.
+        //! Write assertions go by inode (every cosmic-config `set` is
+        //! temp+rename — see [`crate::testutil::bg_wallpapers_inode`] for
+        //! the rationale).
+
+        use super::*;
+        use crate::testutil::{bg_key_file, bg_layout, read_only_trees, restore_dir_permissions};
+
+        const SHARED: &str = "com.system76.CosmicBackground";
+        const DARK: &str = "com.system76.CosmicBackground.Dark";
+        const LIGHT: &str = "com.system76.CosmicBackground.Light";
+        const THEME_MODE_NAME: &str = "com.system76.CosmicTheme.Mode";
+
+        /// A minimal same-shape `all` entry showing `path`.
+        fn entry_ron(path: &Path) -> String {
+            ron::to_string(&BgEntry::new_all(Source::Path(path.to_path_buf()))).expect("serialize")
+        }
+
+        /// Set (or, with `None`, remove) the theme mode's `is_dark` key.
+        fn set_is_dark(root: &Path, ron: Option<&str>) {
+            let file = bg_key_file(root, THEME_MODE_NAME, "is_dark");
+            match ron {
+                Some(ron) => {
+                    std::fs::create_dir_all(file.parent().unwrap()).expect("theme-mode dir");
+                    std::fs::write(file, ron).expect("write is_dark");
+                }
+                None => {
+                    let _ = std::fs::remove_file(file);
+                }
+            }
+        }
+
+        fn image(name: &str) -> PathBuf {
+            PathBuf::from(format!("/home/u/Pictures/BingWallpaper/{name}.jpg"))
+        }
+
+        fn seed(root: &Path, name: &str, key: &str, ron: &str) {
+            std::fs::write(bg_key_file(root, name, key), ron).expect("seed key file");
+        }
+
+        fn entry_text(root: &Path, name: &str) -> String {
+            std::fs::read_to_string(bg_key_file(root, name, "all")).expect("read `all` key file")
+        }
+
+        fn entry(root: &Path, name: &str) -> BgEntry {
+            ron::from_str(&entry_text(root, name)).expect("`all` parses as BgEntry")
+        }
+
+        /// The stored `same-on-all`, or `None` when the key file is absent
+        /// (cosmic-bg then treats it as `true`).
+        fn same_on_all(root: &Path, name: &str) -> Option<bool> {
+            let text = std::fs::read_to_string(bg_key_file(root, name, "same-on-all")).ok()?;
+            Some(ron::from_str(&text).expect("`same-on-all` parses as bool"))
+        }
+
+        fn inode(path: &Path) -> u64 {
+            use std::os::unix::fs::MetadataExt as _;
+            std::fs::metadata(path).expect("stat key file").ino()
+        }
+
+        /// Inodes of every key file that exists across the three configs.
+        fn key_inodes(root: &Path) -> Vec<(String, u64)> {
+            let mut inodes = Vec::new();
+            for name in [SHARED, DARK, LIGHT] {
+                for key in ["all", "same-on-all"] {
+                    let file = bg_key_file(root, name, key);
+                    if file.exists() {
+                        inodes.push((format!("{name}/{key}"), inode(&file)));
+                    }
+                }
+            }
+            inodes
+        }
+
+        #[test]
+        fn old_layout_apply_writes_shared_only() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            bg_layout(dir.path(), false);
+            seed(dir.path(), SHARED, "all", LEGACY_ALL_RON);
+            let targets = open_targets(dir.path()).expect("open targets");
+
+            apply_to(&targets, &image("a")).expect("apply");
+
+            let shared = entry(dir.path(), SHARED);
+            assert_eq!(shared.source, Source::Path(image("a")));
+            // The user's other fields survive, as before.
+            assert!(shared.filter_by_theme);
+            assert_eq!(shared.rotation_frequency, 300);
+            // An absent `same-on-all` already means true: a plain read must
+            // not write it.
+            assert_eq!(same_on_all(dir.path(), SHARED), None);
+        }
+
+        #[test]
+        fn old_layout_apply_creates_no_mode_dirs() {
+            // Upgrade safety: a legacy apply must leave nothing that makes
+            // per-mode cosmic-bg skip seeding from the shared config.
+            let dir = tempfile::tempdir().expect("tempdir");
+            bg_layout(dir.path(), false);
+
+            let targets = open_targets(dir.path()).expect("open targets");
+            apply_to(&targets, &image("a")).expect("apply");
+
+            for name in [DARK, LIGHT] {
+                assert!(
+                    !dir.path().join("cosmic").join(name).exists(),
+                    "{name} must not be created on a legacy layout"
+                );
+            }
+            assert_eq!(entry(dir.path(), SHARED).source, Source::Path(image("a")));
+        }
+
+        #[test]
+        fn new_layout_apply_writes_both_modes_and_shared() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            bg_layout(dir.path(), true);
+            for name in [DARK, LIGHT] {
+                seed(dir.path(), name, "all", PER_MODE_ALL_RON);
+                seed(dir.path(), name, "same-on-all", "true");
+            }
+            let targets = open_targets(dir.path()).expect("open targets");
+
+            apply_to(&targets, &image("a")).expect("apply");
+
+            for name in [SHARED, DARK, LIGHT] {
+                assert_eq!(
+                    entry(dir.path(), name).source,
+                    Source::Path(image("a")),
+                    "{name}"
+                );
+            }
+            for name in [DARK, LIGHT] {
+                assert_eq!(same_on_all(dir.path(), name), Some(true), "{name}");
+            }
+        }
+
+        #[test]
+        fn new_layout_preserves_each_modes_own_fields() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            bg_layout(dir.path(), true);
+            // Dark: Fit + a custom fade. Light: Zoom, no fade recorded.
+            seed(dir.path(), DARK, "all", PER_MODE_ALL_RON);
+            seed(dir.path(), LIGHT, "all", LEGACY_ALL_RON);
+            let targets = open_targets(dir.path()).expect("open targets");
+
+            apply_to(&targets, &image("a")).expect("apply");
+
+            let dark = entry(dir.path(), DARK);
+            assert_eq!(dark.source, Source::Path(image("a")));
+            assert_eq!(dark.scaling_mode, ScalingMode::Fit([0.0, 0.0, 0.0]));
+            assert_eq!(dark.transition_duration, Some(1200));
+            assert!(!dark.filter_by_theme);
+
+            let light = entry(dir.path(), LIGHT);
+            assert_eq!(light.source, Source::Path(image("a")));
+            assert_eq!(light.scaling_mode, ScalingMode::Zoom);
+            assert_eq!(light.transition_duration, None);
+            assert!(light.filter_by_theme);
+            assert!(!entry_text(dir.path(), LIGHT).contains("transition_duration"));
+        }
+
+        #[test]
+        fn per_mode_same_on_all_false_flips_true() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            bg_layout(dir.path(), true);
+            seed(dir.path(), DARK, "same-on-all", "false");
+            seed(dir.path(), SHARED, "same-on-all", "false");
+            let targets = open_targets(dir.path()).expect("open targets");
+
+            apply_to(&targets, &image("a")).expect("apply");
+
+            assert_eq!(same_on_all(dir.path(), DARK), Some(true));
+            assert_eq!(same_on_all(dir.path(), SHARED), Some(true));
+            // Light had no key: absent already means true, nothing written.
+            assert_eq!(same_on_all(dir.path(), LIGHT), None);
+        }
+
+        #[test]
+        fn reapply_is_write_free() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            bg_layout(dir.path(), true);
+            seed(dir.path(), DARK, "all", PER_MODE_ALL_RON);
+            seed(dir.path(), DARK, "same-on-all", "false");
+            seed(dir.path(), LIGHT, "same-on-all", "true");
+            let targets = open_targets(dir.path()).expect("open targets");
+
+            apply_to(&targets, &image("a")).expect("first apply");
+            let applied = key_inodes(dir.path());
+            assert_eq!(
+                applied.len(),
+                5,
+                "three `all` keys and two `same-on-all`: {applied:?}"
+            );
+
+            // Same image again: no key file may be rewritten (a rewrite
+            // makes cosmic-bg reload and fade for nothing).
+            apply_to(&targets, &image("a")).expect("re-apply");
+            assert_eq!(key_inodes(dir.path()), applied);
+
+            // Liveness of the inode check: a different image rewrites every
+            // `all` key and still no `same-on-all`.
+            apply_to(&targets, &image("b")).expect("apply another image");
+            let changed = key_inodes(dir.path());
+            for (before, after) in applied.iter().zip(&changed) {
+                assert_eq!(before.0, after.0);
+                if before.0.ends_with("/all") {
+                    assert_ne!(before.1, after.1, "{} must be rewritten", before.0);
+                } else {
+                    assert_eq!(before.1, after.1, "{} must be untouched", before.0);
+                }
+            }
+        }
+
+        #[test]
+        fn shared_entry_stays_legacy_parseable() {
+            // Whatever the modes carry, the shared `all` must still parse as
+            // the pinned `deny_unknown_fields` Entry: legacy cosmic-bg
+            // (downgrade, or a third party having created the mode dirs)
+            // falls back to its default wallpaper otherwise.
+            for shared_seed in [None, Some(LEGACY_ALL_RON)] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                bg_layout(dir.path(), true);
+                seed(dir.path(), DARK, "all", PER_MODE_ALL_RON);
+                seed(dir.path(), LIGHT, "all", PER_MODE_ALL_RON);
+                if let Some(ron) = shared_seed {
+                    seed(dir.path(), SHARED, "all", ron);
+                }
+                let targets = open_targets(dir.path()).expect("open targets");
+
+                apply_to(&targets, &image("a")).expect("apply");
+
+                let pinned: PinnedEntry = ron::from_str(&entry_text(dir.path(), SHARED))
+                    .expect("legacy cosmic-bg must parse the shared entry");
+                assert_eq!(pinned.source, Source::Path(image("a")));
+                assert_eq!(pinned.filter_by_theme, shared_seed.is_some());
+            }
+        }
+
+        #[test]
+        fn unreadable_entry_is_rebuilt_from_defaults() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            bg_layout(dir.path(), false);
+            seed(dir.path(), SHARED, "all", "not valid ron [");
+            let targets = open_targets(dir.path()).expect("open targets");
+
+            apply_to(&targets, &image("a")).expect("apply");
+
+            assert_eq!(
+                entry(dir.path(), SHARED),
+                BgEntry::new_all(Source::Path(image("a")))
+            );
+        }
+
+        #[test]
+        fn apply_fails_fast_on_a_failed_write() {
+            // Modes are written first; a failed mode write must surface and
+            // stop before the shared config.
+            let dir = tempfile::tempdir().expect("tempdir");
+            bg_layout(dir.path(), true);
+            let targets = open_targets(dir.path()).expect("open targets");
+
+            let locked = read_only_trees(&[dir.path().join("cosmic").join(DARK)]);
+            let result = apply_to(&targets, &image("a"));
+            restore_dir_permissions(&locked);
+
+            let error = result.expect_err("a failed config write must surface");
+            assert!(error.to_string().contains("cosmic-bg config error"));
+            assert!(
+                key_inodes(dir.path()).is_empty(),
+                "nothing after the failed write may land"
+            );
+        }
+
+        #[test]
+        fn old_layout_reads_shared() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            bg_layout(dir.path(), false);
+            let targets = open_targets(dir.path()).expect("open targets");
+
+            // No `all` key at all: cosmic-bg shows its default.
+            assert_eq!(current_from(&targets), CurrentWallpaper::NoFile);
+
+            seed(dir.path(), SHARED, "all", &entry_ron(&image("a")));
+            assert_eq!(current_from(&targets), CurrentWallpaper::File(image("a")));
+
+            // Per-output mode: unknowable from the `all` entry.
+            seed(dir.path(), SHARED, "same-on-all", "false");
+            assert_eq!(current_from(&targets), CurrentWallpaper::Unknown);
+
+            // And an apply through the same targets is read back.
+            apply_to(&targets, &image("b")).expect("apply");
+            assert_eq!(current_from(&targets), CurrentWallpaper::File(image("b")));
+        }
+
+        #[test]
+        fn current_follows_active_mode() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            bg_layout(dir.path(), true);
+            seed(dir.path(), DARK, "all", &entry_ron(&image("a")));
+            let foreign = PathBuf::from("/usr/share/backgrounds/cosmic/b.jpg");
+            seed(dir.path(), LIGHT, "all", &entry_ron(&foreign));
+            let targets = open_targets(dir.path()).expect("open targets");
+
+            set_is_dark(dir.path(), Some("false"));
+            assert_eq!(current_from(&targets), CurrentWallpaper::File(foreign));
+
+            set_is_dark(dir.path(), Some("true"));
+            assert_eq!(current_from(&targets), CurrentWallpaper::File(image("a")));
+
+            // Unreadable or missing mode → Dark, like upstream `Mode::current`.
+            set_is_dark(dir.path(), Some("not a bool ["));
+            assert_eq!(current_from(&targets), CurrentWallpaper::File(image("a")));
+            set_is_dark(dir.path(), None);
+            assert_eq!(current_from(&targets), CurrentWallpaper::File(image("a")));
+
+            // No theme-mode config at all → Dark as well.
+            set_is_dark(dir.path(), Some("false"));
+            let without_theme_mode = BgTargets {
+                theme_mode: None,
+                ..targets
+            };
+            assert_eq!(
+                current_from(&without_theme_mode),
+                CurrentWallpaper::File(image("a"))
+            );
+        }
+
+        #[test]
+        fn new_layout_ignores_stale_shared() {
+            // Per-mode cosmic-bg never re-reads the shared config: whatever
+            // it holds says nothing about what is on screen.
+            let dir = tempfile::tempdir().expect("tempdir");
+            bg_layout(dir.path(), true);
+            seed(dir.path(), SHARED, "all", &entry_ron(&image("old")));
+            seed(dir.path(), SHARED, "same-on-all", "false");
+            for name in [DARK, LIGHT] {
+                seed(dir.path(), name, "all", &entry_ron(&image("new")));
+            }
+            let targets = open_targets(dir.path()).expect("open targets");
+
+            assert_eq!(current_from(&targets), CurrentWallpaper::File(image("new")));
+        }
+
+        #[test]
+        fn new_shape_entry_is_classified() {
+            // The regression: an entry carrying `transition_duration` did
+            // not parse as the pinned Entry and read as "no file".
+            let dir = tempfile::tempdir().expect("tempdir");
+            bg_layout(dir.path(), true);
+            seed(dir.path(), DARK, "all", PER_MODE_ALL_RON);
+            let targets = open_targets(dir.path()).expect("open targets");
+
+            assert_eq!(
+                current_from(&targets),
+                CurrentWallpaper::File(PathBuf::from("/usr/share/backgrounds/cosmic/old.jpg"))
+            );
+        }
+
+        #[test]
+        fn active_mode_per_output_is_unknown() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            bg_layout(dir.path(), true);
+            seed(dir.path(), DARK, "all", &entry_ron(&image("a")));
+            seed(dir.path(), DARK, "same-on-all", "false");
+            seed(dir.path(), LIGHT, "all", &entry_ron(&image("a")));
+            let targets = open_targets(dir.path()).expect("open targets");
+
+            // Dark is active (no `is_dark` key) and is in per-output mode.
+            assert_eq!(current_from(&targets), CurrentWallpaper::Unknown);
+            // Light is same-on-all: known again once it is the active mode.
+            set_is_dark(dir.path(), Some("false"));
+            assert_eq!(current_from(&targets), CurrentWallpaper::File(image("a")));
+        }
+
+        #[test]
+        fn active_mode_without_entry_reads_shared() {
+            // Mode directories exist but the active mode has no `all` key:
+            // a per-mode cosmic-bg that has not seeded yet, or directories a
+            // third party (or a since-downgraded cosmic-bg) left on a legacy
+            // system. Either way the shared config is what is, or is about
+            // to be, displayed — reading "no file" here would stop the
+            // daily apply and unprotect the displayed image from the prune.
+            let dir = tempfile::tempdir().expect("tempdir");
+            bg_layout(dir.path(), true);
+            let targets = open_targets(dir.path()).expect("open targets");
+
+            // Nothing anywhere: cosmic-bg shows its default.
+            assert_eq!(current_from(&targets), CurrentWallpaper::NoFile);
+
+            seed(dir.path(), SHARED, "all", &entry_ron(&image("a")));
+            assert_eq!(current_from(&targets), CurrentWallpaper::File(image("a")));
+
+            // Only the active mode's key matters: Light having an entry
+            // does not stand in for Dark, nor stop Dark's fallback.
+            seed(dir.path(), LIGHT, "all", &entry_ron(&image("b")));
+            assert_eq!(current_from(&targets), CurrentWallpaper::File(image("a")));
+            set_is_dark(dir.path(), Some("false"));
+            assert_eq!(current_from(&targets), CurrentWallpaper::File(image("b")));
+            set_is_dark(dir.path(), None);
+
+            // The fallback takes the shared config whole, `same-on-all`
+            // included.
+            seed(dir.path(), SHARED, "same-on-all", "false");
+            assert_eq!(current_from(&targets), CurrentWallpaper::Unknown);
+            seed(dir.path(), SHARED, "same-on-all", "true");
+
+            // A present but unreadable mode entry is not "absent": the mode
+            // owns its state, so stay with the mode's (default) reading.
+            seed(dir.path(), DARK, "all", "not valid ron [");
+            assert_eq!(current_from(&targets), CurrentWallpaper::NoFile);
+        }
+
+        #[test]
+        fn missing_active_mode_config_is_unknown() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            bg_layout(dir.path(), true);
+            for name in [SHARED, DARK, LIGHT] {
+                seed(dir.path(), name, "all", &entry_ron(&image("a")));
+            }
+            let mut targets = open_targets(dir.path()).expect("open targets");
+
+            // Dark is active but its handle is not among the targets: do
+            // not guess from the other mode or from shared.
+            targets.modes.retain(|(mode, _)| *mode == BgMode::Light);
+            assert_eq!(current_from(&targets), CurrentWallpaper::Unknown);
+        }
     }
 
     mod poke {
